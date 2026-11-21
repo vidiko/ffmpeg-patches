@@ -653,6 +653,50 @@ class VulkanSweepTest(unittest.TestCase):
         self.assertEqual(rows[0][1], mixed)
         self.assertTrue(mixed.endswith(",non-feature"))
 
+    def test_r6_t8_shader_requirements_uses_capability_need_key(self) -> None:
+        """T8: shader_requirements maps SPIR-V capabilities through capability_need_key wiring."""
+        cap_map = r6_t3_capability_map(self.repo)
+        self.addCleanup(reset_vulkan_maps)
+        reset_vulkan_maps()
+        sweep_vulkan_features.MAP_STATE.capability_map = cap_map
+        work = self.repo / "spv-work"
+        work.mkdir()
+        spv = work / "shader.spv"
+        spv.write_bytes(b"\x00")
+        caps = (
+            "TriAtomics",
+            "MixedStorage",
+            "SingleRead",
+            "DupDraw",
+            "VersionOnly",
+            "UnknownNotInFixture",
+        )
+        disasm = "\n".join(f"OpCapability {name}" for name in caps)
+        helper = sweep_vulkan_features.capability_need_key
+        cap_names = ("TriAtomics", "MixedStorage", "SingleRead", "DupDraw")
+        expected = {helper(cap_map[name]) for name in cap_names}
+        deadline = time.monotonic() + 120
+        with (
+            unittest.mock.patch.object(sweep_vulkan_features, "git", return_value="//"),
+            unittest.mock.patch.object(sweep_vulkan_features, "compile_shader", return_value=spv),
+            unittest.mock.patch.object(sweep_vulkan_features, "run_tool", return_value=disasm),
+            unittest.mock.patch.object(
+                sweep_vulkan_features, "spirv_needs_scalar", return_value=False
+            ),
+        ):
+            needs = sweep_vulkan_features.shader_requirements(
+                str(self.repo),
+                self.base,
+                "libavfilter/vulkan/t.comp.glsl",
+                work,
+                deadline,
+            )
+        self.assertEqual(needs.features, expected)
+        for cap in cap_names:
+            key = helper(cap_map[cap])
+            self.assertIsNotNone(key)
+            self.assertEqual(needs.evidence[key], f"capability:{cap}")
+
     def test_r6_t4_shader_diff_finds_existing_owner(self) -> None:
         """T4: a shader-only diff locates the owning vf_<stem>_vulkan.c at head for sweeps."""
         c_vulkan = "extern const unsigned char ff_v360_comp_spv_data[];\nint f(void){return 0;}\n"

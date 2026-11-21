@@ -1798,6 +1798,10 @@ class DocTermTest(unittest.TestCase):
         """Underscores in the option name may match hyphenated Texinfo wording."""
         self.assertTrue(upstream_lint.option_named_in_text("global_sidx", "see global-sidx layout"))
 
+    def test_option_named_in_text_underscore_matches_space(self) -> None:
+        """Underscores in the option name may match space-separated Texinfo wording."""
+        self.assertTrue(upstream_lint.option_named_in_text("global_sidx", "see global sidx layout"))
+
     def test_option_named_in_text_plain_name(self) -> None:
         """A bare option name embedded in prose is found."""
         self.assertTrue(

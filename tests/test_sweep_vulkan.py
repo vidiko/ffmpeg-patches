@@ -62,6 +62,62 @@ layout(push_constant) uniform PC { uint idx; } pc;
 void main() { imageLoad(imgs[pc.idx], ivec2(0)); }
 """
 
+SAMPLED_DYNAMIC_SHADER = """\
+#version 460
+#extension GL_EXT_nonuniform_qualifier : require
+layout(local_size_x = 1) in;
+layout(set = 0, binding = 0) uniform texture2D texs[4];
+layout(set = 0, binding = 1) uniform sampler texsSmp;
+layout(push_constant) uniform PC { uint idx; } pc;
+void main() {
+    texture(sampler2D(texs[nonuniformEXT(pc.idx)], texsSmp), vec2(0.0));
+}
+"""
+
+R7_SAMPLED_DISASM = "\n".join(
+    (
+        "%float = OpTypeFloat 32",
+        "%uint = OpTypeInt 32 0",
+        "%uint_4 = OpConstant %uint 4",
+        "%7 = OpTypeImage %float 2D 0 0 0 1 Unknown",
+        "%_arr_7_uint_4 = OpTypeArray %7 %uint_4",
+        "%_ptr_UniformConstant__arr_7_uint_4 = OpTypePointer UniformConstant %_arr_7_uint_4",
+        "%texs = OpVariable %_ptr_UniformConstant__arr_7_uint_4 UniformConstant",
+        "%_ptr_UniformConstant_7 = OpTypePointer UniformConstant %7",
+        "%idx = OpLoad %uint %pc_idx",
+        "%19 = OpAccessChain %_ptr_UniformConstant_7 %texs %idx",
+    )
+)
+
+R7_STORAGE_DISASM = "\n".join(
+    (
+        "%float = OpTypeFloat 32",
+        "%uint = OpTypeInt 32 0",
+        "%uint_4 = OpConstant %uint 4",
+        "%7 = OpTypeImage %float 2D 0 0 0 2 Rgba8",
+        "%_arr_7_uint_4 = OpTypeArray %7 %uint_4",
+        "%_ptr_UniformConstant__arr_7_uint_4 = OpTypePointer UniformConstant %_arr_7_uint_4",
+        "%imgs = OpVariable %_ptr_UniformConstant__arr_7_uint_4 UniformConstant",
+        "%_ptr_UniformConstant_7 = OpTypePointer UniformConstant %7",
+        "%idx = OpLoad %uint %pc_idx",
+        "%21 = OpAccessChain %_ptr_UniformConstant_7 %imgs %idx",
+    )
+)
+
+R7_BUFFER_DISASM = "\n".join(
+    (
+        "%uint = OpTypeInt 32 0",
+        "%uint_4 = OpConstant %uint 4",
+        "%7 = OpTypeImage %uint Buffer 0 0 0 2 Rgba8",
+        "%_arr_7_uint_4 = OpTypeArray %7 %uint_4",
+        "%_ptr_UniformConstant__arr_7_uint_4 = OpTypePointer UniformConstant %_arr_7_uint_4",
+        "%bufs = OpVariable %_ptr_UniformConstant__arr_7_uint_4 UniformConstant",
+        "%_ptr_UniformConstant_7 = OpTypePointer UniformConstant %7",
+        "%idx = OpLoad %uint %pc_idx",
+        "%21 = OpAccessChain %_ptr_UniformConstant_7 %bufs %idx",
+    )
+)
+
 LITERAL_SHADER = """\
 #version 460
 #extension GL_EXT_shader_image_load_formatted : require
@@ -807,6 +863,240 @@ class VulkanSweepTest(unittest.TestCase):
             ):
                 sweep_vulkan_features.spirv_needs_scalar(spv, time.monotonic() + 120)
             self.assertEqual(recorded, [90.0, 30.0])
+
+    def test_r7_g1_cpu_sites_wrapped_mask_statement(self) -> None:
+        """G1: cpu_sites finds mask normalization when the mask continues on the next line."""
+        source = "unsigned v = src[x]\n    & 0xFFF0u;\n"
+        sites = sweep_port_parity.cpu_sites(source)
+        self.assertEqual(sites, [(1, "mask")])
+
+    def test_r7_g1_port_parity_wrapped_mask_row(self) -> None:
+        """G1: port-parity reports mask when the CPU mask wraps across two lines."""
+        cpu = "void f(const uint16_t *src) { uint16_t v = src[0]\n    & 0xFFF0u; (void)v; }\n"
+        c_vulkan = (
+            "extern const unsigned char ff_test_comp_spv_data[];\nint f(void) { return 0; }\n"
+        )
+        head = self.commit_filter(
+            c_vulkan=c_vulkan,
+            shader_name="test.comp.glsl",
+            shader=MASK_SHADER,
+            cpu=cpu,
+        )
+        self.assertIn("| mask | none |", self.parity_report(head))
+
+    def test_r7_g1_cpu_sites_semicolon_statement_boundary(self) -> None:
+        """G1: two statements on one line only classify sample reads inside the first statement."""
+        source = "uint16_t v = src[0]; int t = other >> 4;\n"
+        self.assertEqual(sweep_port_parity.cpu_sites(source), [])
+
+    def test_r7b_g1_cpu_sites_function_body_five_cases(self) -> None:
+        """G1 r7b: cpu_sites classifies each statement inside braced bodies separately."""
+        cases = (
+            (
+                (
+                    "static void f(const uint16_t *src)\n{\n"
+                    "    int a = src[0];\n"
+                    "    int m = x & 0xFFF0u;\n"
+                    "}\n"
+                ),
+                [],
+            ),
+            (
+                (
+                    "static void f(const uint16_t *src)\n{\n"
+                    "    int a = src[0] & 0xFFF0u;\n"
+                    "    int b = src[1] >> 4;\n"
+                    "}\n"
+                ),
+                [(3, "mask"), (4, "shift")],
+            ),
+            (
+                (
+                    "static void f(const uint16_t *src)\n{\n"
+                    "    int a = src[0]\n"
+                    "        & 0xFFF0u;\n"
+                    "}\n"
+                ),
+                [(3, "mask")],
+            ),
+            (
+                (
+                    "static void f(const uint16_t *src, uint16_t *dst, int n)\n"
+                    "{\n"
+                    "    for (int i = 0; i < n; i++)\n"
+                    "        dst[i] = src[i] & 0xFFF0u;\n"
+                    "}\n"
+                ),
+                [(4, "mask")],
+            ),
+            (
+                (
+                    "static void f(const uint16_t *src)\n{\n"
+                    "    if (x) {\n"
+                    "        a = src[0] & 0xFFF0u;\n"
+                    "    }\n"
+                    "    b = src[1];\n"
+                    "}\n"
+                ),
+                [(4, "mask")],
+            ),
+        )
+        for source, expected in cases:
+            with self.subTest(source=source.splitlines()[0]):
+                self.assertEqual(sweep_port_parity.cpu_sites(source), expected)
+
+    def test_r7b_g1_statement_spans_split_function_body(self) -> None:
+        """G1 r7b: statement_spans does not merge separate statements inside a function body."""
+        source = (
+            "static void f(const uint16_t *src)\n"
+            "{\n"
+            "    int a = src[0];\n"
+            "    int m = x & 0xFFF0u;\n"
+            "}\n"
+        )
+        masked = variant_sweep.mask_literals(source)
+        spans = sweep_port_parity.statement_spans(masked)
+        self.assertGreaterEqual(len(spans), 3)
+        for start, end in spans:
+            piece = source[start:end]
+            self.assertFalse("src[0]" in piece and "0xFFF0u" in piece)
+
+    def test_r7c_g1_statement_spans_for_header_semicolons(self) -> None:
+        """G1 r7c: semicolons inside a for header parentheses do not split statement_spans."""
+        source = "for (i = 0; i < n; i++)\n    x = src[i] & 0xFFF0u;\n"
+        masked = variant_sweep.mask_literals(source)
+        end = source.rindex(";") + 1
+        self.assertEqual(sweep_port_parity.statement_spans(masked), [(0, end)])
+
+    def test_r7c_g1_statement_spans_trailing_whitespace(self) -> None:
+        """G1 r7c: trailing whitespace after the last statement terminator yields no extra span."""
+        source = "a = 1;\n\n"
+        masked = variant_sweep.mask_literals(source)
+        self.assertEqual(sweep_port_parity.statement_spans(masked), [(0, 6)])
+
+    def test_r7c_g1_cpu_sites_for_condition_mask(self) -> None:
+        """G1 r7c: cpu_sites keeps sample read and mask in one for-statement span."""
+        source = (
+            "static void f(const uint16_t *src)\n"
+            "{\n"
+            "    for (int v = src[0]; (v & 0xFFF0u) != 0; v++)\n"
+            "        n++;\n"
+            "}\n"
+        )
+        self.assertEqual(sweep_port_parity.cpu_sites(source), [(3, "mask")])
+
+    def test_r7_g2_linked_shaders_ignores_masked_symbols(self) -> None:
+        """G2: linked_shaders ignores shader symbols inside comments and string literals."""
+        c_source = (
+            "/* extern const unsigned char ff_old_comp_spv_data[]; */\n"
+            "// ff_old_comp_spv_data\n"
+            'const char *s = "ff_old_comp_spv_data";\n'
+        )
+        self.assertEqual(sweep_vulkan_features.linked_shaders(c_source), [])
+
+    def test_r7_g2_linked_shaders_keeps_active_declarations(self) -> None:
+        """G2: linked_shaders still returns active ff_*_comp_spv_data shader links."""
+        c_source = (
+            "/* ff_old_comp_spv_data */\nextern const unsigned char ff_new_comp_spv_data[];\n"
+        )
+        self.assertEqual(
+            sweep_vulkan_features.linked_shaders(c_source),
+            ["libavfilter/vulkan/new.comp.glsl"],
+        )
+
+    def test_r7_g3_feature_reads_skip_plain_writes(self) -> None:
+        """G3: c_feature_reads ignores plain assignments but keeps genuine feature reads."""
+        reset_vulkan_maps()
+        self.addCleanup(reset_vulkan_maps)
+        sweep_vulkan_features.ensure_maps()
+        write_only = "feats->shaderInt64 = VK_TRUE;\n"
+        self.assertEqual(sweep_vulkan_features.c_feature_reads(write_only), [])
+        wrapped = "feats->shaderInt64\n    = VK_TRUE;\n"
+        self.assertEqual(sweep_vulkan_features.c_feature_reads(wrapped), [])
+        checks = (
+            "if (feats->shaderInt64 == VK_TRUE) {}\n",
+            "ok = feats->shaderInt64;\n",
+            "feats->shaderInt64 |= other;\n",
+            "a.shaderInt64 = b.shaderInt64;\n",
+        )
+        for source in checks:
+            sites = sweep_vulkan_features.c_feature_reads(source)
+            self.assertEqual(len(sites), 1, source)
+            self.assertEqual(sites[0].feature, "shaderInt64")
+
+    def test_r7_g3_compare_gates_write_only_feature(self) -> None:
+        """G3: compare_gates reports used-unchecked when C only writes an unchecked feature."""
+        reset_vulkan_maps()
+        self.addCleanup(reset_vulkan_maps)
+        sweep_vulkan_features.ensure_maps()
+        source = "feats->shaderInt64 = VK_TRUE;\n"
+        checked = sweep_vulkan_features.c_feature_reads(source)
+        needs = [
+            sweep_vulkan_features.ShaderNeeds(
+                "libavfilter/vulkan/b.comp.glsl",
+                {"shaderInt64"},
+                {"shaderInt64": "capability:Int64"},
+            )
+        ]
+        rows = sweep_vulkan_features.compare_gates("libavfilter/vf_test_vulkan.c", checked, needs)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0][1], "shaderInt64")
+        self.assertEqual(rows[0][3], "used-unchecked")
+
+    def test_r7_g4_dynamic_storage_index_disasm_cases(self) -> None:
+        """G4: dynamic_storage_index counts storage-image arrays only, not sampled or buffers."""
+        sampled = sweep_vulkan_features.dynamic_storage_index(R7_SAMPLED_DISASM)
+        storage = sweep_vulkan_features.dynamic_storage_index(R7_STORAGE_DISASM)
+        buffer = sweep_vulkan_features.dynamic_storage_index(R7_BUFFER_DISASM)
+        self.assertEqual(sampled, (False, False))
+        self.assertEqual(storage, (True, False))
+        self.assertEqual(buffer, (False, False))
+
+    @unittest.skipIf(SKIP_VULKAN, SKIP_REASON)
+    def test_r7_g4_sampled_array_no_storage_dynamic_row(self) -> None:
+        """G4: dynamically indexed sampled-image arrays do not require storage-image indexing."""
+        c_source = (
+            "extern const unsigned char ff_test_comp_spv_data[];\n"
+            "int gate(VkPhysicalDeviceFeatures *feats) {\n"
+            "    if (!feats->shaderStorageImageReadWithoutFormat) return -1;\n"
+            "    return 0;\n"
+            "}\n"
+        )
+        head = self.commit_filter(
+            c_vulkan=c_source,
+            shader_name="test.comp.glsl",
+            shader=SAMPLED_DYNAMIC_SHADER,
+        )
+        report = self.vk_report(head)
+        self.assertNotIn("shaderStorageImageArrayDynamicIndexing", report)
+
+    def test_r7_g5_gate_row_anchor_shader_order(self) -> None:
+        """G5: slash-free evidence anchors used-unchecked rows on the first linked shader need."""
+        path_a = "libavfilter/vulkan/a.comp.glsl"
+        path_b = "libavfilter/vulkan/b.comp.glsl"
+        empty = sweep_vulkan_features.ShaderNeeds(path_a, set(), {})
+        int64_b = sweep_vulkan_features.ShaderNeeds(
+            path_b,
+            {"shaderInt64"},
+            {"shaderInt64": "capability:Int64"},
+        )
+        c_path = "libavfilter/vf_test_vulkan.c"
+        rows = sweep_vulkan_features.compare_gates(c_path, [], [empty, int64_b])
+        self.assertEqual(rows[0][0], f"{path_b}:1")
+        rows_b = sweep_vulkan_features.compare_gates(c_path, [], [int64_b])
+        self.assertEqual(rows_b[0][0], f"{path_b}:1")
+        int64_a = sweep_vulkan_features.ShaderNeeds(
+            path_a,
+            {"shaderInt64"},
+            {"shaderInt64": "capability:Int64"},
+        )
+        int64_b2 = sweep_vulkan_features.ShaderNeeds(
+            path_b,
+            {"shaderInt64"},
+            {"shaderInt64": "capability:Int64"},
+        )
+        rows_both = sweep_vulkan_features.compare_gates(c_path, [], [int64_a, int64_b2])
+        self.assertEqual(rows_both[0][0], f"{path_a}:1")
 
     def test_t6_second_linked_shader_mask_site(self) -> None:
         """t6: port-parity names the second linked shader when only it applies the mask."""

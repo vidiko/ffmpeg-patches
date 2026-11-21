@@ -98,6 +98,32 @@ def collect_pairs(
     return pairs
 
 
+def statement_spans(masked: str) -> list[tuple[int, int]]:
+    """Return statement spans ending at ;, { or } at parenthesis depth 0, without a blank tail."""
+    spans: list[tuple[int, int]] = []
+    start = 0
+    paren_depth = 0
+    index = 0
+    limit = len(masked)
+    while index < limit:
+        ch = masked[index]
+        if ch == "(":
+            paren_depth += 1
+        elif ch == ")":
+            if paren_depth > 0:
+                paren_depth -= 1
+        elif paren_depth == 0 and ch in ";{}":
+            end = index + 1
+            spans.append((start, end))
+            start = end
+        index += 1
+    if start < limit:
+        piece = masked[start:limit]
+        if piece.strip():
+            spans.append((start, limit))
+    return spans
+
+
 def normalization_kind(statement: str) -> str | None:
     """Classify one statement as mask, shift, clip, or clamp normalization."""
     if CLIP.search(statement):
@@ -115,12 +141,17 @@ def cpu_sites(source: str) -> list[tuple[int, str]]:
     """List sample-load normalization sites in one CPU filter source."""
     sites: list[tuple[int, str]] = []
     masked = mask_literals(source)
-    for line_number, line in enumerate(masked.splitlines(), 1):
-        if not SAMPLE_READ.search(line):
+    for start, end in statement_spans(masked):
+        statement = masked[start:end]
+        read_match = SAMPLE_READ.search(statement)
+        if read_match is None:
             continue
-        kind = normalization_kind(line)
-        if kind is not None:
-            sites.append((line_number, kind))
+        kind = normalization_kind(statement)
+        if kind is None:
+            continue
+        offset = start + read_match.start()
+        line_number = masked.count("\n", 0, offset) + 1
+        sites.append((line_number, kind))
     return sites
 
 

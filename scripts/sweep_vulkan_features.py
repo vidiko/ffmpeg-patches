@@ -179,7 +179,7 @@ def run_tool(argv: list[str], deadline: float, maximum: int, label: str) -> str:
 def linked_shaders(c_source: str) -> list[str]:
     """Return head-commit shader paths referenced by ff_*_comp_spv_data symbols."""
     paths = []
-    for match in SHADER_SYMBOL.finditer(c_source):
+    for match in SHADER_SYMBOL.finditer(mask_literals(c_source)):
         paths.append(f"libavfilter/vulkan/{match[1]}.comp.glsl")
     return paths
 
@@ -254,14 +254,29 @@ def collect_targets(
     return targets
 
 
+def plain_assignment_after(text: str, offset: int) -> bool:
+    """Return True when masked text after offset begins a plain '=' assignment."""
+    position = offset
+    limit = min(len(text), offset + 256)
+    while position < limit and text[position] in " \t\n\r":
+        position += 1
+    if position >= limit or text[position] != "=":
+        return False
+    return position + 1 >= len(text) or text[position + 1] != "="
+
+
 def c_feature_reads(source: str) -> list[FeatureSite]:
     """Collect VkPhysicalDeviceFeatures gate reads from masked C source."""
+    masked = mask_literals(source)
     sites: list[FeatureSite] = []
-    for line_number, line in enumerate(mask_literals(source).splitlines(), 1):
-        for match in FEATURE_READ.finditer(line):
-            feature = match[1]
-            if feature in MAP_STATE.feature_allowlist:
-                sites.append(FeatureSite(line_number, feature))
+    for match in FEATURE_READ.finditer(masked):
+        feature = match[1]
+        if feature not in MAP_STATE.feature_allowlist:
+            continue
+        if plain_assignment_after(masked, match.end()):
+            continue
+        line_number = masked.count("\n", 0, match.start()) + 1
+        sites.append(FeatureSite(line_number, feature))
     return sites
 
 
@@ -302,6 +317,51 @@ def spirv_needs_scalar(spv: Path, deadline: float) -> bool:
     return False
 
 
+def spirv_type_operands(disasm: str) -> dict[str, list[str]]:
+    """Map SPIR-V result ids to opcode and operand tokens from disassembly text."""
+    types: dict[str, list[str]] = {}
+    for match in re.finditer(r"(%\w+) = (Op\w+)(.*)", disasm):
+        tail = match[3].split()
+        types[match[1]] = [match[2], *tail]
+    return types
+
+
+def spirv_array_element(type_id: str, types: dict[str, list[str]]) -> str | None:
+    """Return the element type id for one SPIR-V array or runtime-array type."""
+    entry = types.get(type_id)
+    if entry is None:
+        return None
+    if entry[0] in ("OpTypeArray", "OpTypeRuntimeArray") and len(entry) > 1:
+        return entry[1]
+    return None
+
+
+def spirv_storage_image_type(image_id: str, types: dict[str, list[str]]) -> bool:
+    """Return whether one SPIR-V image type is a non-buffer storage image."""
+    entry = types.get(image_id)
+    if entry is None or entry[0] != "OpTypeImage" or len(entry) < 8:
+        return False
+    if entry[2] == "Buffer":
+        return False
+    return entry[6] == "2"
+
+
+def storage_image_array_vars(disasm: str) -> set[str]:
+    """Return UniformConstant variables that point at storage-image arrays."""
+    types = spirv_type_operands(disasm)
+    vars_found: set[str] = set()
+    for match in re.finditer(r"(%\w+) = OpVariable (%\w+) UniformConstant", disasm):
+        ptr = types.get(match[2])
+        if ptr is None or ptr[0] != "OpTypePointer" or len(ptr) < 3:
+            continue
+        if ptr[1] != "UniformConstant":
+            continue
+        element = spirv_array_element(ptr[2], types)
+        if element is not None and spirv_storage_image_type(element, types):
+            vars_found.add(match[1])
+    return vars_found
+
+
 def dynamic_storage_index(disasm: str) -> tuple[bool, bool]:
     """Detect dynamic and non-uniform storage-image array indexing in SPIR-V text."""
     assignments = {match[1]: match[2] for match in re.finditer(r"(%\w+) = (Op\w+)", disasm)}
@@ -310,9 +370,7 @@ def dynamic_storage_index(disasm: str) -> tuple[bool, bool]:
         if match[2].startswith("%int_") or match[2] in constants:
             constants.add(match[1])
     nonuniform_ids = {match[1] for match in re.finditer(r"OpDecorate (%\w+) NonUniform", disasm)}
-    array_vars = {
-        match[1] for match in re.finditer(r"(%\w+) = OpVariable %_ptr_UniformConstant_", disasm)
-    }
+    array_vars = storage_image_array_vars(disasm)
     dynamic = False
     nonuniform = False
     for line in disasm.splitlines():
@@ -403,12 +461,17 @@ def anyof_group_satisfied(feature: str, used: set[str], checked_names: set[str])
     return False
 
 
-def gate_row_anchor(text: str, needs: list[ShaderNeeds], c_path: str) -> str:
+def gate_row_anchor(
+    text: str,
+    anchor_by_feature: dict[str, str],
+    feature: str,
+    c_path: str,
+) -> str:
     """Choose the file prefix for one shader-side mismatch row."""
     if "/" in text:
         return text.split(":", 1)[0]
-    if needs:
-        return needs[0].path
+    if feature in anchor_by_feature:
+        return anchor_by_feature[feature]
     return c_path
 
 
@@ -420,8 +483,11 @@ def compare_gates(
     """Emit mismatch rows for one Vulkan filter file."""
     used: set[str] = set()
     evidence_by_feature: dict[str, str] = {}
+    anchor_by_feature: dict[str, str] = {}
     for entry in needs:
         used |= entry.features
+        for feature in entry.features:
+            anchor_by_feature.setdefault(feature, entry.path)
         for feature, text in entry.evidence.items():
             evidence_by_feature.setdefault(feature, text)
     rows: list[tuple[str, str, str, str]] = []
@@ -438,7 +504,7 @@ def compare_gates(
             continue
         direction = "ambiguous" if feature.startswith("any-of:") else "used-unchecked"
         text = evidence_by_feature.get(feature, "shader")
-        anchor = gate_row_anchor(text, needs, c_path)
+        anchor = gate_row_anchor(text, anchor_by_feature, feature, c_path)
         rows.append((f"{anchor}:1", feature, text, direction))
     return rows
 

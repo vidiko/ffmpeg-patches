@@ -58,6 +58,162 @@ DOCSTRING_FINDING = (
     "libavfilter/vf_x.c:12 ff_beta\n"
 )
 DOCSTRING_ADVICE = "add a doc comment to each listed function, or pass --docstring-reason"
+DASHENC_OPTIONS = (
+    "#define OFFSET(x) offsetof(DashContext, x)\n"
+    "typedef struct DashContext {\n"
+    "    int ignore_io_errors;\n"
+    "    int global_sidx;\n"
+    "    int single_file;\n"
+    "} DashContext;\n"
+    "static const AVOption options[] = {\n"
+    '    { "ignore_io_errors", "ignore", OFFSET(ignore_io_errors), 0 },\n'
+    '    { "global_sidx", "sidx", OFFSET(global_sidx), 0 },\n'
+    '    { "single_file", "single", OFFSET(single_file), 0 },\n'
+    "};\n"
+)
+DASHENC_OPTIONS_T9 = (
+    "#define OFFSET(x) offsetof(DashContext, x)\n"
+    "typedef struct DashContext {\n"
+    "    int ignore_io_errors;\n"
+    "    int global_sidx;\n"
+    "    int single_file;\n"
+    "} DashContext;\n"
+    "static const AVOption options[] = {\n"
+    '    { "ignore_io_errors", "ignore", OFFSET(ignore_io_errors), 0 },\n'
+    '    { "none", "no segment list", 0, AV_OPT_TYPE_CONST, { .i64 = 0 }, 0, 0,'
+    ' AV_OPT_FLAG_DEPRECATED, "dash" },\n'
+    '    { "global_sidx", "sidx", OFFSET(global_sidx), 0 },\n'
+    '    { "single_file", "single " "file mode", OFFSET(single_file), 0 },\n'
+    "};\n"
+)
+DASHENC_WRITE_HEAD = "int dash_write(DashContext *c)\n{\n    int ret = 0;\n"
+DASHENC_WRITE_TAIL = "    if (c->global_sidx) {\n        ret = 1;\n    }\n    return ret;\n}\n"
+DASHENC_GAP2 = "    ;\n    ;\n"
+DASHENC_GAP3 = "    ;\n    ;\n    ;\n"
+DASHENC_IGNORE_TEST = "    if (!c->ignore_io_errors && ret >= 0) { ret = 0; }\n"
+DASHENC_BASE = DASHENC_OPTIONS + DASHENC_WRITE_HEAD + DASHENC_GAP2 + DASHENC_WRITE_TAIL
+DASHENC_T1_SOURCE = (
+    DASHENC_OPTIONS + DASHENC_WRITE_HEAD + DASHENC_IGNORE_TEST + DASHENC_GAP2 + DASHENC_WRITE_TAIL
+)
+DASHENC_T9_SOURCE = (
+    DASHENC_OPTIONS_T9
+    + DASHENC_WRITE_HEAD
+    + DASHENC_IGNORE_TEST
+    + DASHENC_GAP2
+    + DASHENC_WRITE_TAIL
+)
+DASHENC_T10_SOURCE = (
+    DASHENC_OPTIONS
+    + DASHENC_WRITE_HEAD
+    + "    if (!c->ignore_io_errors) { ret = -1; }\n"
+    + "    if (c->ignore_io_errors && ret >= 0) { ret = 0; }\n"
+    + "    if (c->global_sidx) {\n"
+    + "        ret = 1;\n"
+    + "    }\n"
+    + "    return ret;\n"
+    + "}\n"
+)
+DASHENC_T3_SOURCE = (
+    DASHENC_OPTIONS
+    + DASHENC_WRITE_HEAD
+    + "    if (c->single_file && c->ignore_io_errors && ret >= 0)\n"
+    + "        ret = 0;\n"
+    + "    return ret;\n"
+    + "}\n"
+    + "int dash_tail(DashContext *c)\n"
+    + "{\n"
+    + "    if (c->global_sidx) {\n"
+    + "        return 2;\n"
+    + "    }\n"
+    + "    return 0;\n"
+    + "}\n"
+)
+DASHENC_T4_SOURCE = (
+    DASHENC_OPTIONS + DASHENC_WRITE_HEAD + DASHENC_IGNORE_TEST + DASHENC_GAP3 + DASHENC_WRITE_TAIL
+)
+DASHENC_T5_SOURCE = (
+    DASHENC_OPTIONS
+    + DASHENC_WRITE_HEAD
+    + DASHENC_IGNORE_TEST
+    + "    /* if (c->global_sidx) */\n"
+    + DASHENC_GAP2
+    + "    return ret;\n"
+    + "}\n"
+    + "int dash_tail(DashContext *c)\n"
+    + "{\n"
+    + "    if (c->global_sidx) {\n"
+    + "        return 2;\n"
+    + "    }\n"
+    + "    return 0;\n"
+    + "}\n"
+)
+DASHENC_NO_TABLE = (
+    "typedef struct DashContext { int ignore_io_errors, global_sidx; } DashContext;\n"
+    + DASHENC_WRITE_HEAD
+    + DASHENC_GAP2
+    + DASHENC_WRITE_TAIL
+)
+DASHENC_NO_TABLE_T1 = (
+    "typedef struct DashContext { int ignore_io_errors, global_sidx; } DashContext;\n"
+    + DASHENC_WRITE_HEAD
+    + DASHENC_IGNORE_TEST
+    + DASHENC_GAP2
+    + DASHENC_WRITE_TAIL
+)
+DOC_MUXERS_BASE = (
+    "@table @option\n"
+    "@item ignore_io_errors\n"
+    "Ignore I/O errors.\n"
+    "@item global_sidx\n"
+    "Write a global sidx.\n"
+    "@item single_file\n"
+    "Write one output file.\n"
+    "@end table\n"
+)
+DOC_MUXERS_T1 = (
+    "@table @option\n"
+    "@item ignore_io_errors\n"
+    "Ignore I/O errors.\n"
+    "Skip flush failures when the output is not writable.\n"
+    "@item global_sidx\n"
+    "Write a global sidx.\n"
+    "@item single_file\n"
+    "Write one output file.\n"
+    "@end table\n"
+)
+DOC_MUXERS_T2 = (
+    "@table @option\n"
+    "@item ignore_io_errors\n"
+    "Ignore I/O errors.\n"
+    "Respect @option{global_sidx} when inserting index ranges.\n"
+    "@item global_sidx\n"
+    "Write a global sidx.\n"
+    "@item single_file\n"
+    "Write one output file.\n"
+    "@end table\n"
+)
+DOC_MUXERS_T3 = (
+    "@table @option\n"
+    "@item ignore_io_errors\n"
+    "Ignore I/O errors.\n"
+    "Applies only on single-file output.\n"
+    "@item global_sidx\n"
+    "Write a global sidx.\n"
+    "@item single_file\n"
+    "Write one output file.\n"
+    "@end table\n"
+)
+DOC_MUXERS_T6 = (
+    "@table @option\n"
+    "@item ignore_io_errors\n"
+    "Ignore I/O errors.\n"
+    "@item global_sidx\n"
+    "Write a global sidx.\n"
+    "May overlap segments when ignore I/O errors is enabled.\n"
+    "@item single_file\n"
+    "Write one output file.\n"
+    "@end table\n"
+)
 
 
 class RulesTest(unittest.TestCase):
@@ -1575,6 +1731,134 @@ class DocTermTest(unittest.TestCase):
             with self.subTest(name=name):
                 self.assertFalse(upstream_lint.is_doc_path(name))
 
+    def test_avoption_field_map_offset_maps_name(self) -> None:
+        """AVOption rows with OFFSET map the structure field to the quoted name."""
+        raw = DASHENC_OPTIONS
+        mapping = upstream_lint.avoption_field_map(raw)
+        self.assertEqual(mapping.get("global_sidx"), "global_sidx")
+        self.assertEqual(mapping.get("ignore_io_errors"), "ignore_io_errors")
+
+    def test_avoption_field_map_const_without_offset_ignored(self) -> None:
+        """A constant table row without OFFSET maps nothing and does not steal the next field."""
+        raw = DASHENC_OPTIONS_T9
+        mapping = upstream_lint.avoption_field_map(raw)
+        self.assertNotIn("none", mapping)
+        self.assertEqual(mapping.get("global_sidx"), "global_sidx")
+
+    def test_avoption_field_map_adjacent_help_literals(self) -> None:
+        """Two adjacent string literals in the help column still map the OFFSET field."""
+        raw = DASHENC_OPTIONS_T9
+        mapping = upstream_lint.avoption_field_map(raw)
+        self.assertEqual(mapping.get("single_file"), "single_file")
+
+    def test_avoption_field_map_null_help(self) -> None:
+        """NULL help text before OFFSET still maps the structure field."""
+        raw = (
+            "#define OFFSET(x) offsetof(Ctx, x)\n"
+            "typedef struct Ctx { int foo_field; } Ctx;\n"
+            "static const AVOption options[] = {\n"
+            '    { "foo", NULL, OFFSET(foo_field), 0 },\n'
+            "};\n"
+        )
+        mapping = upstream_lint.avoption_field_map(raw)
+        self.assertEqual(mapping.get("foo_field"), "foo")
+
+    def test_texi_option_name_strips_inline_command(self) -> None:
+        """@option{NAME} on an item line yields NAME."""
+        self.assertEqual(upstream_lint.texi_option_name("@option{global_sidx}"), "global_sidx")
+
+    def test_texi_option_name_plain_token(self) -> None:
+        """A bare item token is returned unchanged."""
+        self.assertEqual(upstream_lint.texi_option_name("ignore_io_errors"), "ignore_io_errors")
+
+    def test_texi_option_name_var_command(self) -> None:
+        """@var{NAME} on an item line yields NAME."""
+        self.assertEqual(upstream_lint.texi_option_name("@var{range}"), "range")
+
+    def test_texi_entry_ranges_one_table(self) -> None:
+        """Each @item line starts a range through the next boundary."""
+        lines = DOC_MUXERS_BASE.splitlines()
+        ranges = upstream_lint.texi_entry_ranges(lines)
+        self.assertEqual(len(ranges), 3)
+        self.assertEqual(ranges[0][2], "ignore_io_errors")
+
+    def test_texi_entry_ranges_no_items(self) -> None:
+        """Prose with no @item lines yields no ranges."""
+        self.assertEqual(upstream_lint.texi_entry_ranges(["plain text"]), [])
+
+    def test_texi_entry_ranges_itemx_boundary(self) -> None:
+        """An @itemx line ends the previous entry and opens the next."""
+        lines = ["@item a\n", "text\n", "@itemx b\n", "more\n", "@end table\n"]
+        ranges = upstream_lint.texi_entry_ranges(lines)
+        self.assertEqual(len(ranges), 2)
+        self.assertEqual(ranges[0][2], "a")
+        self.assertEqual(ranges[1][2], "b")
+
+    def test_option_named_in_text_underscore_matches_hyphen(self) -> None:
+        """Underscores in the option name may match hyphenated Texinfo wording."""
+        self.assertTrue(upstream_lint.option_named_in_text("global_sidx", "see global-sidx layout"))
+
+    def test_option_named_in_text_plain_name(self) -> None:
+        """A bare option name embedded in prose is found."""
+        self.assertTrue(
+            upstream_lint.option_named_in_text("global_sidx", "Respect global_sidx ranges.")
+        )
+
+    def test_option_named_in_text_hyphen_suffix_not_named(self) -> None:
+        """A name followed by a hyphen is not treated as the option name."""
+        self.assertFalse(upstream_lint.option_named_in_text("global", "toggle global-sidx"))
+
+    def test_option_named_in_text_word_prefix_not_named(self) -> None:
+        """A name preceded by a word character is not treated as the option name."""
+        self.assertFalse(upstream_lint.option_named_in_text("sidx", "the globalsidx flag"))
+
+    def test_option_interplay_findings_reports_coupled_tests(self) -> None:
+        """Coupled AVOption tests with under-documented entries yield interplay findings."""
+        tree = Path("/fixture/tree")
+        head = "HEAD"
+        range_patch = "diff --git a/libavformat/dashenc.c\n"
+        doc_entries = {"ignore_io_errors": "Ignore I/O errors.\nSkip flush failures."}
+        with (
+            unittest.mock.patch.object(
+                upstream_lint, "_patch_files", return_value=[("libavformat/dashenc.c", ["@@"], 0)]
+            ),
+            unittest.mock.patch.object(upstream_lint, "_added_lines", return_value={15}),
+            unittest.mock.patch.object(upstream_lint, "_git", return_value=DASHENC_T1_SOURCE),
+        ):
+            findings = upstream_lint.option_interplay_findings(tree, head, range_patch, doc_entries)
+        self.assertEqual(len(findings), 1)
+        self.assertIn("ignore_io_errors near global_sidx", findings[0])
+
+    def test_option_interplay_findings_named_neighbour_passes(self) -> None:
+        """Findings are omitted when the changed entry names the neighbour option."""
+        tree = Path("/fixture/tree")
+        doc_entries = {
+            "ignore_io_errors": "Ignore errors; respects global_sidx placement.",
+        }
+        with (
+            unittest.mock.patch.object(
+                upstream_lint, "_patch_files", return_value=[("libavformat/dashenc.c", ["@@"], 0)]
+            ),
+            unittest.mock.patch.object(upstream_lint, "_added_lines", return_value={15}),
+            unittest.mock.patch.object(upstream_lint, "_git", return_value=DASHENC_T1_SOURCE),
+        ):
+            findings = upstream_lint.option_interplay_findings(tree, "HEAD", "patch", doc_entries)
+        self.assertEqual(findings, [])
+
+    def test_option_interplay_findings_no_doc_change_passes(self) -> None:
+        """No finding when the neighbour option's Texinfo entry did not gain lines."""
+        tree = Path("/fixture/tree")
+        doc_entries: dict[str, str] = {}
+        with (
+            unittest.mock.patch.object(
+                upstream_lint, "_patch_files", return_value=[("libavformat/dashenc.c", ["@@"], 0)]
+            ),
+            unittest.mock.patch.object(upstream_lint, "_added_lines", return_value={15}),
+            unittest.mock.patch.object(upstream_lint, "_git", return_value=DASHENC_T1_SOURCE),
+        ):
+            findings = upstream_lint.option_interplay_findings(tree, "HEAD", "patch", doc_entries)
+        self.assertEqual(findings, [])
+
 
 WRAP_TEXT = (
     "@section libsvtav1\n"
@@ -2643,6 +2927,136 @@ class PipelineTest(FixtureTest):
         rc, output = self.check()
         self.assertEqual(rc, 0, output)
         self.assertIn("step: doc-terms rc: 0", output)
+
+    def test_doc_terms_option_interplay_fails(self) -> None:
+        """Added ignore_io_errors tests near global_sidx without naming it fail doc-terms."""
+        self._write_dashenc_fixture()
+        self.commit("libavformat/dashenc: option table fixture")
+        self.base = self.git("rev-parse", "HEAD").strip()
+        self.write("libavformat/dashenc.c", DASHENC_T1_SOURCE)
+        self.write("doc/muxers.texi", DOC_MUXERS_T1)
+        self.commit("libavformat/dashenc: ignore I/O errors")
+        rc, output = self.check()
+        self.assertEqual(rc, 1, output)
+        self.assertIn("step: doc-terms rc: 1", output)
+        self.assertIn("option interplay", output)
+        self.assertIn("added code tests ignore_io_errors near global_sidx", output)
+
+    def test_doc_terms_option_interplay_avoption_const_before_offset(self) -> None:
+        """A const AVOption row without OFFSET must not remap the following field."""
+        self.write("libavformat/dashenc.c", DASHENC_OPTIONS_T9)
+        self.write("doc/muxers.texi", DOC_MUXERS_BASE)
+        self.commit("libavformat/dashenc: option table with const row")
+        self.base = self.git("rev-parse", "HEAD").strip()
+        self.write("libavformat/dashenc.c", DASHENC_T9_SOURCE)
+        self.write("doc/muxers.texi", DOC_MUXERS_T1)
+        self.commit("libavformat/dashenc: ignore I/O errors")
+        rc, output = self.check()
+        self.assertEqual(rc, 1, output)
+        self.assertIn("added code tests ignore_io_errors near global_sidx", output)
+
+    def test_doc_terms_option_interplay_two_added_lines_once(self) -> None:
+        """Two added lines testing the same pair report option interplay only once."""
+        self._write_dashenc_fixture()
+        self.commit("libavformat/dashenc: option table fixture")
+        self.base = self.git("rev-parse", "HEAD").strip()
+        self.write("libavformat/dashenc.c", DASHENC_T10_SOURCE)
+        self.write("doc/muxers.texi", DOC_MUXERS_T1)
+        self.commit("libavformat/dashenc: dual ignore I/O guards")
+        rc, output = self.check()
+        self.assertEqual(rc, 1, output)
+        self.assertEqual(output.count("option interplay:"), 1)
+
+    def test_doc_terms_option_interplay_named_passes(self) -> None:
+        """Docs that name global_sidx waive the ignore_io_errors interplay finding."""
+        self._write_dashenc_fixture()
+        self.commit("libavformat/dashenc: option table fixture")
+        self.base = self.git("rev-parse", "HEAD").strip()
+        self.write("libavformat/dashenc.c", DASHENC_T1_SOURCE)
+        self.write("doc/muxers.texi", DOC_MUXERS_T2)
+        self.commit("libavformat/dashenc: ignore I/O errors")
+        rc, output = self.check()
+        self.assertEqual(rc, 0, output)
+        self.assertIn("step: doc-terms rc: 0", output)
+
+    def test_doc_terms_option_interplay_same_line_passes(self) -> None:
+        """single-file wording in the entry waives interplay on the same added line."""
+        self._write_dashenc_fixture()
+        self.commit("libavformat/dashenc: option table fixture")
+        self.base = self.git("rev-parse", "HEAD").strip()
+        self.write("libavformat/dashenc.c", DASHENC_T3_SOURCE)
+        self.write("doc/muxers.texi", DOC_MUXERS_T3)
+        self.commit("libavformat/dashenc: single file guard")
+        rc, output = self.check()
+        self.assertEqual(rc, 0, output)
+        self.assertIn("step: doc-terms rc: 0", output)
+
+    def test_doc_terms_option_interplay_window_passes(self) -> None:
+        """global_sidx four lines away from the added test stays outside the window."""
+        self._write_dashenc_fixture()
+        self.commit("libavformat/dashenc: option table fixture")
+        self.base = self.git("rev-parse", "HEAD").strip()
+        self.write("libavformat/dashenc.c", DASHENC_T4_SOURCE)
+        self.write("doc/muxers.texi", DOC_MUXERS_T1)
+        self.commit("libavformat/dashenc: ignore I/O errors")
+        rc, output = self.check()
+        self.assertEqual(rc, 0, output)
+        self.assertIn("step: doc-terms rc: 0", output)
+
+    def test_doc_terms_option_interplay_comment_passes(self) -> None:
+        """A comment-only global_sidx mention in the window is not an option test."""
+        self._write_dashenc_fixture()
+        self.commit("libavformat/dashenc: option table fixture")
+        self.base = self.git("rev-parse", "HEAD").strip()
+        self.write("libavformat/dashenc.c", DASHENC_T5_SOURCE)
+        self.write("doc/muxers.texi", DOC_MUXERS_T1)
+        self.commit("libavformat/dashenc: ignore I/O errors")
+        rc, output = self.check()
+        self.assertEqual(rc, 0, output)
+        self.assertIn("step: doc-terms rc: 0", output)
+
+    def test_doc_terms_option_interplay_wrong_entry_passes(self) -> None:
+        """Doc additions in another entry do not trigger ignore_io_errors interplay."""
+        self._write_dashenc_fixture()
+        self.commit("libavformat/dashenc: option table fixture")
+        self.base = self.git("rev-parse", "HEAD").strip()
+        self.write("libavformat/dashenc.c", DASHENC_T1_SOURCE)
+        self.write("doc/muxers.texi", DOC_MUXERS_T6)
+        self.commit("libavformat/dashenc: ignore I/O errors")
+        rc, output = self.check()
+        self.assertEqual(rc, 0, output)
+        self.assertIn("step: doc-terms rc: 0", output)
+
+    def test_doc_terms_option_interplay_waiver_passes(self) -> None:
+        """A non-blank --doc-reason waives an option-interplay doc-terms finding."""
+        self._write_dashenc_fixture()
+        self.commit("libavformat/dashenc: option table fixture")
+        self.base = self.git("rev-parse", "HEAD").strip()
+        self.write("libavformat/dashenc.c", DASHENC_T1_SOURCE)
+        self.write("doc/muxers.texi", DOC_MUXERS_T1)
+        self.commit("libavformat/dashenc: ignore I/O errors")
+        rc, output = self.check("--doc-reason", "global_sidx layout is documented elsewhere")
+        self.assertEqual(rc, 0, output)
+        self.assertIn("waived: global_sidx layout is documented elsewhere", output)
+        self.assertIn("step: doc-terms rc: 0", output)
+
+    def test_doc_terms_option_interplay_no_table_passes(self) -> None:
+        """Source without an AVOption table produces no option-interplay finding."""
+        self.write("libavformat/dashenc.c", DASHENC_NO_TABLE)
+        self.write("doc/muxers.texi", DOC_MUXERS_BASE)
+        self.commit("libavformat/dashenc: writer without options")
+        self.base = self.git("rev-parse", "HEAD").strip()
+        self.write("libavformat/dashenc.c", DASHENC_NO_TABLE_T1)
+        self.write("doc/muxers.texi", DOC_MUXERS_T1)
+        self.commit("libavformat/dashenc: ignore I/O errors")
+        rc, output = self.check()
+        self.assertEqual(rc, 0, output)
+        self.assertIn("step: doc-terms rc: 0", output)
+
+    def _write_dashenc_fixture(self) -> None:
+        """Write the dashenc and muxers fixture files shared by option-interplay tests."""
+        self.write("libavformat/dashenc.c", DASHENC_BASE)
+        self.write("doc/muxers.texi", DOC_MUXERS_BASE)
 
     def test_speed_claim_fails(self) -> None:
         """An encode speed claim without an end-to-end figure fails claim-scope."""

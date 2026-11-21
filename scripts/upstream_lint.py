@@ -83,17 +83,26 @@ still does not support, are not detected.
 
 The doc-terms step fails when base..head adds lines both to library or fftools
 sources and to Texinfo files under doc/, and an added source line shows a
-behaviour whose added description leaves one of its cases out: a test for
-non-RGB input (a comparison against a COLOR_RGB constant, or a negated
-AV_PIX_FMT_FLAG_RGB flag test, in either operand order) while the added
-docs say YUV but never non-RGB, gray or grey, or a colour range comparison
-while the added docs mention range
-or rangein but never unspecified, unknown or untagged. The added source lines
-are read from the head file with comments, string literals and preprocessor
-lines blanked, so a comment that names the behaviour does not count, and
-neither does a macro that tests the flag. --doc-reason TEXT waives it and
-prints the reason. Only these two pairs are checked; any other gap between
-what the code does and what the docs say is not detected.
+behaviour whose added description leaves one of its cases out. The non-RGB
+pair fires when the code tests non-RGB input (a comparison against a COLOR_RGB
+constant, or a negated AV_PIX_FMT_FLAG_RGB flag test, in either operand order)
+while the added docs say YUV but never non-RGB, gray or grey. The
+unspecified-range pair fires on a colour range comparison while the added docs
+mention range or rangein but never unspecified, unknown or untagged. The added
+source lines are read from the head file with comments, string literals and
+preprocessor lines blanked, so a comment that names the behaviour does not
+count, and neither does a macro that tests the flag. It also fails when an added
+line tests one AVOption field within three head lines of a test of another field
+from the same file's option table, and the changed Texinfo entry for that option
+gains text but never names the neighbour option (underscore in the name may
+match a hyphen or space). Entry scope is the nearest preceding @item or @itemx
+through the line before the next @item, @itemx or @end; the full entry text at
+head is used, not added lines alone. Only structure member access with -> is
+treated as an option test; interplay beyond the window of three head lines or
+across files is not detected. --doc-reason TEXT waives it and prints the reason.
+The non-RGB pair, the unspecified-range pair, and this option-interplay check
+are the only doc-term rules; any other gap between what the code does and what
+the docs say is not detected.
 
 The doc-wrap step fails an added line of filled prose in a changed doc/*.texi
 file that is shorter than half of both neighbouring prose lines, each at least
@@ -1757,6 +1766,191 @@ def is_doc_path(name: str) -> bool:
     return len(parts) > 1 and parts[0] == "doc" and name.endswith(".texi")
 
 
+OPTION_WINDOW = 3
+AVOPTION_HELP = r'(?:(?:"(?:[^"\\]|\\.)*"\s*)+|NULL\s*)'
+AVOPTION_FIELD = (
+    r"(?:OFFSET\s*\(\s*(\w+(?:\[[^\]]*\])?)\s*\)|"
+    r"offsetof\s*\(\s*\w+\s*,\s*(\w+(?:\[[^\]]*\])?)\s*\))"
+)
+AVOPTION_ENTRY = re.compile(rf"\{{\s*\"([^\"]+)\"\s*,\s*{AVOPTION_HELP}\s*,\s*{AVOPTION_FIELD}")
+TEXI_ITEM_HEAD = re.compile(r"^@itemx?\s+(\S+)")
+TEXI_ENTRY_BOUNDARY = re.compile(r"^@(?:itemx?|end)\b")
+OPTION_TEST_MARKERS = ("if (", "while (", "&&", "||", "?")
+
+
+def avoption_field_map(raw: str) -> dict[str, str]:
+    """Map AVOption OFFSET fields to public option names in one source file."""
+    mapping: dict[str, str] = {}
+    for match in AVOPTION_ENTRY.finditer(raw):
+        name = match[1]
+        field = match[2] or match[3]
+        if field:
+            mapping[field] = name
+    return mapping
+
+
+def _option_fields_tested(line: str, fields: frozenset[str]) -> frozenset[str]:
+    """Return option structure fields tested on one blanked source line."""
+    if not any(marker in line for marker in OPTION_TEST_MARKERS):
+        return frozenset()
+    found: set[str] = set()
+    for option_field in fields:
+        if re.search(rf"->{re.escape(option_field)}\b", line):
+            found.add(option_field)
+    return frozenset(found)
+
+
+def texi_option_name(token: str) -> str:
+    """Strip @option or @var from the first word of a Texinfo item line."""
+    if token.startswith("@option{") and token.endswith("}"):
+        return token[8:-1]
+    if token.startswith("@var{") and token.endswith("}"):
+        return token[5:-1]
+    return token
+
+
+def texi_entry_ranges(lines: list[str]) -> list[tuple[int, int, str, str]]:
+    """Return 1-based line ranges, option names and text for each @item entry."""
+    entries: list[tuple[int, int, str, str]] = []
+    index = 0
+    while index < len(lines):
+        match = TEXI_ITEM_HEAD.match(lines[index])
+        if not match:
+            index += 1
+            continue
+        name = texi_option_name(match[1])
+        start = index
+        index += 1
+        while index < len(lines) and not TEXI_ENTRY_BOUNDARY.match(lines[index]):
+            index += 1
+        entries.append((start + 1, index, name, "\n".join(lines[start:index])))
+    return entries
+
+
+def option_named_in_text(name: str, text: str) -> bool:
+    """Return whether an option name appears in Texinfo text."""
+    body = "[_\\- ]".join(re.escape(part) for part in name.split("_"))
+    return re.search(rf"(?<![\w-]){body}(?![\w-])", text) is not None
+
+
+def _doc_entries_with_additions(tree: Path, head: str, range_patch: str) -> dict[str, str]:
+    """Map option names to entry text for Texinfo entries that gained lines."""
+    entries: dict[str, str] = {}
+    for path, hunks, _added in _patch_files(range_patch):
+        if not is_doc_path(path):
+            continue
+        added = _added_lines("\n".join(hunks))
+        if not added:
+            continue
+        lines = _git(tree, "show", f"{head}:{path}").split("\n")
+        for start, end, name, text in texi_entry_ranges(lines):
+            if any(start <= number <= end for number in added):
+                entries[name] = text
+    return entries
+
+
+def _option_pairs_between(
+    tested: frozenset[str], nearby: frozenset[str], field_map: dict[str, str]
+) -> list[tuple[str, str]]:
+    """Return option name pairs between two tested field sets in one source file."""
+    pairs: list[tuple[str, str]] = []
+    for field_a in tested:
+        option_a = field_map[field_a]
+        for field_b in nearby:
+            if field_a == field_b:
+                continue
+            pairs.append((option_a, field_map[field_b]))
+    return pairs
+
+
+def _interplay_pairs_for_line(
+    number: int,
+    tested: frozenset[str],
+    code_lines: list[str],
+    field_map: dict[str, str],
+) -> list[tuple[int, str, str]]:
+    """List option name pairs one added line triggers within OPTION_WINDOW."""
+    fields = frozenset(field_map)
+    low = max(1, number - OPTION_WINDOW)
+    high = min(len(code_lines), number + OPTION_WINDOW)
+    raw: list[tuple[int, str, str]] = []
+    for other in range(low, high + 1):
+        nearby = _option_fields_tested(code_lines[other - 1], fields)
+        for option_a, option_b in _option_pairs_between(tested, nearby, field_map):
+            raw.append((number, option_a, option_b))
+    return raw
+
+
+def _dedupe_interplay_pairs(
+    raw: list[tuple[int, str, str]],
+) -> list[tuple[int, str, str]]:
+    """Keep the first added line for each option name pair in one source file."""
+    seen: dict[tuple[str, str], int] = {}
+    for number, option_a, option_b in raw:
+        key = (option_a, option_b)
+        if key not in seen or number < seen[key]:
+            seen[key] = number
+    return [(seen[key], key[0], key[1]) for key in seen]
+
+
+def _interplay_pairs(
+    code_lines: list[str], added: set[int], field_map: dict[str, str]
+) -> list[tuple[int, str, str]]:
+    """List unique option name pairs from added lines tested within OPTION_WINDOW."""
+    fields = frozenset(field_map)
+    raw: list[tuple[int, str, str]] = []
+    for number in sorted(added):
+        if number > len(code_lines):
+            continue
+        tested = _option_fields_tested(code_lines[number - 1], fields)
+        if not tested:
+            continue
+        raw.extend(_interplay_pairs_for_line(number, tested, code_lines, field_map))
+    return _dedupe_interplay_pairs(raw)
+
+
+def _interplay_findings_one_path(
+    tree: Path,
+    head: str,
+    path: str,
+    hunks: list[str],
+    doc_entries: dict[str, str],
+) -> list[str]:
+    """Return option-interplay doc-terms findings for one changed source file."""
+    added = _added_lines("\n".join(hunks))
+    if not added:
+        return []
+    raw = _git(tree, "show", f"{head}:{path}")
+    field_map = avoption_field_map(raw)
+    if not field_map:
+        return []
+    raw_lines = raw.split("\n")
+    code_lines = _code_lines(raw)
+    findings: list[str] = []
+    for number, option_a, option_b in _interplay_pairs(code_lines, added, field_map):
+        entry = doc_entries.get(option_a)
+        if entry is None or option_named_in_text(option_b, entry):
+            continue
+        snippet = raw_lines[number - 1].strip()
+        findings.append(
+            f'option interplay: added code tests {option_a} near {option_b} in "{snippet}"; '
+            f"the {option_a} docs never name {option_b}; say how {option_b} changes {option_a}"
+        )
+    return findings
+
+
+def option_interplay_findings(
+    tree: Path, head: str, range_patch: str, doc_entries: dict[str, str]
+) -> list[str]:
+    """Return doc-terms findings for coupled AVOption tests and under-documented entries."""
+    findings: list[str] = []
+    for path, hunks, _added in _patch_files(range_patch):
+        if not is_source_path(path):
+            continue
+        findings.extend(_interplay_findings_one_path(tree, head, path, hunks, doc_entries))
+    return findings
+
+
 def doc_term_findings(code: str, docs: str) -> list[str]:
     """Return a finding per doc term the added code shows and the added docs omit."""
     findings: list[str] = []
@@ -1790,9 +1984,12 @@ def _doc_terms(tree: Path, base: str, head: str, waiver: str) -> Step:
             code.extend(_added_code(tree, head, path, hunks))
         elif is_doc_path(path):
             docs.extend(added)
+    doc_entries = _doc_entries_with_additions(tree, head, range_patch)
+    findings = doc_term_findings("\n".join(code), "\n".join(docs))
+    findings.extend(option_interplay_findings(tree, head, range_patch, doc_entries))
     return _waivable_step(
         "doc-terms",
-        doc_term_findings("\n".join(code), "\n".join(docs)),
+        findings,
         waiver,
         f"no omitted doc term in {len(docs)} added doc line(s)",
         "name the case in the docs, or pass --doc-reason",

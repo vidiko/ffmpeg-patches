@@ -1778,24 +1778,62 @@ TEXI_ENTRY_BOUNDARY = re.compile(r"^@(?:itemx?|end)\b")
 OPTION_TEST_MARKERS = ("if (", "while (", "&&", "||", "?")
 
 
-def avoption_field_map(raw: str) -> dict[str, str]:
-    """Map AVOption OFFSET fields to public option names in one source file."""
-    mapping: dict[str, str] = {}
+def avoption_field_map(raw: str) -> dict[str, list[str]]:
+    """Map each AVOption OFFSET field to its public option names in table order."""
+    mapping: dict[str, list[str]] = {}
     for match in AVOPTION_ENTRY.finditer(raw):
         name = match[1]
         field = match[2] or match[3]
         if field:
-            mapping[field] = name
+            names = mapping.setdefault(field, [])
+            if name not in names:
+                names.append(name)
     return mapping
 
 
-def _option_fields_tested(line: str, fields: frozenset[str]) -> frozenset[str]:
+def _condition_span_lines(code_lines: list[str]) -> frozenset[int]:
+    """Return 1-based line numbers inside the parentheses of an if or while condition."""
+    inside: set[int] = set()
+    depth = 0
+    for index, line in enumerate(code_lines):
+        number = index + 1
+        pos = 0
+        if depth > 0:
+            inside.add(number)
+        while pos < len(line):
+            if depth == 0:
+                started = False
+                for marker in ("if (", "while ("):
+                    found = line.find(marker, pos)
+                    if found >= 0:
+                        depth = 1
+                        pos = found + len(marker)
+                        inside.add(number)
+                        started = True
+                        break
+                if not started:
+                    break
+                continue
+            if line[pos] == "(":
+                depth += 1
+            elif line[pos] == ")":
+                depth -= 1
+            pos += 1
+    return frozenset(inside)
+
+
+def _option_fields_tested(
+    line: str,
+    fields: frozenset[str],
+    *,
+    in_condition: bool = False,
+) -> frozenset[str]:
     """Return option structure fields tested on one blanked source line."""
-    if not any(marker in line for marker in OPTION_TEST_MARKERS):
+    if not in_condition and not any(marker in line for marker in OPTION_TEST_MARKERS):
         return frozenset()
     found: set[str] = set()
     for option_field in fields:
-        if re.search(rf"->{re.escape(option_field)}\b", line):
+        if re.search(rf"->{re.escape(option_field)}(?!\w)", line):
             found.add(option_field)
     return frozenset(found)
 
@@ -1833,9 +1871,9 @@ def option_named_in_text(name: str, text: str) -> bool:
     return re.search(rf"(?<![\w-]){body}(?![\w-])", text) is not None
 
 
-def _doc_entries_with_additions(tree: Path, head: str, range_patch: str) -> dict[str, str]:
-    """Map option names to entry text for Texinfo entries that gained lines."""
-    entries: dict[str, str] = {}
+def _doc_entries_with_additions(tree: Path, head: str, range_patch: str) -> dict[str, list[str]]:
+    """Map option names to changed entry texts in document order."""
+    entries: dict[str, list[str]] = {}
     for path, hunks, _added in _patch_files(range_patch):
         if not is_doc_path(path):
             continue
@@ -1845,21 +1883,22 @@ def _doc_entries_with_additions(tree: Path, head: str, range_patch: str) -> dict
         lines = _git(tree, "show", f"{head}:{path}").split("\n")
         for start, end, name, text in texi_entry_ranges(lines):
             if any(start <= number <= end for number in added):
-                entries[name] = text
+                entries.setdefault(name, []).append(text)
     return entries
 
 
 def _option_pairs_between(
-    tested: frozenset[str], nearby: frozenset[str], field_map: dict[str, str]
+    tested: frozenset[str], nearby: frozenset[str], field_map: dict[str, list[str]]
 ) -> list[tuple[str, str]]:
     """Return option name pairs between two tested field sets in one source file."""
     pairs: list[tuple[str, str]] = []
     for field_a in tested:
-        option_a = field_map[field_a]
-        for field_b in nearby:
-            if field_a == field_b:
-                continue
-            pairs.append((option_a, field_map[field_b]))
+        for option_a in field_map[field_a]:
+            for field_b in nearby:
+                if field_a == field_b:
+                    continue
+                for option_b in field_map[field_b]:
+                    pairs.append((option_a, option_b))
     return pairs
 
 
@@ -1867,7 +1906,8 @@ def _interplay_pairs_for_line(
     number: int,
     tested: frozenset[str],
     code_lines: list[str],
-    field_map: dict[str, str],
+    field_map: dict[str, list[str]],
+    cond_lines: frozenset[int],
 ) -> list[tuple[int, str, str]]:
     """List option name pairs one added line triggers within OPTION_WINDOW."""
     fields = frozenset(field_map)
@@ -1875,7 +1915,11 @@ def _interplay_pairs_for_line(
     high = min(len(code_lines), number + OPTION_WINDOW)
     raw: list[tuple[int, str, str]] = []
     for other in range(low, high + 1):
-        nearby = _option_fields_tested(code_lines[other - 1], fields)
+        nearby = _option_fields_tested(
+            code_lines[other - 1],
+            fields,
+            in_condition=other in cond_lines,
+        )
         for option_a, option_b in _option_pairs_between(tested, nearby, field_map):
             raw.append((number, option_a, option_b))
     return raw
@@ -1894,18 +1938,23 @@ def _dedupe_interplay_pairs(
 
 
 def _interplay_pairs(
-    code_lines: list[str], added: set[int], field_map: dict[str, str]
+    code_lines: list[str], added: set[int], field_map: dict[str, list[str]]
 ) -> list[tuple[int, str, str]]:
     """List unique option name pairs from added lines tested within OPTION_WINDOW."""
     fields = frozenset(field_map)
+    cond_lines = _condition_span_lines(code_lines)
     raw: list[tuple[int, str, str]] = []
     for number in sorted(added):
         if number > len(code_lines):
             continue
-        tested = _option_fields_tested(code_lines[number - 1], fields)
+        tested = _option_fields_tested(
+            code_lines[number - 1],
+            fields,
+            in_condition=number in cond_lines,
+        )
         if not tested:
             continue
-        raw.extend(_interplay_pairs_for_line(number, tested, code_lines, field_map))
+        raw.extend(_interplay_pairs_for_line(number, tested, code_lines, field_map, cond_lines))
     return _dedupe_interplay_pairs(raw)
 
 
@@ -1914,7 +1963,7 @@ def _interplay_findings_one_path(
     head: str,
     path: str,
     hunks: list[str],
-    doc_entries: dict[str, str],
+    doc_entries: dict[str, list[str]],
 ) -> list[str]:
     """Return option-interplay doc-terms findings for one changed source file."""
     added = _added_lines("\n".join(hunks))
@@ -1928,8 +1977,10 @@ def _interplay_findings_one_path(
     code_lines = _code_lines(raw)
     findings: list[str] = []
     for number, option_a, option_b in _interplay_pairs(code_lines, added, field_map):
-        entry = doc_entries.get(option_a)
-        if entry is None or option_named_in_text(option_b, entry):
+        entry_texts = doc_entries.get(option_a)
+        if entry_texts is None:
+            continue
+        if all(option_named_in_text(option_b, text) for text in entry_texts):
             continue
         snippet = raw_lines[number - 1].strip()
         findings.append(
@@ -1940,7 +1991,7 @@ def _interplay_findings_one_path(
 
 
 def option_interplay_findings(
-    tree: Path, head: str, range_patch: str, doc_entries: dict[str, str]
+    tree: Path, head: str, range_patch: str, doc_entries: dict[str, list[str]]
 ) -> list[str]:
     """Return doc-terms findings for coupled AVOption tests and under-documented entries."""
     findings: list[str] = []

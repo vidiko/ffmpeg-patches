@@ -214,6 +214,85 @@ DOC_MUXERS_T6 = (
     "Write one output file.\n"
     "@end table\n"
 )
+DASHENC_OPTIONS_ALIAS = (
+    "#define OFFSET(x) offsetof(DashContext, x)\n"
+    "typedef struct DashContext {\n"
+    "    int ignore_io_errors;\n"
+    "    int global_sidx;\n"
+    "} DashContext;\n"
+    "static const AVOption options[] = {\n"
+    '    { "ignore_io_errors", "ignore", OFFSET(ignore_io_errors), 0 },\n'
+    '    { "ignore_errors", "alias", OFFSET(ignore_io_errors), 0 },\n'
+    '    { "global_sidx", "sidx", OFFSET(global_sidx), 0 },\n'
+    "};\n"
+)
+DASHENC_ALIAS_BASE = (
+    DASHENC_OPTIONS_ALIAS
+    + "int dash_write(DashContext *c)\n{\n    int ret = 0;\n    ;\n    ;\n"
+    + DASHENC_WRITE_TAIL
+)
+DASHENC_ALIAS_T1 = (
+    DASHENC_OPTIONS_ALIAS
+    + "int dash_write(DashContext *c)\n{\n    int ret = 0;\n"
+    + "    if (!c->ignore_io_errors && ret >= 0) { ret = 0; }\n"
+    + "    ;\n    ;\n"
+    + DASHENC_WRITE_TAIL
+)
+DOC_MUXERS_ALIAS_BASE = (
+    "@table @option\n"
+    "@item ignore_io_errors\n"
+    "Ignore I/O errors.\n"
+    "@item ignore_errors\n"
+    "Deprecated alias.\n"
+    "@item global_sidx\n"
+    "Write a global sidx.\n"
+    "@end table\n"
+)
+DOC_MUXERS_ALIAS_T1 = (
+    "@table @option\n"
+    "@item ignore_io_errors\n"
+    "Ignore I/O errors.\n"
+    "Skip flush failures when the output is not writable.\n"
+    "@item ignore_errors\n"
+    "Deprecated alias.\n"
+    "@item global_sidx\n"
+    "Write a global sidx.\n"
+    "@end table\n"
+)
+DASHENC_COND_T1 = (
+    DASHENC_OPTIONS
+    + "int dash_write(DashContext *c)\n{\n    int ret = 0;\n"
+    + "    if (ret >= 0 &&\n        !c->ignore_io_errors)\n        ret = 0;\n"
+    + "    if (c->global_sidx) {\n        ret = 1;\n    }\n    return ret;\n}\n"
+)
+DASHENC_OPTIONS_FLAGS = (
+    "#define OFFSET(x) offsetof(DashContext, x)\n"
+    "typedef struct DashContext {\n"
+    "    int flags[4];\n"
+    "    int global_sidx_extra;\n"
+    "    int global_sidx;\n"
+    "} DashContext;\n"
+    "static const AVOption options[] = {\n"
+    '    { "flags", "flags", OFFSET(flags[0]), 0 },\n'
+    '    { "global_sidx", "sidx", OFFSET(global_sidx), 0 },\n'
+    "};\n"
+)
+DASHENC_FLAGS_BASE = (
+    DASHENC_OPTIONS_FLAGS + "int dash_write(DashContext *c)\n{\n    return c->global_sidx;\n}\n"
+)
+DASHENC_FLAGS_T1 = (
+    DASHENC_OPTIONS_FLAGS
+    + "int dash_write(DashContext *c)\n{\n    if (c->flags[0]) { return 1; }\n"
+    + "    if (c->global_sidx) { return 2; }\n    return 0;\n}\n"
+)
+DOC_MUXERS_FLAGS_T1 = (
+    "@table @option\n"
+    "@item flags\n"
+    "Bitmask flags.\n"
+    "@item global_sidx\n"
+    "Write a global sidx.\n"
+    "@end table\n"
+)
 
 
 class RulesTest(unittest.TestCase):
@@ -1735,21 +1814,21 @@ class DocTermTest(unittest.TestCase):
         """AVOption rows with OFFSET map the structure field to the quoted name."""
         raw = DASHENC_OPTIONS
         mapping = upstream_lint.avoption_field_map(raw)
-        self.assertEqual(mapping.get("global_sidx"), "global_sidx")
-        self.assertEqual(mapping.get("ignore_io_errors"), "ignore_io_errors")
+        self.assertEqual(mapping.get("global_sidx"), ["global_sidx"])
+        self.assertEqual(mapping.get("ignore_io_errors"), ["ignore_io_errors"])
 
     def test_avoption_field_map_const_without_offset_ignored(self) -> None:
         """A constant table row without OFFSET maps nothing and does not steal the next field."""
         raw = DASHENC_OPTIONS_T9
         mapping = upstream_lint.avoption_field_map(raw)
         self.assertNotIn("none", mapping)
-        self.assertEqual(mapping.get("global_sidx"), "global_sidx")
+        self.assertEqual(mapping.get("global_sidx"), ["global_sidx"])
 
     def test_avoption_field_map_adjacent_help_literals(self) -> None:
         """Two adjacent string literals in the help column still map the OFFSET field."""
         raw = DASHENC_OPTIONS_T9
         mapping = upstream_lint.avoption_field_map(raw)
-        self.assertEqual(mapping.get("single_file"), "single_file")
+        self.assertEqual(mapping.get("single_file"), ["single_file"])
 
     def test_avoption_field_map_null_help(self) -> None:
         """NULL help text before OFFSET still maps the structure field."""
@@ -1761,7 +1840,61 @@ class DocTermTest(unittest.TestCase):
             "};\n"
         )
         mapping = upstream_lint.avoption_field_map(raw)
-        self.assertEqual(mapping.get("foo_field"), "foo")
+        self.assertEqual(mapping.get("foo_field"), ["foo"])
+
+    def test_avoption_field_map_shared_field_lists_both_names(self) -> None:
+        """Each public name for one OFFSET field is kept in table order."""
+        mapping = upstream_lint.avoption_field_map(DASHENC_OPTIONS_ALIAS)
+        self.assertEqual(mapping.get("ignore_io_errors"), ["ignore_io_errors", "ignore_errors"])
+
+    def test_option_fields_tested_continuation_in_if_condition(self) -> None:
+        """A continuation line inside an if condition counts as testing option fields."""
+        line = "        !c->ignore_io_errors)"
+        fields = frozenset({"ignore_io_errors"})
+        code_lines = [
+            "int f() {",
+            "    if (ret >= 0 &&",
+            line,
+            "        ret = 0;",
+            "}",
+        ]
+        cond = upstream_lint._condition_span_lines(code_lines)
+        tested = upstream_lint._option_fields_tested(line, fields, in_condition=3 in cond)
+        self.assertEqual(tested, frozenset({"ignore_io_errors"}))
+
+    def test_option_fields_tested_plain_assignment_not_counted(self) -> None:
+        """A plain assignment line reading an option field is not an option test."""
+        line = "    c->ignore_io_errors = 1;"
+        cond = upstream_lint._condition_span_lines([line])
+        tested = upstream_lint._option_fields_tested(
+            line, frozenset({"ignore_io_errors"}), in_condition=1 in cond
+        )
+        self.assertEqual(tested, frozenset())
+
+    def test_option_fields_tested_indexed_member(self) -> None:
+        """An indexed structure member matches a field name ending with an index."""
+        line = "    if (c->flags[0]) {"
+        tested = upstream_lint._option_fields_tested(line, frozenset({"flags[0]"}))
+        self.assertEqual(tested, frozenset({"flags[0]"}))
+
+    def test_option_fields_tested_longer_identifier_not_matched(self) -> None:
+        """A longer identifier does not match a shorter option field name."""
+        line = "    if (c->global_sidx_extra) {"
+        tested = upstream_lint._option_fields_tested(line, frozenset({"global_sidx"}))
+        self.assertEqual(tested, frozenset())
+
+    def test_option_pairs_between_skips_same_field_aliases(self) -> None:
+        """No option name pair is formed between two names of the same OFFSET field."""
+        field_map = {
+            "ignore_io_errors": ["ignore_io_errors", "ignore_errors"],
+            "global_sidx": ["global_sidx"],
+        }
+        pairs = upstream_lint._option_pairs_between(
+            frozenset({"ignore_io_errors"}),
+            frozenset({"ignore_io_errors"}),
+            field_map,
+        )
+        self.assertEqual(pairs, [])
 
     def test_texi_option_name_strips_inline_command(self) -> None:
         """@option{NAME} on an item line yields NAME."""
@@ -1821,7 +1954,7 @@ class DocTermTest(unittest.TestCase):
         tree = Path("/fixture/tree")
         head = "HEAD"
         range_patch = "diff --git a/libavformat/dashenc.c\n"
-        doc_entries = {"ignore_io_errors": "Ignore I/O errors.\nSkip flush failures."}
+        doc_entries = {"ignore_io_errors": ["Ignore I/O errors.\nSkip flush failures."]}
         with (
             unittest.mock.patch.object(
                 upstream_lint, "_patch_files", return_value=[("libavformat/dashenc.c", ["@@"], 0)]
@@ -1837,7 +1970,7 @@ class DocTermTest(unittest.TestCase):
         """Findings are omitted when the changed entry names the neighbour option."""
         tree = Path("/fixture/tree")
         doc_entries = {
-            "ignore_io_errors": "Ignore errors; respects global_sidx placement.",
+            "ignore_io_errors": ["Ignore errors; respects global_sidx placement."],
         }
         with (
             unittest.mock.patch.object(
@@ -1862,6 +1995,20 @@ class DocTermTest(unittest.TestCase):
         ):
             findings = upstream_lint.option_interplay_findings(tree, "HEAD", "patch", doc_entries)
         self.assertEqual(findings, [])
+
+    def test_interplay_pairs_alias_maps_nearby_scalar(self) -> None:
+        """Pair generation lists every option name for a shared field near a scalar test."""
+        code_lines = upstream_lint._code_lines(DASHENC_ALIAS_T1)
+        field_map = upstream_lint.avoption_field_map(DASHENC_ALIAS_T1)
+        added = {line for line, text in enumerate(code_lines, 1) if text.strip().startswith("if ")}
+        pairs = upstream_lint._interplay_pairs(code_lines, added, field_map)
+        names = {(option_a, option_b) for _line, option_a, option_b in pairs}
+        self.assertIn(("ignore_io_errors", "global_sidx"), names)
+        self.assertIn(("ignore_errors", "global_sidx"), names)
+        self.assertNotIn(("ignore_io_errors", "ignore_errors"), names)
+        self.assertNotIn(("ignore_errors", "ignore_io_errors"), names)
+        self.assertNotIn(("ignore_io_errors", "ignore_io_errors"), names)
+        self.assertNotIn(("ignore_errors", "ignore_errors"), names)
 
 
 WRAP_TEXT = (
@@ -3056,6 +3203,107 @@ class PipelineTest(FixtureTest):
         rc, output = self.check()
         self.assertEqual(rc, 0, output)
         self.assertIn("step: doc-terms rc: 0", output)
+
+    def test_doc_terms_option_interplay_shared_field_alias_fails(self) -> None:
+        """Only the first alias name doc entry changes between base and T1."""
+        self.write("libavformat/dashenc.c", DASHENC_ALIAS_BASE)
+        self.write("doc/muxers.texi", DOC_MUXERS_ALIAS_BASE)
+        self.commit("libavformat/dashenc: alias option table")
+        self.base = self.git("rev-parse", "HEAD").strip()
+        self.write("libavformat/dashenc.c", DASHENC_ALIAS_T1)
+        self.write("doc/muxers.texi", DOC_MUXERS_ALIAS_T1)
+        self.commit("libavformat/dashenc: alias guard")
+        rc, output = self.check()
+        self.assertEqual(rc, 1, output)
+        self.assertEqual(output.count("option interplay:"), 1)
+        self.assertIn("ignore_io_errors near global_sidx", output)
+        self.assertNotIn("ignore_errors near", output)
+        self.assertNotIn("ignore_io_errors near ignore_errors", output)
+        self.assertNotIn("ignore_errors near ignore_io_errors", output)
+
+    def test_doc_terms_option_interplay_multiline_if_fails(self) -> None:
+        """An added continuation line inside a multiline if still couples with global_sidx."""
+        self._write_dashenc_fixture()
+        self.commit("libavformat/dashenc: option table fixture")
+        self.base = self.git("rev-parse", "HEAD").strip()
+        self.write("libavformat/dashenc.c", DASHENC_COND_T1)
+        self.write("doc/muxers.texi", DOC_MUXERS_T1)
+        self.commit("libavformat/dashenc: multiline ignore guard")
+        rc, output = self.check()
+        self.assertEqual(rc, 1, output)
+        self.assertIn("ignore_io_errors near global_sidx", output)
+
+    def test_doc_terms_option_interplay_indexed_flags_fails(self) -> None:
+        """An indexed flags member coupled with global_sidx yields option interplay."""
+        self.write("libavformat/dashenc.c", DASHENC_FLAGS_BASE)
+        self.write("doc/muxers.texi", DOC_MUXERS_FLAGS_T1)
+        self.commit("libavformat/dashenc: flags option table")
+        self.base = self.git("rev-parse", "HEAD").strip()
+        self.write("libavformat/dashenc.c", DASHENC_FLAGS_T1)
+        self.write(
+            "doc/muxers.texi",
+            DOC_MUXERS_FLAGS_T1.replace(
+                "Bitmask flags.\n", "Bitmask flags.\nApplies when segment indices shift.\n"
+            ),
+        )
+        self.commit("libavformat/dashenc: guard flags and global sidx")
+        rc, output = self.check()
+        self.assertEqual(rc, 1, output)
+        self.assertIn("flags near global_sidx", output)
+
+    def test_doc_terms_option_interplay_dual_entry_omit_first_fails(self) -> None:
+        """A later changed entry cannot waive a finding from an earlier omitting entry."""
+        self._write_dashenc_fixture()
+        self.commit("libavformat/dashenc: option table fixture")
+        self.base = self.git("rev-parse", "HEAD").strip()
+        self.write("libavformat/dashenc.c", DASHENC_T1_SOURCE)
+        omit_first = (
+            "@table @option\n"
+            "@item ignore_io_errors\n"
+            "Ignore transport failures only.\n"
+            "@item global_sidx\n"
+            "Write a global sidx.\n"
+            "@end table\n"
+            "@table @option\n"
+            "@item ignore_io_errors\n"
+            "Ignore I/O errors.\n"
+            "Respects global_sidx placement.\n"
+            "@item global_sidx\n"
+            "Write a global sidx.\n"
+            "@end table\n"
+        )
+        self.write("doc/muxers.texi", omit_first)
+        self.commit("libavformat/dashenc: dual ignore_io_errors docs")
+        rc, output = self.check()
+        self.assertEqual(rc, 1, output)
+        self.assertIn("ignore_io_errors near global_sidx", output)
+
+    def test_doc_terms_option_interplay_dual_entry_omit_last_fails(self) -> None:
+        """An earlier naming entry cannot waive a finding from a later omitting entry."""
+        self._write_dashenc_fixture()
+        self.commit("libavformat/dashenc: option table fixture")
+        self.base = self.git("rev-parse", "HEAD").strip()
+        self.write("libavformat/dashenc.c", DASHENC_T1_SOURCE)
+        omit_last = (
+            "@table @option\n"
+            "@item ignore_io_errors\n"
+            "Ignore I/O errors.\n"
+            "Respects global_sidx placement.\n"
+            "@item global_sidx\n"
+            "Write a global sidx.\n"
+            "@end table\n"
+            "@table @option\n"
+            "@item ignore_io_errors\n"
+            "Ignore transport failures only.\n"
+            "@item global_sidx\n"
+            "Write a global sidx.\n"
+            "@end table\n"
+        )
+        self.write("doc/muxers.texi", omit_last)
+        self.commit("libavformat/dashenc: dual ignore_io_errors docs reversed")
+        rc, output = self.check()
+        self.assertEqual(rc, 1, output)
+        self.assertIn("ignore_io_errors near global_sidx", output)
 
     def _write_dashenc_fixture(self) -> None:
         """Write the dashenc and muxers fixture files shared by option-interplay tests."""

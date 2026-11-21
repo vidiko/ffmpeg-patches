@@ -2542,6 +2542,68 @@ def _c_rules_depths(lines: list[bytes], code: list[str], directive_count: int) -
     return depths
 
 
+def _c_rules_scan_line(
+    clean: str, state: tuple[int, bool, bool, bool]
+) -> tuple[int, bool, bool, bool]:
+    """Advance brace depth, boundary state and function-header context across one code line."""
+    depth, _, in_function, after_rparen = state
+    stripped = clean.rstrip(" \t\r\f\v")
+    if not stripped:
+        return state
+    closed_function = False
+    for index in range(len(stripped)):
+        char = stripped[index]
+        if char in " \t\r\f\v":
+            continue
+        closed_function = False
+        if char == "{":
+            in_function = after_rparen if depth == 0 else in_function
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            closed_function = depth == 0 and in_function
+            in_function = in_function and depth > 0
+        after_rparen = char == ")"
+    at_boundary = stripped[-1] == ";" or closed_function
+    return depth, at_boundary, in_function, after_rparen
+
+
+def _c_rules_arm_state(
+    raw: bytes,
+    clean: str,
+    state: tuple[int, bool, bool, bool],
+    stack: list[tuple[tuple[int, bool, bool, bool], bool, bool, bool, bool]],
+    limit: int,
+) -> tuple[tuple[int, bool, bool, bool], bool]:
+    """Update per-arm boundary and header state across preprocessor conditional directives."""
+    match = re.match(rb"[ \t]*#[ \t]*([A-Za-z_]\w*)", raw)
+    word = match[1] if not clean.strip() and match is not None else b""
+    if word not in {b"if", b"ifdef", b"ifndef", b"elif", b"else", b"endif"}:
+        return state, True
+    if word in {b"if", b"ifdef", b"ifndef"} and len(stack) < limit:
+        stack.append((state, True, True, True, False))
+        return state, True
+    if word in {b"elif", b"else"} and stack and not stack[-1][4]:
+        entry, boundary_ok, in_func_ok, rparen_ok, _ = stack[-1]
+        stack[-1] = (
+            entry,
+            boundary_ok and state[1],
+            in_func_ok and state[2],
+            rparen_ok and state[3],
+            word == b"else",
+        )
+        return entry, True
+    if word == b"endif" and stack:
+        entry, boundary_ok, in_func_ok, rparen_ok, has_else = stack.pop()
+        return (
+            state[0],
+            boundary_ok and state[1] and (has_else or entry[1]),
+            in_func_ok and state[2] and (has_else or entry[2]),
+            rparen_ok and state[3] and (has_else or entry[3]),
+        ), True
+    return (state[0], False, False, False), False
+
+
 def _c_rules_blank(source: bytes, attributes: set[bytes]) -> bytes:
     """Blank code attributes and file-scope macro calls, preserving all noncode bytes."""
     code, directives = _c_lex_lines(source.decode("latin-1"))
@@ -2551,25 +2613,28 @@ def _c_rules_blank(source: bytes, attributes: set[bytes]) -> bytes:
     words = re.compile(rb"\b(?:" + b"|".join(sorted(attributes)) + rb")\b") if attributes else None
     lines = source.split(b"\n")
     depths = _c_rules_depths(lines, code, len(directives))
-    at_boundary = True
+    state = (0, True, False, False)
+    stack: list[tuple[tuple[int, bool, bool, bool], bool, bool, bool, bool]] = []
+    valid = True
     for index in range(len(lines)):
         raw, clean = lines[index], code[index]
+        state, ok = _c_rules_arm_state(raw, clean, state, stack, len(lines))
+        valid = valid and ok
         invocation = re.fullmatch(rb"[ \t]*[A-Za-z_]\w*[ \t]*\(.*\)[ \t\r]*", raw)
         if (
-            depths[index] == 0
-            and at_boundary
+            valid
+            and depths[index] == 0
+            and state[1]
             and invocation
             and _c_rules_macro_call(clean, names)
             and not raw[clean.rfind(")") + 1 :].strip(b" \t\r")
         ):
             lines[index] = re.sub(rb"[^\r]", b" ", raw)
-            at_boundary = True
+            state = (state[0] + clean.count("{") - clean.count("}"), True, False, False)
         else:
             if words is not None:
                 lines[index] = _c_rules_blank_words(raw, clean, words)
-            stripped = clean.rstrip(" \t\r\f\v")
-            if stripped:
-                at_boundary = stripped[-1] in {";", "}"}
+            state = _c_rules_scan_line(clean, state)
     return b"\n".join(lines)
 
 
@@ -2579,11 +2644,11 @@ def _c_rules_inside(path: Path, root: Path) -> bool:
 
 
 def _c_rules_copy_source(source: Path, target: Path, attributes: set[bytes]) -> str:
-    """Copy supported bytes or retain unread links, returning an unsupported-syntax reason."""
+    """Copy blanked supported bytes, or return an unread or unsupported-syntax reason."""
     try:
         content = _c_rules_read_source(source)
     except OSError:
-        target.symlink_to(source.absolute())
+        return "could not be read"
     except ValueError as error:
         return str(error)
     else:

@@ -4294,6 +4294,39 @@ class CRulesScratchTest(FixtureTest):
         self.assertEqual(counts.get(supported_path), 1)
         self.assertEqual(counts.get(planted_path), 1)
 
+    def test_unreadable_source_classified_unread_without_scan_failure(self) -> None:
+        """Scratch preparation classifies an unreadable source unread and omits it from scanning."""
+        supported = "libavfilter/vf_ok.c"
+        planted = "libavfilter/vf_x.c"
+        self.write(supported, "int ok(void) { return 0; }\n")
+        self.write(planted, "int unread(void) { return 0; }\n")
+        self.commit()
+        planted_path = self.root / planted
+        real_read = upstream_lint._c_rules_read_source
+
+        def fail_planted(path: Path) -> bytes:
+            """Raise PermissionError for the planted source and delegate every other read."""
+            if path == planted_path:
+                raise PermissionError("fixture unread")
+            return real_read(path)
+
+        with (
+            unittest.mock.patch.object(
+                upstream_lint, "_c_rules_read_source", side_effect=fail_planted
+            ),
+            unittest.mock.patch.object(
+                upstream_lint, "_c_rules_scan", wraps=upstream_lint._c_rules_scan
+            ) as scan,
+        ):
+            step = upstream_lint._c_rules(self.root, self.base, "HEAD", "")
+        self.assertEqual(step.rc, 1, step.output)
+        self.assertEqual(step.output.count(f"unread: {planted}:"), 1, step.output)
+        self.assertIn(f"no waiver: {planted}:", step.output)
+        self.assertNotIn("command rc:", step.output)
+        scan_paths = scan.call_args.args[1]
+        self.assertNotIn(planted, scan_paths)
+        self.assertIn(supported, scan_paths)
+
     def test_attribute_parser_failure_is_blanked(self) -> None:
         """A discovered attribute cannot make an otherwise clean step exit two."""
         source = (
@@ -4409,8 +4442,8 @@ class CRulesBlankingTest(unittest.TestCase):
         self.assertIn(b"/*", blanked)
         self.assertIn(b"*/", blanked)
 
-    def test_unread_requested_path_remains_original_link(self) -> None:
-        """A read failure preserves the original inaccessible path for the scanner."""
+    def test_unread_requested_path_is_classified_unread(self) -> None:
+        """A read failure classifies the path unread without writing a scratch file or link."""
         with tempfile.TemporaryDirectory() as directory:
             tree = Path(directory) / "tree"
             (tree / "libavutil").mkdir(parents=True)
@@ -4425,15 +4458,54 @@ class CRulesBlankingTest(unittest.TestCase):
                 return real_read(path)
 
             with unittest.mock.patch.object(Path, "read_bytes", read):
-                root, notices, escaped, _ = upstream_lint._c_rules_scan_root(
+                root, notices, escaped, unread = upstream_lint._c_rules_scan_root(
                     tree, ["libavutil/unread.c"], directory
                 )
             target = root / "libavutil/unread.c"
-            self.assertTrue(target.is_symlink())
-            self.assertEqual(target.readlink(), source)
             self.assertFalse(target.exists())
-            self.assertEqual(notices, [])
+            self.assertFalse(target.is_symlink())
+            self.assertEqual(unread, ["libavutil/unread.c"])
+            self.assertEqual(notices, ["informational: libavutil/unread.c: could not be read"])
             self.assertEqual(escaped, [])
+
+    def test_conditional_arms_track_entry_boundary(self) -> None:
+        """Conditional arms restart from the entry boundary and require all paths closed."""
+        d1_source = (
+            b"#define VALUE(x) (x)\nstatic int n =\n#if A\n    0;\n#else\n"
+            b"    VALUE(1)\n    ;\n#endif\n"
+        )
+        self.assertEqual(upstream_lint._c_rules_blank(d1_source, set()), d1_source)
+        elif_source = d1_source.replace(b"#else\n", b"#elif B\n    1;\n#else\n")
+        self.assertEqual(upstream_lint._c_rules_blank(elif_source, set()), elif_source)
+        all_boundary = (
+            b"#define VALUE(x) (x)\n#if A\nstatic int n = 0;\n#else\n"
+            b"static int n = 1;\n#endif\nVALUE(1)\n"
+        )
+        expected_all = all_boundary[: -len(b"VALUE(1)\n")] + b"        \n"
+        self.assertEqual(upstream_lint._c_rules_blank(all_boundary, set()), expected_all)
+        no_else = b"#define VALUE(x) (x)\nstatic int n =\n#if A\n    0\n#endif\n    ;\nVALUE(1)\n"
+        expected_no_else = no_else[: -len(b"VALUE(1)\n")] + b"        \n"
+        self.assertEqual(upstream_lint._c_rules_blank(no_else, set()), expected_no_else)
+        no_else_open = (
+            b"#define VALUE(x) (x)\nstatic int n =\n#if A\n    0;\n#endif\n    VALUE(1)\n    ;\n"
+        )
+        self.assertEqual(upstream_lint._c_rules_blank(no_else_open, set()), no_else_open)
+
+    def test_closing_brace_sets_boundary_only_for_function_body(self) -> None:
+        """Non-function closing braces keep declarations open while function bodies close."""
+        typedef_source = b"#define NAME(x) x\ntypedef struct { int x; }\nNAME(Foo)\n;\nFoo value;\n"
+        self.assertEqual(upstream_lint._c_rules_blank(typedef_source, set()), typedef_source)
+        init_source = b"#define CALL(x) (x)\nstatic int a[] = { 1, 2 }\nCALL(1)\n;\n"
+        self.assertEqual(upstream_lint._c_rules_blank(init_source, set()), init_source)
+        completed_struct = b"#define CALL(x) (x)\nstruct s { int x; };\nCALL(1)\n"
+        expected_struct = b"#define CALL(x) (x)\nstruct s { int x; };\n       \n"
+        self.assertEqual(upstream_lint._c_rules_blank(completed_struct, set()), expected_struct)
+        split_func = b"#define CALL(x) (x)\nint f(void)\n{\n    return 0;\n}\nCALL(1)\n"
+        expected_split = split_func[: -len(b"CALL(1)\n")] + b"       \n"
+        self.assertEqual(upstream_lint._c_rules_blank(split_func, set()), expected_split)
+        inline_func = b"#define CALL(x) (x)\nint f(void) {\n    return 0;\n}\nCALL(1)\n"
+        expected_inline = inline_func[: -len(b"CALL(1)\n")] + b"       \n"
+        self.assertEqual(upstream_lint._c_rules_blank(inline_func, set()), expected_inline)
 
     def test_conditional_arms_track_shared_starting_depth(self) -> None:
         """Conditional arms restart from the entry depth and disable blanking on divergence."""

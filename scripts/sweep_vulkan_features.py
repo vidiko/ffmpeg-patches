@@ -37,7 +37,7 @@ MAX_VULKAN_FILES = 64
 MAX_SHADERS = 64
 MAX_TOOL_BYTES = 8 * 1024 * 1024
 SHADER_SYMBOL = re.compile(r"ff_(\w+)_comp_spv_data", re.ASCII)
-FEATURE_READ = re.compile(r"->([A-Za-z]\w*)", re.ASCII)
+FEATURE_READ = re.compile(r"(?:\.\s*|\s*->\s*)([A-Za-z]\w*)", re.ASCII)
 VULKAN_C = re.compile(r"libavfilter/vf_.+_vulkan\.c\Z")
 SHADER_PATH = re.compile(r"libavfilter/vulkan/.+\.comp\.glsl\Z")
 
@@ -47,7 +47,7 @@ class VulkanMapState:
 
     loaded = False
     allowlist: frozenset[str] = frozenset()
-    capability_map: dict[str, set[str]] = {}
+    capability_map: dict[str, CapabilityEnables] = {}
     feature_allowlist: frozenset[str] = frozenset()
     derivable: frozenset[str] = frozenset()
 
@@ -74,6 +74,13 @@ class ShaderNeeds(NamedTuple):
     evidence: dict[str, str]
 
 
+class CapabilityEnables(NamedTuple):
+    """Hold feature and non-feature enables for one SPIR-V capability."""
+
+    features: frozenset[str]
+    non_feature: bool
+
+
 def feature_allowlist_from_xml(root: ET.Element) -> frozenset[str]:
     """Collect VkBool32 members from VkPhysicalDeviceFeatures and Features2 extensions."""
     allow: set[str] = {"scalarBlockLayout"}
@@ -92,7 +99,7 @@ def feature_allowlist_from_xml(root: ET.Element) -> frozenset[str]:
     return frozenset(allow)
 
 
-def derivable_features(cap_map: dict[str, set[str]]) -> frozenset[str]:
+def derivable_features(cap_map: dict[str, CapabilityEnables]) -> frozenset[str]:
     """Return feature names derivable from SPIR-V capabilities, indexing, or scalar layout."""
     features: set[str] = {
         "scalarBlockLayout",
@@ -100,27 +107,32 @@ def derivable_features(cap_map: dict[str, set[str]]) -> frozenset[str]:
         "shaderStorageImageArrayNonUniformIndexing",
     }
     for mapped in cap_map.values():
-        features |= mapped
+        features |= mapped.features
     return frozenset(features)
 
 
-def load_maps(xml_path: Path) -> tuple[frozenset[str], dict[str, set[str]], frozenset[str]]:
+def load_maps(
+    xml_path: Path,
+) -> tuple[frozenset[str], dict[str, CapabilityEnables], frozenset[str]]:
     """Build SPIR-V capability map and Vk feature allow-lists from vk.xml."""
     root = ET.parse(xml_path).getroot()
     allow: set[str] = set()
-    cap_map: dict[str, set[str]] = {}
+    cap_map: dict[str, CapabilityEnables] = {}
     for cap in root.iter("spirvcapability"):
         name = cap.get("name")
         if not name:
             continue
         features: set[str] = set()
+        non_feature = False
         for enable in cap.findall("enable"):
             feature = enable.get("feature")
             if feature:
                 features.add(feature)
                 allow.add(feature)
-        if features:
-            cap_map[name] = features
+            elif enable.get("version") or enable.get("extension") or enable.get("property"):
+                non_feature = True
+        if features or non_feature:
+            cap_map[name] = CapabilityEnables(frozenset(features), non_feature)
     feature_allow = feature_allowlist_from_xml(root)
     return frozenset(allow), cap_map, feature_allow
 
@@ -173,7 +185,7 @@ def linked_shaders(c_source: str) -> list[str]:
 
 
 def diff_names(directory: str, base: str, head: str, deadline: float) -> set[str]:
-    """Return libavfilter paths changed between base and head."""
+    """Return in-tree libavfilter paths changed between base and head."""
     text = git(
         directory,
         "diff",
@@ -181,6 +193,7 @@ def diff_names(directory: str, base: str, head: str, deadline: float) -> set[str
         "--no-textconv",
         "--no-color",
         "--name-only",
+        "--diff-filter=d",
         base,
         head,
         "--",
@@ -216,8 +229,11 @@ def owners_for_shaders(directory: str, head: str, shaders: set[str], deadline: f
             deadline=deadline,
             missing_ok=True,
         )
-        owners.update(line for line in listing.splitlines() if VULKAN_C.fullmatch(line))
-    check_limit("vulkan file count", len(owners), MAX_VULKAN_FILES)
+        prefix = f"{head}:"
+        for line in listing.splitlines():
+            path = line[len(prefix) :] if line.startswith(prefix) else line
+            if VULKAN_C.fullmatch(path):
+                owners.add(path)
     return owners
 
 
@@ -228,6 +244,7 @@ def collect_targets(
     vulkan = {path for path in names if VULKAN_C.fullmatch(path)}
     shaders = {path for path in names if SHADER_PATH.fullmatch(path)}
     vulkan |= owners_for_shaders(directory, head, shaders, deadline)
+    check_limit("vulkan file count", len(vulkan), MAX_VULKAN_FILES)
     if not vulkan:
         return {}
     sources: dict[str, str] = {}
@@ -269,8 +286,8 @@ def spirv_needs_scalar(spv: Path, deadline: float) -> bool:
     """Return whether spirv-val requires scalar-block-layout for this module."""
     base = [str(SPIRV_VAL), "--target-env", "vulkan1.3", str(spv)]
     scalar = [*base, "--scalar-block-layout"]
-    timeout = min(120, check_deadline(deadline))
     for argv in (base, scalar):
+        timeout = min(120, check_deadline(deadline))
         result = subprocess.run(  # nosec B603 - fixed spirv-val argv, bounded sweep deadline.
             argv,
             capture_output=True,
@@ -313,6 +330,16 @@ def dynamic_storage_index(disasm: str) -> tuple[bool, bool]:
     return dynamic, nonuniform
 
 
+def capability_need_key(enables: CapabilityEnables) -> str | None:
+    """Return one shader need key for a SPIR-V capability enable set, or None."""
+    if not enables.features:
+        return None
+    if len(enables.features) == 1 and not enables.non_feature:
+        return next(iter(enables.features))
+    suffix = ",non-feature" if enables.non_feature else ""
+    return "any-of:" + ",".join(sorted(enables.features)) + suffix
+
+
 def shader_requirements(
     directory: str, head: str, shader_path: str, work: Path, deadline: float
 ) -> ShaderNeeds:
@@ -330,9 +357,14 @@ def shader_requirements(
     features: set[str] = set()
     evidence: dict[str, str] = {}
     for capability in spirv_capabilities(disasm):
-        for feature in MAP_STATE.capability_map.get(capability, ()):
-            features.add(feature)
-            evidence.setdefault(feature, f"capability:{capability}")
+        enables = MAP_STATE.capability_map.get(capability)
+        if enables is None:
+            continue
+        need_key = capability_need_key(enables)
+        if need_key is None:
+            continue
+        features.add(need_key)
+        evidence.setdefault(need_key, f"capability:{capability}")
     dynamic, nonuniform = dynamic_storage_index(disasm)
     if dynamic:
         features.add("shaderStorageImageArrayDynamicIndexing")
@@ -352,6 +384,34 @@ def shader_requirements(
     return ShaderNeeds(shader_path, features, evidence)
 
 
+def anyof_members(group_key: str) -> frozenset[str]:
+    """Parse sorted feature names from one any-of capability group key."""
+    body = group_key.removeprefix("any-of:")
+    if body.endswith(",non-feature"):
+        body = body[: -len(",non-feature")]
+    return frozenset(part for part in body.split(",") if part)
+
+
+def anyof_group_satisfied(feature: str, used: set[str], checked_names: set[str]) -> bool:
+    """Return whether one checked feature satisfies a linked any-of capability group."""
+    for group_key in used:
+        if not group_key.startswith("any-of:"):
+            continue
+        members = anyof_members(group_key)
+        if feature in members and members & checked_names:
+            return True
+    return False
+
+
+def gate_row_anchor(text: str, needs: list[ShaderNeeds], c_path: str) -> str:
+    """Choose the file prefix for one shader-side mismatch row."""
+    if "/" in text:
+        return text.split(":", 1)[0]
+    if needs:
+        return needs[0].path
+    return c_path
+
+
 def compare_gates(
     c_path: str,
     checked: list[FeatureSite],
@@ -369,17 +429,17 @@ def compare_gates(
     for site in checked:
         if site.feature not in MAP_STATE.derivable:
             rows.append((f"{c_path}:{site.line}", site.feature, "n/a", "unmapped"))
-        elif site.feature not in used:
+        elif site.feature not in used and not anyof_group_satisfied(
+            site.feature, used, checked_names
+        ):
             rows.append((f"{c_path}:{site.line}", site.feature, "none", "required-unused"))
     for feature in sorted(used - checked_names):
+        if feature.startswith("any-of:") and anyof_members(feature) & checked_names:
+            continue
+        direction = "ambiguous" if feature.startswith("any-of:") else "used-unchecked"
         text = evidence_by_feature.get(feature, "shader")
-        if "/" in text:
-            anchor = text.split(":", 1)[0]
-        elif needs:
-            anchor = needs[0].path
-        else:
-            anchor = c_path
-        rows.append((f"{anchor}:1", feature, text, "used-unchecked"))
+        anchor = gate_row_anchor(text, needs, c_path)
+        rows.append((f"{anchor}:1", feature, text, direction))
     return rows
 
 

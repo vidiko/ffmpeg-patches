@@ -53,6 +53,27 @@ def pair_name(path: str) -> str | None:
     return None
 
 
+def pair_paths_at_head(directory: str, head: str, stems: list[str], deadline: float) -> set[str]:
+    """Return CPU and Vulkan filter paths that exist at head for up to MAX_PAIRS stems."""
+    paths: list[str] = []
+    for stem in stems[:MAX_PAIRS]:
+        paths.append(f"libavfilter/vf_{stem}.c")
+        paths.append(f"libavfilter/vf_{stem}_vulkan.c")
+    if not paths:
+        return set()
+    text = git(
+        directory,
+        "ls-tree",
+        "-r",
+        "--name-only",
+        head,
+        "--",
+        *paths,
+        deadline=deadline,
+    )
+    return {line for line in text.splitlines() if line}
+
+
 def collect_pairs(
     directory: str, head: str, names: set[str], deadline: float
 ) -> dict[str, tuple[str, str, bool]]:
@@ -66,11 +87,14 @@ def collect_pairs(
         if stem := pair_name(path):
             stems[stem] = True
     check_limit("filter pair count", len(stems), MAX_PAIRS)
+    stems_sorted = sorted(stems)
+    existing = pair_paths_at_head(directory, head, stems_sorted, deadline)
     pairs: dict[str, tuple[str, str, bool]] = {}
-    for stem in sorted(stems):
+    for stem in stems_sorted:
         cpu = f"libavfilter/vf_{stem}.c"
         vk = f"libavfilter/vf_{stem}_vulkan.c"
-        pairs[stem] = (cpu, vk, stems[stem])
+        if cpu in existing and vk in existing:
+            pairs[stem] = (cpu, vk, stems[stem])
     return pairs
 
 

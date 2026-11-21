@@ -107,6 +107,47 @@ void main() { norm(imageLoad(img, ivec2(0)).x); }
 """
 
 
+R6_T3_VKXML = """\
+<registry>
+  <spirvcapabilities>
+    <spirvcapability name="TriAtomics">
+      <enable feature="shaderBufferInt64Atomics"/>
+      <enable feature="shaderSharedInt64Atomics"/>
+      <enable feature="shaderImageInt64Atomics"/>
+    </spirvcapability>
+    <spirvcapability name="MixedStorage">
+      <enable feature="shaderStorageImageReadWithoutFormat"/>
+      <enable version="VK_VERSION_1_3"/>
+    </spirvcapability>
+    <spirvcapability name="SingleRead">
+      <enable feature="shaderStorageImageWriteWithoutFormat"/>
+    </spirvcapability>
+    <spirvcapability name="DupDraw">
+      <enable feature="drawIndirectFirstInstance" struct="VkPhysicalDeviceFeatures"/>
+      <enable feature="drawIndirectFirstInstance" struct="VkPhysicalDeviceVulkan11Features"/>
+    </spirvcapability>
+    <spirvcapability name="VersionOnly">
+      <enable version="VK_VERSION_1_2"/>
+    </spirvcapability>
+  </spirvcapabilities>
+</registry>
+"""
+
+
+def r6_t3_capability_map(scratch: Path) -> dict[str, sweep_vulkan_features.CapabilityEnables]:
+    """Load the r6 T3 vk.xml fixture into a capability map."""
+    xml_path = scratch / "vk.xml"
+    xml_path.write_text(R6_T3_VKXML, encoding="utf-8")
+    _, cap_map, _ = sweep_vulkan_features.load_maps(xml_path)
+    return cap_map
+
+
+def install_r6_t3_derivable(cap_map: dict[str, sweep_vulkan_features.CapabilityEnables]) -> None:
+    """Point MAP_STATE.derivable at features from the r6 T3 fixture map."""
+    state = sweep_vulkan_features.MAP_STATE
+    state.derivable = sweep_vulkan_features.derivable_features(cap_map)
+
+
 def reset_vulkan_maps() -> None:
     """Clear lazy vk.xml map caches so patched registry paths apply."""
     state = sweep_vulkan_features.MAP_STATE
@@ -511,6 +552,218 @@ class VulkanSweepTest(unittest.TestCase):
         ):
             sweep_port_parity.sweep(str(self.repo), self.base, head, time.monotonic() + 120)
 
+    def test_r6_t1_partial_pair_skips_missing_twin(self) -> None:
+        """T1: a touched filter with only one CPU or Vulkan twin yields no hits and no error."""
+        (self.repo / "libavfilter" / "vf_vkonly_vulkan.c").write_text(
+            "int vk(void){return 0;}\n", encoding="utf-8"
+        )
+        (self.repo / "libavfilter" / "vf_cpuonly.c").write_text(
+            "void cpu(void){}\n", encoding="utf-8"
+        )
+        (self.repo / "libavfilter" / "fix.c").write_text(
+            (self.repo / "libavfilter" / "fix.c").read_text(encoding="utf-8") + "\n",
+            encoding="utf-8",
+        )
+        run_git(self.repo, "add", ".")
+        run_git(self.repo, "commit", "-qm", "head")
+        head = run_git(self.repo, "rev-parse", "HEAD")
+        self.assertIn("no hits", self.parity_report(head))
+
+    @unittest.skipIf(SKIP_VULKAN, SKIP_REASON)
+    def test_r6_t2_dot_and_spaced_arrow_feature_reads(self) -> None:
+        """T2: dot and spaced-arrow allowlisted reads match; unlisted dot reads do not."""
+        reset_vulkan_maps()
+        self.addCleanup(reset_vulkan_maps)
+        sweep_vulkan_features.ensure_maps()
+        source = (
+            "int gate(VkPhysicalDeviceVulkan12Features *v12, VkPhysicalDeviceFeatures *feats) {\n"
+            "    if (!v12.runtimeDescriptorArray) return -1;\n"
+            "    if (!v12 -> scalarBlockLayout) return -1;\n"
+            "    if (!feats.notAnAllowlistedMember) return -1;\n"
+            "    return 0;\n"
+            "}\n"
+        )
+        sites = sweep_vulkan_features.c_feature_reads(source)
+        names = {site.feature for site in sites}
+        self.assertIn("runtimeDescriptorArray", names)
+        self.assertIn("scalarBlockLayout", names)
+        self.assertNotIn("notAnAllowlistedMember", names)
+        self.assertEqual(len(names), 2)
+
+    def test_r6_t3_capability_need_keys_from_fixture(self) -> None:
+        """T3: map-derived capability keys match single, any-of, non-feature, and absent rules."""
+        with tempfile.TemporaryDirectory() as scratch:
+            cap_map = r6_t3_capability_map(Path(scratch))
+        helper = sweep_vulkan_features.capability_need_key
+        tri = helper(cap_map["TriAtomics"])
+        self.assertEqual(
+            tri,
+            "any-of:shaderBufferInt64Atomics,shaderImageInt64Atomics,shaderSharedInt64Atomics",
+        )
+        mixed = helper(cap_map["MixedStorage"])
+        self.assertEqual(mixed, "any-of:shaderStorageImageReadWithoutFormat,non-feature")
+        single = helper(cap_map["SingleRead"])
+        self.assertEqual(single, "shaderStorageImageWriteWithoutFormat")
+        dup = helper(cap_map["DupDraw"])
+        self.assertEqual(dup, "drawIndirectFirstInstance")
+        self.assertIsNone(helper(cap_map["VersionOnly"]))
+
+    def test_r6_t3_anyof_group_compare_gates(self) -> None:
+        """T3: compare_gates treats map-derived any-of groups as ambiguous or satisfied."""
+        with tempfile.TemporaryDirectory() as scratch:
+            cap_map = r6_t3_capability_map(Path(scratch))
+        self.addCleanup(reset_vulkan_maps)
+        install_r6_t3_derivable(cap_map)
+        group = sweep_vulkan_features.capability_need_key(cap_map["TriAtomics"])
+        self.assertIsNotNone(group)
+        needs = [
+            sweep_vulkan_features.ShaderNeeds(
+                "libavfilter/vulkan/test.comp.glsl",
+                {group},
+                {group: "capability:TriAtomics"},
+            )
+        ]
+        rows = sweep_vulkan_features.compare_gates("libavfilter/vf_test_vulkan.c", [], needs)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0][1], group)
+        self.assertEqual(rows[0][3], "ambiguous")
+        checked = [sweep_vulkan_features.FeatureSite(2, "shaderBufferInt64Atomics")]
+        self.assertEqual(
+            sweep_vulkan_features.compare_gates("libavfilter/vf_test_vulkan.c", checked, needs),
+            [],
+        )
+
+    def test_r6_t3_non_feature_compare_gates(self) -> None:
+        """T3: feature-plus-version capabilities surface ,non-feature any-of keys in rows."""
+        with tempfile.TemporaryDirectory() as scratch:
+            cap_map = r6_t3_capability_map(Path(scratch))
+        self.addCleanup(reset_vulkan_maps)
+        install_r6_t3_derivable(cap_map)
+        mixed = sweep_vulkan_features.capability_need_key(cap_map["MixedStorage"])
+        self.assertIsNotNone(mixed)
+        needs = [
+            sweep_vulkan_features.ShaderNeeds(
+                "libavfilter/vulkan/s.comp.glsl",
+                {mixed},
+                {mixed: "capability:MixedStorage"},
+            )
+        ]
+        rows = sweep_vulkan_features.compare_gates("libavfilter/vf_test_vulkan.c", [], needs)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0][1], mixed)
+        self.assertTrue(mixed.endswith(",non-feature"))
+
+    def test_r6_t4_shader_diff_finds_existing_owner(self) -> None:
+        """T4: a shader-only diff locates the owning vf_<stem>_vulkan.c at head for sweeps."""
+        c_vulkan = "extern const unsigned char ff_v360_comp_spv_data[];\nint f(void){return 0;}\n"
+        (self.repo / "libavfilter" / "vf_v360_vulkan.c").write_text(c_vulkan, encoding="utf-8")
+        (self.repo / "libavfilter" / "vulkan" / "v360.comp.glsl").write_text(
+            SIMPLE_SHADER, encoding="utf-8"
+        )
+        run_git(self.repo, "add", ".")
+        run_git(self.repo, "commit", "-qm", "base2")
+        base = run_git(self.repo, "rev-parse", "HEAD")
+        (self.repo / "libavfilter" / "vulkan" / "v360.comp.glsl").write_text(
+            SIMPLE_SHADER + "\n", encoding="utf-8"
+        )
+        run_git(self.repo, "add", "libavfilter/vulkan/v360.comp.glsl")
+        run_git(self.repo, "commit", "-qm", "head")
+        head = run_git(self.repo, "rev-parse", "HEAD")
+        deadline = time.monotonic() + 120
+        owners = sweep_vulkan_features.owners_for_shaders(
+            str(self.repo),
+            head,
+            {"libavfilter/vulkan/v360.comp.glsl"},
+            deadline,
+        )
+        self.assertIn("libavfilter/vf_v360_vulkan.c", owners)
+        names = sweep_vulkan_features.diff_names(str(self.repo), base, head, deadline)
+        targets = sweep_vulkan_features.collect_targets(str(self.repo), head, names, deadline)
+        self.assertIn("libavfilter/vf_v360_vulkan.c", targets)
+
+    def test_r6_t5_deleted_vulkan_c_omitted_from_diff(self) -> None:
+        """T5: deleted Vulkan C paths stay out of diff_names and vulkan-features sweep rows."""
+        (self.repo / "libavfilter" / "vf_drop_vulkan.c").write_text(
+            "int drop(void){return 0;}\n", encoding="utf-8"
+        )
+        run_git(self.repo, "add", "libavfilter/vf_drop_vulkan.c")
+        run_git(self.repo, "commit", "-qm", "mid")
+        drop_base = run_git(self.repo, "rev-parse", "HEAD")
+        run_git(self.repo, "rm", "libavfilter/vf_drop_vulkan.c")
+        run_git(self.repo, "commit", "-qm", "head")
+        head = run_git(self.repo, "rev-parse", "HEAD")
+        deadline = time.monotonic() + 120
+        names = sweep_vulkan_features.diff_names(str(self.repo), drop_base, head, deadline)
+        self.assertNotIn("libavfilter/vf_drop_vulkan.c", names)
+        report = sweep_vulkan_features.sweep(str(self.repo), drop_base, head, deadline)
+        self.assertNotIn("vf_drop_vulkan.c", report)
+        self.assertIn("no hits", report)
+
+    def test_r6_t6_vulkan_limit_after_shader_owner_union(self) -> None:
+        """T6: owner union can exceed MAX_VULKAN_FILES and block before read_sources."""
+        for stem, symbol in (("one", "one"), ("two", "two")):
+            sym = f"ff_{symbol}_comp_spv_data"
+            body = f"extern const unsigned char {sym}[];\nint f(void){{return 0;}}\n"
+            (self.repo / "libavfilter" / f"vf_{stem}_vulkan.c").write_text(body, encoding="utf-8")
+            (self.repo / "libavfilter" / "vulkan" / f"{symbol}.comp.glsl").write_text(
+                SIMPLE_SHADER, encoding="utf-8"
+            )
+        run_git(self.repo, "add", ".")
+        run_git(self.repo, "commit", "-qm", "mid")
+        (self.repo / "libavfilter" / "vulkan" / "one.comp.glsl").write_text(
+            SIMPLE_SHADER + "\n", encoding="utf-8"
+        )
+        (self.repo / "libavfilter" / "vulkan" / "two.comp.glsl").write_text(
+            SIMPLE_SHADER + "\n", encoding="utf-8"
+        )
+        run_git(self.repo, "add", "libavfilter/vulkan")
+        run_git(self.repo, "commit", "-qm", "head")
+        head = run_git(self.repo, "rev-parse", "HEAD")
+        with (
+            unittest.mock.patch.object(sweep_vulkan_features, "MAX_VULKAN_FILES", 1),
+            unittest.mock.patch(
+                "scripts.sweep_vulkan_features.read_sources",
+                side_effect=AssertionError("read_sources called"),
+            ),
+            self.assertRaisesRegex(RuntimeError, "vulkan file count"),
+        ):
+            self.vk_report(head)
+
+    @unittest.skipIf(SKIP_VULKAN, SKIP_REASON)
+    def test_r6_t7_spirv_scalar_recomputes_timeout(self) -> None:
+        """T7: spirv_needs_scalar passes a fresh timeout on each spirv-val invocation."""
+        with tempfile.TemporaryDirectory() as scratch:
+            spv = Path(scratch) / "test.spv"
+            spv.write_bytes(b"\x03\x02\x23\x07" + b"\x00" * 16)
+            recorded: list[float] = []
+            deadline_calls = 0
+
+            def fake_deadline(_deadline: float) -> float:
+                nonlocal deadline_calls
+                deadline_calls += 1
+                if deadline_calls == 1:
+                    return 90.0
+                if deadline_calls == 3:
+                    return 30.0
+                return 30.0
+
+            def fake_run(*_args, **kwargs):
+                recorded.append(kwargs["timeout"])
+                result = unittest.mock.Mock()
+                result.returncode = 0 if len(recorded) == 1 else 1
+                return result
+
+            with (
+                unittest.mock.patch(
+                    "scripts.sweep_vulkan_features.check_deadline", side_effect=fake_deadline
+                ),
+                unittest.mock.patch(
+                    "scripts.sweep_vulkan_features.subprocess.run", side_effect=fake_run
+                ),
+            ):
+                sweep_vulkan_features.spirv_needs_scalar(spv, time.monotonic() + 120)
+            self.assertEqual(recorded, [90.0, 30.0])
+
     def test_t6_second_linked_shader_mask_site(self) -> None:
         """t6: port-parity names the second linked shader when only it applies the mask."""
         cpu = "void f(const uint16_t *src) { uint16_t v = src[0] & 0xFF00u; (void)v; }\n"
@@ -644,12 +897,12 @@ class PortParityMutantTest(VulkanMutantHarness):
 
         slice_mutant_old = (
             '    check_limit("filter pair count", len(stems), MAX_PAIRS)\n'
-            "    pairs: dict[str, tuple[str, str, bool]] = {}\n"
-            "    for stem in sorted(stems):"
+            "    stems_sorted = sorted(stems)\n"
+            "    existing = pair_paths_at_head(directory, head, stems_sorted, deadline)"
         )
         slice_mutant_new = (
-            "    pairs: dict[str, tuple[str, str, bool]] = {}\n"
-            "    for stem in sorted(stems)[:MAX_PAIRS]:"
+            "    stems_sorted = sorted(stems)[:MAX_PAIRS]\n"
+            "    existing = pair_paths_at_head(directory, head, stems_sorted, deadline)"
         )
         self.assert_mutant_kills(
             "scripts/sweep_port_parity.py",
@@ -730,10 +983,15 @@ class VulkanMutantTest(VulkanMutantHarness):
             report = module.sweep(str(self.repo), self.base, head, time.monotonic() + 120)
             self.assertNotIn("| required-unused |", report)
 
+        required_branch = (
+            "elif site.feature not in used and not anyof_group_satisfied(\n"
+            "            site.feature, used, checked_names\n"
+            "        ):"
+        )
         self.assert_mutant_kills(
             "scripts/sweep_vulkan_features.py",
-            "elif site.feature not in used:",
-            "elif False and site.feature not in used:",
+            required_branch,
+            required_branch.replace("elif site", "elif False and site", 1),
             real,
             mutant,
         )

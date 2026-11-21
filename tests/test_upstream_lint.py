@@ -4507,6 +4507,56 @@ class CRulesBlankingTest(unittest.TestCase):
         expected_inline = inline_func[: -len(b"CALL(1)\n")] + b"       \n"
         self.assertEqual(upstream_lint._c_rules_blank(inline_func, set()), expected_inline)
 
+    def test_conditional_arms_record_every_arm_state(self) -> None:
+        """Every conditional arm must close at a boundary or function header to blank calls."""
+        open_arm = (
+            b"#define VALUE(x) (x)\n#if A\nstatic int n =\n#else\n"
+            b"static int n = 1;\n#endif\n    VALUE(1)\n    ;\n"
+        )
+        self.assertEqual(upstream_lint._c_rules_blank(open_arm, set()), open_arm)
+        struct_arm = (
+            b"#define CALL(x) (x)\n#if A\nstruct s {\n#else\nint f(void) {\n"
+            b"#endif\n    int x;\n}\nCALL(1)\n;\n"
+        )
+        self.assertEqual(upstream_lint._c_rules_blank(struct_arm, set()), struct_arm)
+        header_arm = (
+            b"#define CALL(x) (x)\n#if A\nstruct s\n#else\nint f(void)\n"
+            b"#endif\n{\n    int x;\n}\nCALL(1)\n;\n"
+        )
+        self.assertEqual(upstream_lint._c_rules_blank(header_arm, set()), header_arm)
+        all_headers = (
+            b"#define CALL(x) (x)\n#if A\nint f(int a)\n#else\nint f(void)\n"
+            b"#endif\n{\n    return 0;\n}\nCALL(1)\n"
+        )
+        expected_headers = all_headers[: -len(b"CALL(1)\n")] + b"       \n"
+        self.assertEqual(upstream_lint._c_rules_blank(all_headers, set()), expected_headers)
+
+    def test_conditional_without_else_keeps_entry_header_state(self) -> None:
+        """Conditionals without an else arm preserve non-function entry header state."""
+        body_source = (
+            b"#define CALL(x) (x)\nstruct s {\n#if A\n    int x; }; int f(void) {\n"
+            b"#endif\n    int y;\n}\nCALL(1)\n;\n"
+        )
+        self.assertEqual(upstream_lint._c_rules_blank(body_source, set()), body_source)
+        header_source = (
+            b"#define CALL(x) (x)\nstruct s\n#if A\nint f(void)\n"
+            b"#endif\n{\n    int x;\n}\nCALL(1)\n;\n"
+        )
+        self.assertEqual(upstream_lint._c_rules_blank(header_source, set()), header_source)
+
+    def test_conditional_directive_mismatch_disables_blanking(self) -> None:
+        """Duplicate else and elif-after-else directives disable subsequent macro blanking."""
+        duplicate_else = (
+            b"#define CALL(x) (x)\nint a;\n#if A\nint b;\n#else\nint c;\n"
+            b"#else\nint d;\n#endif\nCALL(1)\n"
+        )
+        self.assertEqual(upstream_lint._c_rules_blank(duplicate_else, set()), duplicate_else)
+        elif_after_else = (
+            b"#define CALL(x) (x)\nint a;\n#if A\nint b;\n#else\nint c;\n"
+            b"#elif B\nint d;\n#endif\nCALL(1)\n"
+        )
+        self.assertEqual(upstream_lint._c_rules_blank(elif_after_else, set()), elif_after_else)
+
     def test_conditional_arms_track_shared_starting_depth(self) -> None:
         """Conditional arms restart from the entry depth and disable blanking on divergence."""
         c3_source = (

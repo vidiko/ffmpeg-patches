@@ -293,6 +293,57 @@ DOC_MUXERS_FLAGS_T1 = (
     "Write a global sidx.\n"
     "@end table\n"
 )
+DASHENC_POST_COND_T1 = (
+    DASHENC_OPTIONS
+    + "int dash_write(DashContext *c)\n{\n    int ret = 0, ready = 1;\n"
+    + "    if (ret >= 0 &&\n        ready) c->ignore_io_errors = 1;\n"
+    + "    if (c->global_sidx) {\n        ret = 1;\n    }\n    return ret;\n}\n"
+)
+TWO_TABLES_OPTIONS = (
+    "#define OFFSET(x) offsetof(MuxContext, x)\n"
+    "typedef struct MuxContext {\n"
+    "    int foo;\n"
+    "    int bar;\n"
+    "} MuxContext;\n"
+    "static const AVOption a_options[] = {\n"
+    '    { "foo", "foo", OFFSET(foo), 0 },\n'
+    "};\n"
+    "static const AVOption b_options[] = {\n"
+    '    { "bar", "bar", OFFSET(bar), 0 },\n'
+    "};\n"
+)
+ONE_TABLE_OPTIONS = (
+    "#define OFFSET(x) offsetof(MuxContext, x)\n"
+    "typedef struct MuxContext {\n"
+    "    int foo;\n"
+    "    int bar;\n"
+    "} MuxContext;\n"
+    "static const AVOption a_options[] = {\n"
+    '    { "foo", "foo", OFFSET(foo), 0 },\n'
+    '    { "bar", "bar", OFFSET(bar), 0 },\n'
+    "};\n"
+)
+MUX_WRITE_BASE = (
+    "int mux_write(MuxContext *c)\n{\n"
+    "    if (c->bar) {\n        return 2;\n    }\n    return 0;\n}\n"
+)
+MUX_WRITE_T1 = (
+    "int mux_write(MuxContext *c)\n{\n"
+    "    if (c->foo) {\n        return 1;\n    }\n"
+    "    if (c->bar) {\n        return 2;\n    }\n    return 0;\n}\n"
+)
+DOC_FOO_BAR_BASE = (
+    "@table @option\n@item foo\nEnable foo mode.\n@item bar\nEnable bar mode.\n@end table\n"
+)
+DOC_FOO_BAR_T1 = (
+    "@table @option\n"
+    "@item foo\n"
+    "Enable foo mode.\n"
+    "Skip extra header packets.\n"
+    "@item bar\n"
+    "Enable bar mode.\n"
+    "@end table\n"
+)
 
 
 class RulesTest(unittest.TestCase):
@@ -1847,6 +1898,13 @@ class DocTermTest(unittest.TestCase):
         mapping = upstream_lint.avoption_field_map(DASHENC_OPTIONS_ALIAS)
         self.assertEqual(mapping.get("ignore_io_errors"), ["ignore_io_errors", "ignore_errors"])
 
+    def test_avoption_tables_two_tables_stay_separate(self) -> None:
+        """Each AVOption table header starts its own field-to-names mapping."""
+        tables = upstream_lint.avoption_tables(TWO_TABLES_OPTIONS)
+        self.assertEqual(tables, [{"foo": ["foo"]}, {"bar": ["bar"]}])
+        self.assertNotIn("bar", tables[0])
+        self.assertNotIn("foo", tables[1])
+
     def test_option_fields_tested_continuation_in_if_condition(self) -> None:
         """A continuation line inside an if condition counts as testing option fields."""
         line = "        !c->ignore_io_errors)"
@@ -1858,16 +1916,16 @@ class DocTermTest(unittest.TestCase):
             "        ret = 0;",
             "}",
         ]
-        cond = upstream_lint._condition_span_lines(code_lines)
-        tested = upstream_lint._option_fields_tested(line, fields, in_condition=3 in cond)
+        cond = upstream_lint._condition_spans(code_lines)
+        tested = upstream_lint._option_fields_tested(line, fields, spans=cond.get(3, ()))
         self.assertEqual(tested, frozenset({"ignore_io_errors"}))
 
     def test_option_fields_tested_plain_assignment_not_counted(self) -> None:
         """A plain assignment line reading an option field is not an option test."""
         line = "    c->ignore_io_errors = 1;"
-        cond = upstream_lint._condition_span_lines([line])
+        cond = upstream_lint._condition_spans([line])
         tested = upstream_lint._option_fields_tested(
-            line, frozenset({"ignore_io_errors"}), in_condition=1 in cond
+            line, frozenset({"ignore_io_errors"}), spans=cond.get(1, ())
         )
         self.assertEqual(tested, frozenset())
 
@@ -1882,6 +1940,58 @@ class DocTermTest(unittest.TestCase):
         line = "    if (c->global_sidx_extra) {"
         tested = upstream_lint._option_fields_tested(line, frozenset({"global_sidx"}))
         self.assertEqual(tested, frozenset())
+
+    def test_option_fields_tested_post_continuation_assign_ignored(self) -> None:
+        """An assignment after a multiline condition closes is not an option test."""
+        fields = frozenset({"ignore_io_errors", "global_sidx"})
+        code_lines = [
+            "    if (ready &&",
+            "        enabled) c->ignore_io_errors = 1;",
+            "    if (c->global_sidx) {",
+        ]
+        spans = upstream_lint._condition_spans(code_lines)
+        second = upstream_lint._option_fields_tested(code_lines[1], fields, spans=spans.get(2, ()))
+        third = upstream_lint._option_fields_tested(code_lines[2], fields, spans=spans.get(3, ()))
+        self.assertEqual(second, frozenset())
+        self.assertEqual(third, frozenset({"global_sidx"}))
+
+    def test_option_fields_tested_same_line_post_if_assign_ignored(self) -> None:
+        """An assignment after a single-line if condition closes is not counted."""
+        line = "    if (c->global_sidx) c->ignore_io_errors = 1;"
+        fields = frozenset({"global_sidx", "ignore_io_errors"})
+        spans = upstream_lint._condition_spans([line])
+        tested = upstream_lint._option_fields_tested(line, fields, spans=spans.get(1, ()))
+        self.assertEqual(tested, frozenset({"global_sidx"}))
+
+    def test_option_fields_tested_continuation_operator_stays_in_span(self) -> None:
+        """Boolean operators inside a continued condition do not admit post-close code."""
+        fields = frozenset({"ignore_io_errors"})
+        code_lines = [
+            "    if (ret >= 0 &&",
+            "        enabled && ready) c->ignore_io_errors = 1;",
+        ]
+        spans = upstream_lint._condition_spans(code_lines)
+        tested = upstream_lint._option_fields_tested(code_lines[1], fields, spans=spans.get(2, ()))
+        self.assertEqual(tested, frozenset())
+
+    def test_option_fields_tested_nested_parens_in_condition(self) -> None:
+        """Nested parentheses keep the outer condition open until its matching close."""
+        fields = frozenset({"ignore_io_errors", "single_file"})
+        code_lines = [
+            "    if (ret >= 0 && (ready ||",
+            "        !c->ignore_io_errors)) c->single_file = 1;",
+        ]
+        spans = upstream_lint._condition_spans(code_lines)
+        tested = upstream_lint._option_fields_tested(code_lines[1], fields, spans=spans.get(2, ()))
+        self.assertEqual(tested, frozenset({"ignore_io_errors"}))
+
+    def test_option_fields_tested_ternary_outside_condition(self) -> None:
+        """A ternary expression on a line with no if or while condition counts."""
+        line = "    ret = c->ignore_io_errors ? 0 : -1;"
+        fields = frozenset({"ignore_io_errors"})
+        spans = upstream_lint._condition_spans([line])
+        tested = upstream_lint._option_fields_tested(line, fields, spans=spans.get(1, ()))
+        self.assertEqual(tested, frozenset({"ignore_io_errors"}))
 
     def test_option_pairs_between_skips_same_field_aliases(self) -> None:
         """No option name pair is formed between two names of the same OFFSET field."""
@@ -1999,9 +2109,9 @@ class DocTermTest(unittest.TestCase):
     def test_interplay_pairs_alias_maps_nearby_scalar(self) -> None:
         """Pair generation lists every option name for a shared field near a scalar test."""
         code_lines = upstream_lint._code_lines(DASHENC_ALIAS_T1)
-        field_map = upstream_lint.avoption_field_map(DASHENC_ALIAS_T1)
+        tables = upstream_lint.avoption_tables(DASHENC_ALIAS_T1)
         added = {line for line, text in enumerate(code_lines, 1) if text.strip().startswith("if ")}
-        pairs = upstream_lint._interplay_pairs(code_lines, added, field_map)
+        pairs = upstream_lint._interplay_pairs(code_lines, added, tables)
         names = {(option_a, option_b) for _line, option_a, option_b in pairs}
         self.assertIn(("ignore_io_errors", "global_sidx"), names)
         self.assertIn(("ignore_errors", "global_sidx"), names)
@@ -2009,6 +2119,15 @@ class DocTermTest(unittest.TestCase):
         self.assertNotIn(("ignore_errors", "ignore_io_errors"), names)
         self.assertNotIn(("ignore_io_errors", "ignore_io_errors"), names)
         self.assertNotIn(("ignore_errors", "ignore_errors"), names)
+
+    def test_interplay_pairs_distinct_tables_yield_no_pair(self) -> None:
+        """Fields from separate AVOption tables do not form an interplay pair."""
+        source = TWO_TABLES_OPTIONS + MUX_WRITE_T1
+        code_lines = upstream_lint._code_lines(source)
+        tables = upstream_lint.avoption_tables(source)
+        added = {line for line, text in enumerate(code_lines, 1) if "c->foo" in text}
+        self.assertTrue(added)
+        self.assertEqual(upstream_lint._interplay_pairs(code_lines, added, tables), [])
 
 
 WRAP_TEXT = (
@@ -3304,6 +3423,48 @@ class PipelineTest(FixtureTest):
         rc, output = self.check()
         self.assertEqual(rc, 1, output)
         self.assertIn("ignore_io_errors near global_sidx", output)
+
+    def test_doc_terms_option_interplay_separate_tables_passes(self) -> None:
+        """Fields from different AVOption tables in one file do not trigger interplay."""
+        self.write("libavformat/dashenc.c", TWO_TABLES_OPTIONS + MUX_WRITE_BASE)
+        self.write("doc/muxers.texi", DOC_FOO_BAR_BASE)
+        self.commit("libavformat/dashenc: two option tables")
+        self.base = self.git("rev-parse", "HEAD").strip()
+        self.write("libavformat/dashenc.c", TWO_TABLES_OPTIONS + MUX_WRITE_T1)
+        self.write("doc/muxers.texi", DOC_FOO_BAR_T1)
+        self.commit("libavformat/dashenc: guard foo mode")
+        rc, output = self.check()
+        self.assertEqual(rc, 0, output)
+        self.assertIn("step: doc-terms rc: 0", output)
+        self.assertNotIn("option interplay:", output)
+
+    def test_doc_terms_option_interplay_shared_table_control_fails(self) -> None:
+        """The same foo and bar tests fail when both belong to one AVOption table."""
+        self.write("libavformat/dashenc.c", ONE_TABLE_OPTIONS + MUX_WRITE_BASE)
+        self.write("doc/muxers.texi", DOC_FOO_BAR_BASE)
+        self.commit("libavformat/dashenc: single option table")
+        self.base = self.git("rev-parse", "HEAD").strip()
+        self.write("libavformat/dashenc.c", ONE_TABLE_OPTIONS + MUX_WRITE_T1)
+        self.write("doc/muxers.texi", DOC_FOO_BAR_T1)
+        self.commit("libavformat/dashenc: guard foo mode")
+        rc, output = self.check()
+        self.assertEqual(rc, 1, output)
+        self.assertIn("step: doc-terms rc: 1", output)
+        self.assertIn("option interplay:", output)
+        self.assertIn("foo near bar", output)
+
+    def test_doc_terms_option_interplay_post_continuation_assign_passes(self) -> None:
+        """An assignment after a continued condition closes does not trigger interplay."""
+        self._write_dashenc_fixture()
+        self.commit("libavformat/dashenc: option table fixture")
+        self.base = self.git("rev-parse", "HEAD").strip()
+        self.write("libavformat/dashenc.c", DASHENC_POST_COND_T1)
+        self.write("doc/muxers.texi", DOC_MUXERS_T1)
+        self.commit("libavformat/dashenc: set ignore flag after ready check")
+        rc, output = self.check()
+        self.assertEqual(rc, 0, output)
+        self.assertIn("step: doc-terms rc: 0", output)
+        self.assertNotIn("option interplay:", output)
 
     def _write_dashenc_fixture(self) -> None:
         """Write the dashenc and muxers fixture files shared by option-interplay tests."""

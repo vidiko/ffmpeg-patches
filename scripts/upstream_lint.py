@@ -92,14 +92,16 @@ mention range or rangein but never unspecified, unknown or untagged. The added
 source lines are read from the head file with comments, string literals and
 preprocessor lines blanked, so a comment that names the behaviour does not
 count, and neither does a macro that tests the flag. It also fails when an added
-line tests one AVOption field within three head lines of a test of another field
-from the same file's option table, and the changed Texinfo entry for that option
-gains text but never names the neighbour option (underscore in the name may
-match a hyphen or space). Entry scope is the nearest preceding @item or @itemx
-through the line before the next @item, @itemx or @end; the full entry text at
-head is used, not added lines alone. Only structure member access with -> is
-treated as an option test; interplay beyond the window of three head lines or
-across files is not detected. --doc-reason TEXT waives it and prints the reason.
+line tests one AVOption field within three head lines of a test of a neighbour
+field from the same AVOption table in that file, and the changed Texinfo entry
+for that option gains text but never names the neighbour option (underscore in
+the name may match a hyphen or space). Entry scope is the nearest preceding
+@item or @itemx through the line before the next @item, @itemx or @end; the full
+entry text at head is used, not added lines alone. Only structure member access
+with -> is treated as an option test, and inside an if or while condition only
+the condition text counts, so a field assigned after the condition closes is not
+an option test; interplay beyond the window of three head lines or across files
+is not detected. --doc-reason TEXT waives it and prints the reason.
 The non-RGB pair, the unspecified-range pair, and this option-interplay check
 are the only doc-term rules; any other gap between what the code does and what
 the docs say is not detected.
@@ -1773,15 +1775,19 @@ AVOPTION_FIELD = (
     r"offsetof\s*\(\s*\w+\s*,\s*(\w+(?:\[[^\]]*\])?)\s*\))"
 )
 AVOPTION_ENTRY = re.compile(rf"\{{\s*\"([^\"]+)\"\s*,\s*{AVOPTION_HELP}\s*,\s*{AVOPTION_FIELD}")
+AVOPTION_TABLE_HEAD = re.compile(r"\bAVOption\s+[A-Za-z_]\w*\s*\[\s*\]\s*=\s*\{")
+CONDITION_HEAD = re.compile(r"\b(?:if|while)\s*\(")
 TEXI_ITEM_HEAD = re.compile(r"^@itemx?\s+(\S+)")
 TEXI_ENTRY_BOUNDARY = re.compile(r"^@(?:itemx?|end)\b")
 OPTION_TEST_MARKERS = ("if (", "while (", "&&", "||", "?")
+OUTSIDE_TEST_MARKERS = ("&&", "||", "?")
+SpanList = tuple[tuple[int, int], ...] | list[tuple[int, int]]
 
 
-def avoption_field_map(raw: str) -> dict[str, list[str]]:
-    """Map each AVOption OFFSET field to its public option names in table order."""
+def _avoption_entries_map(chunk: str) -> dict[str, list[str]]:
+    """Map each AVOption OFFSET field in one source slice to its option names."""
     mapping: dict[str, list[str]] = {}
-    for match in AVOPTION_ENTRY.finditer(raw):
+    for match in AVOPTION_ENTRY.finditer(chunk):
         name = match[1]
         field = match[2] or match[3]
         if field:
@@ -1791,49 +1797,96 @@ def avoption_field_map(raw: str) -> dict[str, list[str]]:
     return mapping
 
 
-def _condition_span_lines(code_lines: list[str]) -> frozenset[int]:
-    """Return 1-based line numbers inside the parentheses of an if or while condition."""
-    inside: set[int] = set()
+def avoption_tables(raw: str) -> list[dict[str, list[str]]]:
+    """Return one field-to-option-names map per AVOption table in source order."""
+    headers = list(AVOPTION_TABLE_HEAD.finditer(raw))
+    if not headers:
+        only = _avoption_entries_map(raw)
+        return [only] if only else []
+    tables: list[dict[str, list[str]]] = []
+    leading = _avoption_entries_map(raw[: headers[0].start()])
+    if leading:
+        tables.append(leading)
+    for index, header in enumerate(headers):
+        end = headers[index + 1].start() if index + 1 < len(headers) else len(raw)
+        tables.append(_avoption_entries_map(raw[header.end() : end]))
+    return tables
+
+
+def avoption_field_map(raw: str) -> dict[str, list[str]]:
+    """Map each AVOption OFFSET field to its public option names in table order."""
+    merged: dict[str, list[str]] = {}
+    for table in avoption_tables(raw):
+        for option_field, names in table.items():
+            target = merged.setdefault(option_field, [])
+            for name in names:
+                if name not in target:
+                    target.append(name)
+    return merged
+
+
+def _condition_spans(code_lines: list[str]) -> dict[int, list[tuple[int, int]]]:
+    """Map 1-based line numbers to half-open character spans in if or while conditions."""
+    spans: dict[int, list[tuple[int, int]]] = {}
     depth = 0
-    for index, line in enumerate(code_lines):
-        number = index + 1
+    for number, line in enumerate(code_lines, 1):
+        line_spans: list[tuple[int, int]] = []
         pos = 0
-        if depth > 0:
-            inside.add(number)
+        span_start = 0
         while pos < len(line):
             if depth == 0:
-                started = False
-                for marker in ("if (", "while ("):
-                    found = line.find(marker, pos)
-                    if found >= 0:
-                        depth = 1
-                        pos = found + len(marker)
-                        inside.add(number)
-                        started = True
-                        break
-                if not started:
+                match = CONDITION_HEAD.search(line, pos)
+                if match is None:
                     break
+                depth = 1
+                pos = match.end()
+                span_start = pos
                 continue
             if line[pos] == "(":
                 depth += 1
             elif line[pos] == ")":
                 depth -= 1
+                if depth == 0:
+                    line_spans.append((span_start, pos))
             pos += 1
-    return frozenset(inside)
+        if depth > 0:
+            line_spans.append((span_start, len(line)))
+        if line_spans:
+            spans[number] = line_spans
+    return spans
+
+
+def _outside_spans(line: str, spans: SpanList) -> str:
+    """Return space-joined slices of line outside sorted half-open spans."""
+    parts: list[str] = []
+    cursor = 0
+    for start, end in spans:
+        parts.append(line[cursor:start])
+        cursor = end
+    parts.append(line[cursor:])
+    return " ".join(parts)
 
 
 def _option_fields_tested(
     line: str,
     fields: frozenset[str],
     *,
-    in_condition: bool = False,
+    spans: SpanList = (),
 ) -> frozenset[str]:
     """Return option structure fields tested on one blanked source line."""
-    if not in_condition and not any(marker in line for marker in OPTION_TEST_MARKERS):
+    if spans:
+        targets = [line[start:end] for start, end in spans]
+        outside = _outside_spans(line, spans)
+        if any(marker in outside for marker in OUTSIDE_TEST_MARKERS):
+            targets.append(outside)
+    elif any(marker in line for marker in OPTION_TEST_MARKERS):
+        targets = [line]
+    else:
         return frozenset()
     found: set[str] = set()
     for option_field in fields:
-        if re.search(rf"->{re.escape(option_field)}(?!\w)", line):
+        pattern = rf"->{re.escape(option_field)}(?!\w)"
+        if any(re.search(pattern, part) for part in targets):
             found.add(option_field)
     return frozenset(found)
 
@@ -1906,11 +1959,11 @@ def _interplay_pairs_for_line(
     number: int,
     tested: frozenset[str],
     code_lines: list[str],
-    field_map: dict[str, list[str]],
-    cond_lines: frozenset[int],
+    tables: list[dict[str, list[str]]],
+    cond_spans: dict[int, list[tuple[int, int]]],
 ) -> list[tuple[int, str, str]]:
     """List option name pairs one added line triggers within OPTION_WINDOW."""
-    fields = frozenset(field_map)
+    fields = frozenset(option_field for table in tables for option_field in table)
     low = max(1, number - OPTION_WINDOW)
     high = min(len(code_lines), number + OPTION_WINDOW)
     raw: list[tuple[int, str, str]] = []
@@ -1918,10 +1971,13 @@ def _interplay_pairs_for_line(
         nearby = _option_fields_tested(
             code_lines[other - 1],
             fields,
-            in_condition=other in cond_lines,
+            spans=cond_spans.get(other, ()),
         )
-        for option_a, option_b in _option_pairs_between(tested, nearby, field_map):
-            raw.append((number, option_a, option_b))
+        for table in tables:
+            table_fields = frozenset(table)
+            pairs = _option_pairs_between(tested & table_fields, nearby & table_fields, table)
+            for option_a, option_b in pairs:
+                raw.append((number, option_a, option_b))
     return raw
 
 
@@ -1938,11 +1994,11 @@ def _dedupe_interplay_pairs(
 
 
 def _interplay_pairs(
-    code_lines: list[str], added: set[int], field_map: dict[str, list[str]]
+    code_lines: list[str], added: set[int], tables: list[dict[str, list[str]]]
 ) -> list[tuple[int, str, str]]:
     """List unique option name pairs from added lines tested within OPTION_WINDOW."""
-    fields = frozenset(field_map)
-    cond_lines = _condition_span_lines(code_lines)
+    fields = frozenset(option_field for table in tables for option_field in table)
+    cond_spans = _condition_spans(code_lines)
     raw: list[tuple[int, str, str]] = []
     for number in sorted(added):
         if number > len(code_lines):
@@ -1950,11 +2006,11 @@ def _interplay_pairs(
         tested = _option_fields_tested(
             code_lines[number - 1],
             fields,
-            in_condition=number in cond_lines,
+            spans=cond_spans.get(number, ()),
         )
         if not tested:
             continue
-        raw.extend(_interplay_pairs_for_line(number, tested, code_lines, field_map, cond_lines))
+        raw.extend(_interplay_pairs_for_line(number, tested, code_lines, tables, cond_spans))
     return _dedupe_interplay_pairs(raw)
 
 
@@ -1970,13 +2026,13 @@ def _interplay_findings_one_path(
     if not added:
         return []
     raw = _git(tree, "show", f"{head}:{path}")
-    field_map = avoption_field_map(raw)
-    if not field_map:
+    tables = avoption_tables(raw)
+    if not any(tables):
         return []
     raw_lines = raw.split("\n")
     code_lines = _code_lines(raw)
     findings: list[str] = []
-    for number, option_a, option_b in _interplay_pairs(code_lines, added, field_map):
+    for number, option_a, option_b in _interplay_pairs(code_lines, added, tables):
         entry_texts = doc_entries.get(option_a)
         if entry_texts is None:
             continue

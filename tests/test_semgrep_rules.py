@@ -1078,9 +1078,10 @@ class FfmpegSemgrepRulesTest(unittest.TestCase):
     """Verify .semgrep-ffmpeg.yml C rules against synthetic FFmpeg call fixtures."""
 
     def test_many_allocations_without_ternaries_do_not_timeout(self) -> None:
-        """A 272-line allocation/check fixture finishes within Semgrep's default timeout."""
+        """A 273-line allocation/check fixture finishes within Semgrep's default timeout."""
         source = (
             "void fixture(void) {\n"
+            "    /* Keep NULL in the translation unit for token prefilters. */\n"
             + "".join(
                 f"    value{i} = av_malloc(8);\n    target{i} = next();\n"
                 f"    if (!value{i}) {{ fail(); }}\n"
@@ -1088,6 +1089,7 @@ class FfmpegSemgrepRulesTest(unittest.TestCase):
             )
             + "}\n"
         )
+        self.assertIn("NULL", source)
         self.assertEqual(_scan_ffmpeg_c(source), [])
 
     def test_planted_allocation_ternary_declarations_flagged(self) -> None:
@@ -1430,6 +1432,13 @@ static int unbraced_inner_loop_break(void)
     def test_unchecked_allocation_ternary_passes(self) -> None:
         """Accept a ternary propagating allocation failure without a separate check."""
         self.assertEqual(_scan_ffmpeg_c(FFMPEG_UNCHECKED_ALLOCATION_TERNARY), [])
+
+    def test_earlier_only_null_check_ternary_passes(self) -> None:
+        """Accept a ternary guarded only by an earlier NULL check without a later check."""
+        later_check = "    if (!buffer)\n        return -1;\n"
+        self.assertIn(later_check, FFMPEG_NULL_CHECKED_ALLOCATION_TERNARY)
+        source = FFMPEG_NULL_CHECKED_ALLOCATION_TERNARY.replace(later_check, "", 1)
+        self.assertEqual(_ternary_finding_lines(source), [])
 
     def test_reassigned_allocation_ternary_reported_plain_shape(self) -> None:
         """Report reassignment before the ternary by plain shape, as without reassignment."""

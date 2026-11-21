@@ -3524,24 +3524,17 @@ class PreCommitResolutionTest(unittest.TestCase):
         upstream_lint._validate_executable([executable, "run"])
 
 
-@unittest.skipUnless(shutil.which(os.environ.get("SEMGREP") or "semgrep"), "semgrep not installed")
-class CRulesScratchTest(FixtureTest):
-    """Exercise scratch preparation and real scanner results on synthetic sources."""
+def _isolate_test_tmpdir(case: unittest.TestCase) -> None:
+    """Isolate temporary directories in a cleanup-managed folder per test."""
+    directory = tempfile.TemporaryDirectory()
+    case.addCleanup(directory.cleanup)
+    environment = unittest.mock.patch.dict(os.environ, {"TMPDIR": directory.name})
+    case.addCleanup(environment.stop)
+    environment.start()
 
-    def setUp(self) -> None:
-        """Isolate scanner temporary files in a cleanup-managed directory per test."""
-        super().setUp()
-        directory = tempfile.TemporaryDirectory()
-        self.addCleanup(directory.cleanup)
-        environment = unittest.mock.patch.dict(os.environ, {"TMPDIR": directory.name})
-        self.addCleanup(environment.stop)
-        environment.start()
 
-    def scan_source(self, source: str) -> upstream_lint.Step:
-        """Commit one synthetic source and run only the real c-rules step."""
-        self.write("libavfilter/vf_x.c", source)
-        self.commit()
-        return upstream_lint._c_rules(self.root, self.base, "HEAD", "")
+class _CRulesBlankingMixin:
+    """Shared exact-byte and newline-offset assertion for c-rules scratch blanking."""
 
     def assert_blanked(self, source: bytes, expected: bytes) -> None:
         """Assert exact scratch bytes, byte length and every newline offset."""
@@ -3552,6 +3545,22 @@ class CRulesScratchTest(FixtureTest):
             [index for index, byte in enumerate(blanked) if byte == 10],
             [index for index, byte in enumerate(source) if byte == 10],
         )
+
+
+@unittest.skipUnless(shutil.which(os.environ.get("SEMGREP") or "semgrep"), "semgrep not installed")
+class CRulesScratchTest(_CRulesBlankingMixin, FixtureTest):
+    """Exercise scratch preparation and real scanner results on synthetic sources."""
+
+    def setUp(self) -> None:
+        """Isolate scanner temporary files in a cleanup-managed directory per test."""
+        super().setUp()
+        _isolate_test_tmpdir(self)
+
+    def scan_source(self, source: str) -> upstream_lint.Step:
+        """Commit one synthetic source and run only the real c-rules step."""
+        self.write("libavfilter/vf_x.c", source)
+        self.commit()
+        return upstream_lint._c_rules(self.root, self.base, "HEAD", "")
 
     def _r5_allocation(self) -> bytes:
         """Return the fourth review's allocation finding without an attribute prefix."""
@@ -3771,45 +3780,6 @@ class CRulesScratchTest(FixtureTest):
         self.assertEqual(step.rc, 1, step.output)
         self.assertIn("finding: libavfilter/vf_x.c:3:", step.output)
 
-    def test_r5_phase2_delimiters(self) -> None:
-        """Spliced quotes, line-comment openers and block closers retain only noncode words."""
-        for newline in (b"\n", b"\r\n"):
-            splice = b"\\" + newline
-            cases = (
-                b'"' + splice + b"\\" + splice + b'"av_fixture_tag";',
-                b"/" + splice * 2 + b"/ av_fixture_tag",
-                b"/* av_fixture_tag *" + splice * 2 + b"/",
-            )
-            for prefix in cases:
-                with self.subTest(newline=newline, prefix=prefix):
-                    self.assert_blanked(
-                        prefix + newline + b"av_fixture_tag int code;" + newline,
-                        prefix + newline + b"               int code;" + newline,
-                    )
-
-    def test_r5_spliced_directive_tokens(self) -> None:
-        """Logical directives recognize definitions and comment prefixes across splices."""
-        for newline in (b"\n", b"\r\n"):
-            with self.subTest(newline=newline):
-                splice = b"\\" + newline
-                prefix = b"/" + splice + b"* leading *" + splice + b"/ " + splice
-                directive = prefix + b"#def" + splice + b"ine av_fixture_tag" + newline
-                (self.root / "libavutil/attributes.h").write_bytes(directive)
-                self.assertEqual(
-                    upstream_lint._c_rules_attributes(self.root), ({b"av_fixture_tag"}, [])
-                )
-                self.assert_blanked(
-                    directive + b"av_fixture_tag int code;" + newline,
-                    directive + b"               int code;" + newline,
-                )
-
-    def test_r5_boundary_nonnewline_backslash(self) -> None:
-        """Boundary control: a backslash before an asterisk does not form a comment opener."""
-        self.assert_blanked(
-            b"/\\* av_fixture_tag */\nav_fixture_tag int code;\n",
-            b"/\\*                */\n               int code;\n",
-        )
-
     def test_r5_bare_cr_source_unread(self) -> None:
         """A bare CR directive boundary is unread and never reaches the scanner."""
         source = (b"#define KEEP av_fixture_tag\n" + self._r5_allocation()).replace(b"\n", b"\r")
@@ -3863,106 +3833,6 @@ class CRulesScratchTest(FixtureTest):
                 self.assertEqual(step.rc, 1, step.output)
                 self.assertIn("finding: libavfilter/vf_x.c:4:", step.output)
                 self.assertNotIn("unread:", step.output)
-
-    def test_r3_spliced_line_comments(self) -> None:
-        """LF and CRLF splices keep the next physical line inside a line comment."""
-        for newline in (b"\n", b"\r\n"):
-            with self.subTest(newline=newline):
-                comment = b"// continued " + bytes([92]) + newline + b"av_fixture_tag" + newline
-                self.assert_blanked(
-                    comment + b"av_fixture_tag int code;\n",
-                    comment + b"               int code;\n",
-                )
-
-    def test_r3_spliced_header_comment(self) -> None:
-        """A definition on a spliced comment line contributes no attribute words."""
-        for newline in (b"\n", b"\r\n"):
-            with self.subTest(newline=newline):
-                header = self.root / "libavutil/attributes.h"
-                prefix = b"// continued " + bytes([92]) + newline
-                header.write_bytes(
-                    prefix + b"#define av_buffer" + newline + b"#define av_fixture_tag\n"
-                )
-                names, notices = upstream_lint._c_rules_attributes(self.root)
-                self.assertEqual(names, {b"av_fixture_tag"})
-                self.assertEqual(notices, [])
-
-    def test_r3_boundary_spliced_literals(self) -> None:
-        """Boundary control: spliced strings and characters retain every literal byte."""
-        for quote in (b'"', b"'"):
-            for newline in (b"\n", b"\r\n"):
-                with self.subTest(quote=quote, newline=newline):
-                    literal = (
-                        quote + b"continued " + bytes([92]) + newline + b"av_fixture_tag" + quote
-                    )
-                    self.assert_blanked(
-                        literal + b";\nav_fixture_tag int code;\n",
-                        literal + b";\n               int code;\n",
-                    )
-
-    def test_r3_unterminated_block_comment(self) -> None:
-        """An unterminated block comment masks through the end of the source."""
-        for suffix in (b"", b"\n", b"\\"):
-            with self.subTest(suffix=suffix):
-                tail = b"/* av_fixture_tag\nav_fixture_tag" + suffix
-                self.assert_blanked(
-                    b"av_fixture_tag int code;\n" + tail,
-                    b"               int code;\n" + tail,
-                )
-
-    def test_r3_unterminated_literals(self) -> None:
-        """Unterminated strings and characters mask through EOF including a trailing escape."""
-        for quote in (b'"', b"'"):
-            for suffix in (b"", b"\\"):
-                with self.subTest(quote=quote, suffix=suffix):
-                    tail = quote + b"av_fixture_tag\nav_fixture_tag" + suffix
-                    self.assert_blanked(
-                        b"av_fixture_tag int code;\n" + tail,
-                        b"               int code;\n" + tail,
-                    )
-
-    def test_r3_boundary_unspliced_line_comment(self) -> None:
-        """Boundary control: an unspliced line comment ends at its physical newline."""
-        self.assert_blanked(
-            b"// av_fixture_tag\nav_fixture_tag int code;\n",
-            b"// av_fixture_tag\n               int code;\n",
-        )
-
-    def test_r3_comment_prefixed_directive(self) -> None:
-        """A comment-prefixed directive protects its spliced physical continuation."""
-        directive = b"/* leading */ #define KEEP \\\n    av_fixture_tag int keep;\n"
-        self.assert_blanked(
-            directive + b"av_fixture_tag int code;\n",
-            directive + b"               int code;\n",
-        )
-
-    def test_r3_directive_spanning_block_comment(self) -> None:
-        """A directive continues across block comments and stops after their closing line."""
-        for middle in (b"", b"av_fixture_tag\n"):
-            with self.subTest(middle=middle):
-                directive = b"#define KEEP /* open\n" + middle + b"*/ av_fixture_tag int keep;\n"
-                self.assert_blanked(
-                    directive + b"av_fixture_tag int code;\n",
-                    directive + b"               int code;\n",
-                )
-
-    def test_r3_boundary_hash_after_code(self) -> None:
-        """Boundary control: a hash after ordinary code cannot start a directive."""
-        self.assert_blanked(
-            b"int x; # y \\\nav_fixture_tag int code;\n",
-            b"int x; # y \\\n               int code;\n",
-        )
-
-    def test_r3_boundary_hash_after_literal(self) -> None:
-        """Boundary control: masking a literal cannot turn a later hash into a directive."""
-        for quote in (b'"', b"'"):
-            with self.subTest(quote=quote):
-                prefix = b"/* leading */ " + quote + b"literal" + quote + b" # y "
-                prefix += bytes([92, 10])
-                self.assert_blanked(
-                    prefix + b"av_fixture_tag int code;\n",
-                    prefix + b"               int code;\n",
-                )
 
     def escaping_header(self) -> Path:
         """Establish an unchanged escaping header in the disposable fixture base."""
@@ -4075,60 +3945,6 @@ class CRulesScratchTest(FixtureTest):
         self.assertIn(f"unread: {name}:", step.output)
         self.assertIn(f"no waiver: {name}:", step.output)
 
-    def test_d1_attributes_only_in_code(self) -> None:
-        """Attribute words inside literals and comments remain byte-identical."""
-        tail = (
-            b'const char *text = "av_fixture_tag";\n'
-            b"int marker = 'x';\nint multichar = 'av_fixture_tag';\n"
-            b"/* av_fixture_tag\n   av_fixture_tag */\n"
-            b"// av_fixture_tag\n"
-        )
-        self.assert_blanked(
-            b"av_fixture_tag int code;\n" + tail,
-            b"               int code;\n" + tail,
-        )
-
-    def test_d1_attribute_discovery_ignores_noncode(self) -> None:
-        """Only real object-like attribute definitions are discovered."""
-        self.write(
-            "libavutil/attributes.h",
-            "/*\n#define av_buffer\n*/\n"
-            'const char *text = "\\\n#define av_string\\\n";\n'
-            "#define av_mark\n",
-        )
-        names, notices = upstream_lint._c_rules_attributes(self.root)
-        self.assertEqual(names, {b"av_mark"})
-        self.assertEqual(notices, [])
-
-    def test_d1_macro_discovery_ignores_noncode(self) -> None:
-        """Commented and quoted function macros cannot blank standalone calls."""
-        source = (
-            b"/*\n#define BUILD(x, n) int x;\n*/\nBUILD(x, 1)\n"
-            b'const char *text = "\\\n#define QUOTED(x) x\\\n";\nQUOTED(x)\n'
-        )
-        self.assert_blanked(source, source)
-
-    def test_d2_two_line_directive_and_code_boundary(self) -> None:
-        """A directive continuation is preserved and following code is blanked."""
-        directive = b"#define KEEP \\\n    av_fixture_tag int keep;\n"
-        self.assert_blanked(
-            directive + b"av_fixture_tag int code;\n",
-            directive + b"               int code;\n",
-        )
-
-    def test_d2_three_line_directive(self) -> None:
-        """Every physical line of a three-line directive stays identical."""
-        source = b"#define KEEP \\\n    av_fixture_tag \\\n    av_fixture_tag int keep;\n"
-        self.assert_blanked(source, source)
-
-    def test_d2_commented_hash_does_not_start_directive(self) -> None:
-        """A hash inside a block comment cannot exempt following ordinary code."""
-        prefix = b"/*\n#define KEEP \\\n*/ "
-        self.assert_blanked(
-            prefix + b"av_fixture_tag int code;\n",
-            prefix + b"               int code;\n",
-        )
-
     def allocation_source(self) -> str:
         """Return a one-line allocation finding that overlaps a committed symlink hunk."""
         return (
@@ -4206,17 +4022,6 @@ class CRulesScratchTest(FixtureTest):
         self.assertIn("resolves outside the checked tree", step.output)
         self.assertIn(f"unread: {name}:", step.output)
         self.assertIn(f"no waiver: {name}:", step.output)
-
-    def test_d3_scratch_target_cannot_escape(self) -> None:
-        """An absolute in-tree source cannot redirect a scratch write outside its root."""
-        name = str(self.root / "libavfilter/vf_x.c")
-        with tempfile.TemporaryDirectory() as directory:
-            with unittest.mock.patch.object(Path, "write_bytes") as write:
-                prepared = upstream_lint._c_rules_scan_root(self.root, [name], directory)
-            write.assert_not_called()
-        self.assertEqual(len(prepared[1]), 1)
-        self.assertIn(upstream_lint._waiver_text(name), prepared[1][0])
-        self.assertIn("resolves outside the scratch root", prepared[1][0])
 
     def test_d3_internal_source_symlink_is_scanned(self) -> None:
         """A requested symlink resolving inside the tree retains normal finding status."""
@@ -4379,9 +4184,274 @@ class CRulesScratchTest(FixtureTest):
         self.assertEqual(start["col"], line.index("buffer ?") + 1)
         self.assertEqual(start["offset"], source.index("buffer ?"))
 
+    def _scan_with_unreadable_header(self) -> tuple[upstream_lint.Step, list[str]]:
+        """Run _c_rules with PermissionError on attributes.h and return step plus scanned paths."""
+        header = self.root / "libavutil/attributes.h"
+        real_read = upstream_lint._c_rules_read_source
+        real_scan = upstream_lint._c_rules_scan
+        scanned_paths: list[str] = []
 
-class CRulesBlankingTest(unittest.TestCase):
+        def read_source(path: Path) -> bytes:
+            """Raise PermissionError on the attributes header and delegate other paths."""
+            if path == header:
+                raise PermissionError("fixture unread")
+            return real_read(path)
+
+        def record_scan(scan_root, paths, json_path, unread_paths):
+            """Record accepted scanner paths before delegating to the real scanner."""
+            scanned_paths.extend(paths)
+            return real_scan(scan_root, paths, json_path, unread_paths)
+
+        with (
+            unittest.mock.patch.object(
+                upstream_lint, "_c_rules_read_source", side_effect=read_source
+            ),
+            unittest.mock.patch.object(upstream_lint, "_c_rules_scan", side_effect=record_scan),
+        ):
+            step = upstream_lint._c_rules(self.root, self.base, "HEAD", "")
+        return step, scanned_paths
+
+    def test_unreadable_attributes_header_preserves_sibling_scan(self) -> None:
+        """An unreadable attributes header skips blanking, flags changes and scans siblings."""
+        notice = (
+            "informational: libavutil/attributes.h: could not be read; attribute blanking skipped"
+        )
+        self.write("libavfilter/vf_x.c", self.allocation_source())
+        self.commit("avfilter/vf_x: update source only")
+        unchanged_step, unchanged_paths = self._scan_with_unreadable_header()
+        self.assertEqual(unchanged_step.rc, 1, unchanged_step.output)
+        self.assertEqual(unchanged_step.output.count(notice), 1, unchanged_step.output)
+        self.assertNotIn("unread: libavutil/attributes.h:", unchanged_step.output)
+        self.assertEqual(unchanged_paths, ["libavfilter/vf_x.c"])
+        self.assertIn("finding: libavfilter/vf_x.c:1:", unchanged_step.output)
+        self.write("libavutil/attributes.h", "#define av_fixture_tag\n#define av_extra\n")
+        self.commit("avutil/attributes: touch header")
+        step, scanned_paths = self._scan_with_unreadable_header()
+        self.assertEqual(step.rc, 1, step.output)
+        self.assertEqual(step.output.count(notice), 1, step.output)
+        self.assertEqual(step.output.count("unread: libavutil/attributes.h:"), 1, step.output)
+        self.assertIn("no waiver: libavutil/attributes.h:", step.output)
+        self.assertNotIn("command rc:", step.output)
+        self.assertNotIn("libavutil/attributes.h", scanned_paths)
+        self.assertIn("libavfilter/vf_x.c", scanned_paths)
+        self.assertIn("finding: libavfilter/vf_x.c:1:", step.output)
+
+
+class CRulesTreeTest(_CRulesBlankingMixin, FixtureTest):
+    """Exercise tree-backed c-rules discovery and containment without running Semgrep."""
+
+    def setUp(self) -> None:
+        """Isolate temporary files in a cleanup-managed directory per test."""
+        super().setUp()
+        _isolate_test_tmpdir(self)
+
+    def test_r5_spliced_directive_tokens(self) -> None:
+        """Logical directives recognize definitions and comment prefixes across splices."""
+        for newline in (b"\n", b"\r\n"):
+            with self.subTest(newline=newline):
+                splice = b"\\" + newline
+                prefix = b"/" + splice + b"* leading *" + splice + b"/ " + splice
+                directive = prefix + b"#def" + splice + b"ine av_fixture_tag" + newline
+                (self.root / "libavutil/attributes.h").write_bytes(directive)
+                self.assertEqual(
+                    upstream_lint._c_rules_attributes(self.root), ({b"av_fixture_tag"}, [])
+                )
+                self.assert_blanked(
+                    directive + b"av_fixture_tag int code;" + newline,
+                    directive + b"               int code;" + newline,
+                )
+
+    def test_r3_spliced_header_comment(self) -> None:
+        """A definition on a spliced comment line contributes no attribute words."""
+        for newline in (b"\n", b"\r\n"):
+            with self.subTest(newline=newline):
+                header = self.root / "libavutil/attributes.h"
+                prefix = b"// continued " + bytes([92]) + newline
+                header.write_bytes(
+                    prefix + b"#define av_buffer" + newline + b"#define av_fixture_tag\n"
+                )
+                names, notices = upstream_lint._c_rules_attributes(self.root)
+                self.assertEqual(names, {b"av_fixture_tag"})
+                self.assertEqual(notices, [])
+
+    def test_d1_attribute_discovery_ignores_noncode(self) -> None:
+        """Only real object-like attribute definitions are discovered."""
+        self.write(
+            "libavutil/attributes.h",
+            "/*\n#define av_buffer\n*/\n"
+            'const char *text = "\\\n#define av_string\\\n";\n'
+            "#define av_mark\n",
+        )
+        names, notices = upstream_lint._c_rules_attributes(self.root)
+        self.assertEqual(names, {b"av_mark"})
+        self.assertEqual(notices, [])
+
+    def test_d3_scratch_target_cannot_escape(self) -> None:
+        """An absolute in-tree source cannot redirect a scratch write outside its root."""
+        name = str(self.root / "libavfilter/vf_x.c")
+        with tempfile.TemporaryDirectory() as directory:
+            with unittest.mock.patch.object(Path, "write_bytes") as write:
+                prepared = upstream_lint._c_rules_scan_root(self.root, [name], directory)
+            write.assert_not_called()
+        self.assertEqual(len(prepared[1]), 1)
+        self.assertIn(upstream_lint._waiver_text(name), prepared[1][0])
+        self.assertIn("resolves outside the scratch root", prepared[1][0])
+
+
+class CRulesBlankingTest(_CRulesBlankingMixin, unittest.TestCase):
     """Pin discovery, lexical boundaries, scope and unread-source preservation."""
+
+    def test_r5_phase2_delimiters(self) -> None:
+        """Spliced quotes, line-comment openers and block closers retain only noncode words."""
+        for newline in (b"\n", b"\r\n"):
+            splice = b"\\" + newline
+            cases = (
+                b'"' + splice + b"\\" + splice + b'"av_fixture_tag";',
+                b"/" + splice * 2 + b"/ av_fixture_tag",
+                b"/* av_fixture_tag *" + splice * 2 + b"/",
+            )
+            for prefix in cases:
+                with self.subTest(newline=newline, prefix=prefix):
+                    self.assert_blanked(
+                        prefix + newline + b"av_fixture_tag int code;" + newline,
+                        prefix + newline + b"               int code;" + newline,
+                    )
+
+    def test_r5_boundary_nonnewline_backslash(self) -> None:
+        """Boundary control: a backslash before an asterisk does not form a comment opener."""
+        self.assert_blanked(
+            b"/\\* av_fixture_tag */\nav_fixture_tag int code;\n",
+            b"/\\*                */\n               int code;\n",
+        )
+
+    def test_r3_spliced_line_comments(self) -> None:
+        """LF and CRLF splices keep the next physical line inside a line comment."""
+        for newline in (b"\n", b"\r\n"):
+            with self.subTest(newline=newline):
+                comment = b"// continued " + bytes([92]) + newline + b"av_fixture_tag" + newline
+                self.assert_blanked(
+                    comment + b"av_fixture_tag int code;\n",
+                    comment + b"               int code;\n",
+                )
+
+    def test_r3_boundary_spliced_literals(self) -> None:
+        """Boundary control: spliced strings and characters retain every literal byte."""
+        for quote in (b'"', b"'"):
+            for newline in (b"\n", b"\r\n"):
+                with self.subTest(quote=quote, newline=newline):
+                    literal = (
+                        quote + b"continued " + bytes([92]) + newline + b"av_fixture_tag" + quote
+                    )
+                    self.assert_blanked(
+                        literal + b";\nav_fixture_tag int code;\n",
+                        literal + b";\n               int code;\n",
+                    )
+
+    def test_r3_unterminated_block_comment(self) -> None:
+        """An unterminated block comment masks through the end of the source."""
+        for suffix in (b"", b"\n", b"\\"):
+            with self.subTest(suffix=suffix):
+                tail = b"/* av_fixture_tag\nav_fixture_tag" + suffix
+                self.assert_blanked(
+                    b"av_fixture_tag int code;\n" + tail,
+                    b"               int code;\n" + tail,
+                )
+
+    def test_r3_unterminated_literals(self) -> None:
+        """Unterminated strings and characters mask through EOF including a trailing escape."""
+        for quote in (b'"', b"'"):
+            for suffix in (b"", b"\\"):
+                with self.subTest(quote=quote, suffix=suffix):
+                    tail = quote + b"av_fixture_tag\nav_fixture_tag" + suffix
+                    self.assert_blanked(
+                        b"av_fixture_tag int code;\n" + tail,
+                        b"               int code;\n" + tail,
+                    )
+
+    def test_r3_boundary_unspliced_line_comment(self) -> None:
+        """Boundary control: an unspliced line comment ends at its physical newline."""
+        self.assert_blanked(
+            b"// av_fixture_tag\nav_fixture_tag int code;\n",
+            b"// av_fixture_tag\n               int code;\n",
+        )
+
+    def test_r3_comment_prefixed_directive(self) -> None:
+        """A comment-prefixed directive protects its spliced physical continuation."""
+        directive = b"/* leading */ #define KEEP \\\n    av_fixture_tag int keep;\n"
+        self.assert_blanked(
+            directive + b"av_fixture_tag int code;\n",
+            directive + b"               int code;\n",
+        )
+
+    def test_r3_directive_spanning_block_comment(self) -> None:
+        """A directive continues across block comments and stops after their closing line."""
+        for middle in (b"", b"av_fixture_tag\n"):
+            with self.subTest(middle=middle):
+                directive = b"#define KEEP /* open\n" + middle + b"*/ av_fixture_tag int keep;\n"
+                self.assert_blanked(
+                    directive + b"av_fixture_tag int code;\n",
+                    directive + b"               int code;\n",
+                )
+
+    def test_r3_boundary_hash_after_code(self) -> None:
+        """Boundary control: a hash after ordinary code cannot start a directive."""
+        self.assert_blanked(
+            b"int x; # y \\\nav_fixture_tag int code;\n",
+            b"int x; # y \\\n               int code;\n",
+        )
+
+    def test_r3_boundary_hash_after_literal(self) -> None:
+        """Boundary control: masking a literal cannot turn a later hash into a directive."""
+        for quote in (b'"', b"'"):
+            with self.subTest(quote=quote):
+                prefix = b"/* leading */ " + quote + b"literal" + quote + b" # y "
+                prefix += bytes([92, 10])
+                self.assert_blanked(
+                    prefix + b"av_fixture_tag int code;\n",
+                    prefix + b"               int code;\n",
+                )
+
+    def test_d1_attributes_only_in_code(self) -> None:
+        """Attribute words inside literals and comments remain byte-identical."""
+        tail = (
+            b'const char *text = "av_fixture_tag";\n'
+            b"int marker = 'x';\nint multichar = 'av_fixture_tag';\n"
+            b"/* av_fixture_tag\n   av_fixture_tag */\n"
+            b"// av_fixture_tag\n"
+        )
+        self.assert_blanked(
+            b"av_fixture_tag int code;\n" + tail,
+            b"               int code;\n" + tail,
+        )
+
+    def test_d1_macro_discovery_ignores_noncode(self) -> None:
+        """Commented and quoted function macros cannot blank standalone calls."""
+        source = (
+            b"/*\n#define BUILD(x, n) int x;\n*/\nBUILD(x, 1)\n"
+            b'const char *text = "\\\n#define QUOTED(x) x\\\n";\nQUOTED(x)\n'
+        )
+        self.assert_blanked(source, source)
+
+    def test_d2_two_line_directive_and_code_boundary(self) -> None:
+        """A directive continuation is preserved and following code is blanked."""
+        directive = b"#define KEEP \\\n    av_fixture_tag int keep;\n"
+        self.assert_blanked(
+            directive + b"av_fixture_tag int code;\n",
+            directive + b"               int code;\n",
+        )
+
+    def test_d2_three_line_directive(self) -> None:
+        """Every physical line of a three-line directive stays identical."""
+        source = b"#define KEEP \\\n    av_fixture_tag \\\n    av_fixture_tag int keep;\n"
+        self.assert_blanked(source, source)
+
+    def test_d2_commented_hash_does_not_start_directive(self) -> None:
+        """A hash inside a block comment cannot exempt following ordinary code."""
+        prefix = b"/*\n#define KEEP \\\n*/ "
+        self.assert_blanked(
+            prefix + b"av_fixture_tag int code;\n",
+            prefix + b"               int code;\n",
+        )
 
     def test_attribute_discovery_and_byte_preservation(self) -> None:
         """Only discovered object macros are blanked outside directive lines."""
@@ -4624,6 +4694,113 @@ class CRulesBlankingTest(unittest.TestCase):
                 upstream_lint._c_rules_blank(unbalanced, {b"av_mark"}),
                 expected,
             )
+
+    def test_unreadable_attributes_header_skips_blanking_with_notice(self) -> None:
+        """An OSError reading attributes.h returns an empty set and one informational notice."""
+        notice = (
+            "informational: libavutil/attributes.h: could not be read; attribute blanking skipped"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            tree = Path(directory) / "tree"
+            header = tree / "libavutil/attributes.h"
+            header.parent.mkdir(parents=True)
+            header.write_bytes(b"#define av_mark\n")
+            real_read = upstream_lint._c_rules_read_source
+
+            def read_source(path: Path) -> bytes:
+                """Raise PermissionError on the attributes header and delegate other paths."""
+                if path == header:
+                    raise PermissionError("fixture unread")
+                return real_read(path)
+
+            with unittest.mock.patch.object(
+                upstream_lint, "_c_rules_read_source", side_effect=read_source
+            ):
+                names, notices = upstream_lint._c_rules_attributes(tree)
+        self.assertEqual(names, set())
+        self.assertEqual(notices, [notice])
+
+    def test_attributed_declaration_heads_do_not_open_function_body(self) -> None:
+        """Attributed type heads retain declarators while plain function heads blank calls."""
+        unchanged_cases = (
+            (
+                b"#define NAME(x) x\ntypedef struct __attribute__((packed)) { int x; }\n"
+                b"NAME(Foo)\n;\nFoo value;\n"
+            ),
+            (
+                b"#define NAME(x) x\ntypedef struct __attribute__((packed))\n{ int x; }\n"
+                b"NAME(Foo)\n;\nFoo value;\n"
+            ),
+            b"#define NAME(x) x\nstruct __attribute__((packed)) { int x; }\nNAME(v)\n;\n",
+            (
+                b"#define CALL(x) (x)\n#if A\nstruct __attribute__((packed))\n#else\n"
+                b"int f(void)\n#endif\n{ int x; }\nCALL(1)\n"
+            ),
+        )
+        for index in range(len(unchanged_cases)):
+            source = unchanged_cases[index]
+            self.assert_blanked(source, source)
+        blanked_cases = (
+            b"#define CALL(x) (x)\nint f(void) {\n    return 0;\n}\nCALL(1)\n",
+            b"#define CALL(x) (x)\nint f(void)\n{\n    return 0;\n}\nCALL(1)\n",
+        )
+        for index in range(len(blanked_cases)):
+            source = blanked_cases[index]
+            expected = source[: -len(b"CALL(1)\n")] + b" " * len(b"CALL(1)") + b"\n"
+            self.assert_blanked(source, expected)
+
+    def test_type_returning_function_heads_open_function_body(self) -> None:
+        """Type-returning, attributed and multi-line function heads open bodies and blank calls."""
+        cases = (
+            (
+                b"#define CALL(x) (x)\nstatic enum AVPixelFormat f(void)\n"
+                b"{\n    return 0;\n}\nCALL(1)\n"
+            ),
+            b"#define CALL(x) (x)\nstatic struct S *f(void) {\n    return 0;\n}\nCALL(1)\n",
+            (
+                b"#define CALL(x) (x)\nstatic enum E f(void) { return 0; }\n"
+                b"static int g(void)\n{\n    return 0;\n}\nCALL(1)\n"
+            ),
+            (
+                b"#define CALL(x) (x)\nstatic int __attribute__((noinline)) f(void)\n"
+                b"{\n    return 0;\n}\nCALL(1)\n"
+            ),
+            (
+                b"#define CALL(x) (x)\nstatic int f(int a,\n    int b)\n"
+                b"{\n    return a;\n}\nCALL(1)\n"
+            ),
+        )
+        for index in range(len(cases)):
+            source = cases[index]
+            expected = source[: -len(b"CALL(1)\n")] + b" " * len(b"CALL(1)") + b"\n"
+            self.assert_blanked(source, expected)
+
+    def test_attribute_groups_never_open_function_body(self) -> None:
+        """Multi-line, alternate-spelling and split-arm attribute groups retain declarators."""
+        cases = (
+            (
+                b"#define NAME(x) x\ntypedef struct __attribute__((\n    packed))\n"
+                b"{ int x; }\nNAME(Foo)\n;\nFoo value;\n"
+            ),
+            b"#define NAME(x) x\nstruct __attribute((packed)) { int x; }\nNAME(v)\n;\n",
+            b"#define NAME(x) x\nstruct __declspec(align(16)) { int x; }\nNAME(v)\n;\n",
+            (
+                b"#define NAME(x) x\n#if A\ntypedef struct __attribute__((packed\n#else\n"
+                b"typedef struct __attribute__((packed))\n#endif\n))\n{ int x; }\nNAME(Foo)\n;\n"
+            ),
+        )
+        for index in range(len(cases)):
+            source = cases[index]
+            self.assert_blanked(source, source)
+
+    def test_broken_attribute_group_ends_at_statement(self) -> None:
+        """Statement terminators close broken attribute groups before later functions."""
+        source = (
+            b"#define CALL(x) (x)\nstruct __attribute__((packed);\nint f(void)\n"
+            b"{\n    return 0;\n}\nCALL(1)\n"
+        )
+        expected = source[: -len(b"CALL(1)\n")] + b" " * len(b"CALL(1)") + b"\n"
+        self.assert_blanked(source, expected)
 
 
 class CRulesTest(unittest.TestCase):
@@ -5867,6 +6044,34 @@ class UnreadWaiverTest(unittest.TestCase):
             self.assertEqual(caught.exception.code, 2)
             self.assertIn("JSON" if index < 3 else "path", output.getvalue())
             self.assertNotIn("unrecognized arguments", output.getvalue())
+
+    def test_usage_deep_nesting_recursion_error(self) -> None:
+        """Deeply nested waiver JSON turns RecursionError into an explicit usage error."""
+        output = io.StringIO()
+        with (
+            unittest.mock.patch.object(upstream_lint.json, "loads", side_effect=RecursionError),
+            unittest.mock.patch.object(upstream_lint, "_prepare") as prepare,
+            unittest.mock.patch.object(upstream_lint, "_checks") as checks,
+            contextlib.redirect_stderr(output),
+            self.assertRaises(SystemExit) as caught,
+        ):
+            upstream_lint.main(["--tree", ".", "--base", "base", "--c-rule-unread-waiver", "{}"])
+        stderr = output.getvalue()
+        self.assertEqual(caught.exception.code, 2)
+        self.assertIn("--c-rule-unread-waiver: JSON: waiver nesting too deep", stderr)
+        self.assertNotIn("Traceback", stderr)
+        self.assertNotIn("RecursionError", stderr)
+        prepare.assert_not_called()
+        checks.assert_not_called()
+
+    def test_unread_waiver_object_rejects_recursion_error(self) -> None:
+        """Direct waiver JSON decoding translates RecursionError into ValueError."""
+        with (
+            unittest.mock.patch.object(upstream_lint.json, "loads", side_effect=RecursionError),
+            self.assertRaises(ValueError) as caught,
+        ):
+            upstream_lint._unread_waiver_object("{}")
+        self.assertEqual(str(caught.exception), "JSON: waiver nesting too deep")
 
     def test_unread_waiver_cannot_waive_tool_errors(self) -> None:
         """Valid dated waivers leave tool, warning and JSON failures at rc two."""

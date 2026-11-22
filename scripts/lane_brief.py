@@ -5,6 +5,7 @@
 
 The check command with a runner first runs scripts/lane_isolation.py on the worktree.
 Required entries must end at an allowed token boundary.
+Refuses make-without-praetorctl, column-limit joins, file length checks, and missing 40-hex names.
 Runner dependencies load on demand so copied validators can reuse the YAML reader.
 
 Usage: lane_brief.py render --branch B --task T --finding F --fix X --tests S --paths P --modules M
@@ -41,6 +42,35 @@ RUNNER_OUTPUT_LIMIT = 65536
 # Allow-list of characters that end a required entry; whitespace, end of text,
 # and a period followed by whitespace or end of text also end it.
 ENTRY_ENDINGS = '`"),:;'
+NEVER_RUN_CLAUSE = re.compile(
+    r"\bnever\s+run\b(?:[^\n;.]|\.(?!\s|$)|\n(?![ \t]*(?:$|[-*`]|\d+\.|\w+:)))*",
+    re.IGNORECASE,
+)
+FORBIDDEN_PRAETORCTL = re.compile(r"\bpraetorctl\b(?!\s+(?:gate|admit)\b)", re.IGNORECASE)
+ALLOWED_ADMIT = re.compile(r"\bexcept\b[^.;\n]*\badmit\b", re.IGNORECASE)
+FORBIDDEN_MAKE = re.compile(r"\bmake\b(?!\s+verify-all\b)", re.IGNORECASE)
+BACKTICK_SPAN = re.compile(r"(?<!`)`([^`]+)`(?!`)")
+MAKE_INVOCATION = re.compile(r"(?<![.-])\bmake\b(?![/.-])")
+COLUMN_LIMIT = re.compile(
+    r"(?:\b(?:(?:longer|more)\s+than|over|at\s+most)\s+|<=\s*)\d{2,3}\s+col(?:umn)?s\b",
+    re.IGNORECASE,
+)
+ONE_LINE_JOIN = re.compile(
+    r"\b(?:"
+    r"becomes?\s+(?:one|a\s+single)\s+line"
+    r"|join(?:ed|ing|s)?(?:\s+(?:(?!\n\s*\n)[^.;]){1,80}?)?\s+"
+    r"(?:into|onto)\s+(?:one|a\s+single)\s+line"
+    r"|go(?:es)?\s+to\s+(?:one|a\s+single)\s+line"
+    r")\b",
+    re.IGNORECASE,
+)
+WHOLE_FILE_LENGTH = re.compile(
+    r"\b[gmn]?awk\b[\s\S]*?\blength\s*\("
+    r"|\b(?:[ef]?grep|rg)\b[\s\S]*?(?<!\\)\.\\?\{\d+(?:,\d*)?\\?\}"
+    r"|\bwc\s+(?:-[a-zA-Z]*L\b|--max-line-length\b)"
+)
+GIT_DIFF_COMMAND = re.compile(r"\bgit\b[^|;&]*\bdiff\b")
+STANDALONE_OBJECT = re.compile(r"(?<![0-9a-fA-F])[0-9a-f]{40}(?![0-9a-fA-F])")
 
 
 def validate_lines(lines: list[bytes], label: str) -> None:
@@ -284,6 +314,100 @@ def check_isolation(worktree: Path) -> int:
     return 0
 
 
+def conflict_make_without_praetorctl(content: str) -> str:
+    """Report a brief that runs make while forbidding praetorctl in Never run."""
+    clauses = [match.group(0) for match in NEVER_RUN_CLAUSE.finditer(content)]
+    praetor_clause = next(
+        (
+            clause
+            for clause in clauses
+            if FORBIDDEN_PRAETORCTL.search(clause) and not ALLOWED_ADMIT.search(clause)
+        ),
+        "",
+    )
+    if not praetor_clause or any(FORBIDDEN_MAKE.search(clause) for clause in clauses):
+        return ""
+    make_span = next(
+        (
+            match.group(1)
+            for match in BACKTICK_SPAN.finditer(content)
+            if MAKE_INVOCATION.search(match.group(1))
+        ),
+        "",
+    )
+    if not make_span:
+        return ""
+    span_text = " ".join(make_span.split())
+    clause_text = " ".join(praetor_clause.split())
+    return (
+        f"`{span_text}` with `{clause_text}`: "
+        "allow praetorctl admit for the make command or move the build to the host and forbid make"
+    )
+
+
+def conflict_join_under_column_limit(content: str) -> str:
+    """Report a brief that sets a column limit and asks to join code onto one line."""
+    limit_match = COLUMN_LIMIT.search(content)
+    join_match = ONE_LINE_JOIN.search(content)
+    if not limit_match or not join_match:
+        return ""
+    limit_text = " ".join(limit_match.group(0).split())
+    join_text = " ".join(join_match.group(0).split())
+    return f'"{join_text}" under "{limit_text}": give the exact wrapped form instead of a join'
+
+
+def conflict_whole_file_length_check(content: str) -> str:
+    """Report a backtick line-length command that does not read a git diff."""
+    for match in BACKTICK_SPAN.finditer(content):
+        span = match.group(1)
+        if WHOLE_FILE_LENGTH.search(span) and not GIT_DIFF_COMMAND.search(span):
+            span_text = " ".join(span.split())
+            return f"`{span_text}`: check only added lines of a git diff"
+    return ""
+
+
+def conflict_missing_object(content: str, worktree: Path) -> str:
+    """Report a standalone 40-hex object name that the worktree does not hold."""
+    names = list(dict.fromkeys(STANDALONE_OBJECT.findall(content)))
+    if not names:
+        return ""
+    lane_isolation = importlib.import_module("scripts.lane_isolation")
+    current = names[0]
+    try:
+        lane_isolation.common_dir(worktree)
+        for current in names:
+            probe = lane_isolation.run_git(["-C", str(worktree), "cat-file", "-e", current])
+            if probe.returncode == 1:
+                return (
+                    f"{current} not in {worktree}: write full names from git rev-parse, "
+                    "never extend a short name by hand"
+                )
+            if probe.returncode != 0:
+                detail = probe.stderr.strip() or f"git cat-file exited {probe.returncode}"
+                raise lane_isolation.IsolationError(detail)
+    except (lane_isolation.IsolationError, OSError) as error:
+        raise lane_isolation.IsolationError(f"could not resolve {current}: {error}") from error
+    return ""
+
+
+def check_conflicts(content: str, label: str, worktree: Path) -> int:
+    """Print each brief conflict reason and return 1 on conflict or 2 on Git error."""
+    reasons = [
+        conflict_make_without_praetorctl(content),
+        conflict_join_under_column_limit(content),
+        conflict_whole_file_length_check(content),
+    ]
+    try:
+        reasons.append(conflict_missing_object(content, worktree))
+    except (OSError, ValueError) as error:
+        print(f"lane_brief: {error}", file=sys.stderr)
+        return 2
+    reported = [reason for reason in reasons if reason]
+    for reason in reported:
+        print(f"{label}: conflict: {reason}", file=sys.stderr)
+    return int(bool(reported))
+
+
 def check_brief(args: argparse.Namespace) -> int:
     """Validate the brief locally and run the configured runner precheck."""
     content = "".join(bounded_lines(args.brief))
@@ -291,14 +415,17 @@ def check_brief(args: argparse.Namespace) -> int:
         args.config if args.config is not None else args.worktree / ".config" / "lane-brief.yaml"
     )
     result = check(content, str(args.brief), read_required(config))
-    if result:
-        return result
+    conflict_result = check_conflicts(content, str(args.brief), args.worktree)
+    if conflict_result == 2:
+        return 2
+    if result or conflict_result:
+        return 1
     if not args.runner:
         print(
             "lane_brief: runner and lane isolation checks skipped: LANE_BRIEF_RUNNER unset",
             file=sys.stderr,
         )
-        return result
+        return 0
     result = check_isolation(args.worktree)
     if result:
         return result

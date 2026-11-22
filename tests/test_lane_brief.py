@@ -513,6 +513,213 @@ class LaneBriefTest(unittest.TestCase):
         self.assertIn("missing required line", error)
         self.assertFalse(calls.exists())
 
+    def check_snippet(self, snippet: str, *, worktree: Path | None = None) -> tuple[int, str]:
+        """Validate a rendered brief containing snippet and return status and stderr."""
+        brief = self.root / "brief.md"
+        brief.write_text(f"{self.rendered()}\n{snippet}", encoding="utf-8")
+        target = worktree if worktree is not None else self.root
+        rc, _, error = self.run_cli(
+            "check", str(brief), "--worktree", str(target), "--config", str(CONFIG)
+        )
+        return rc, error
+
+    def commit_fixture(self) -> tuple[Path, str]:
+        """Create a one-commit temporary Git repository and return its path and HEAD."""
+        worktree = repo(self.root / "worktree")
+        commit = run_git(worktree, "rev-parse", "HEAD", preserve_config=True)
+        return worktree, commit
+
+    def test_conflict_does_not_call_runner(self) -> None:
+        """Reject a conflicting brief before checking isolation or invoking the runner."""
+        brief, runner, calls = self.runner_fixture()
+        content = brief.read_text(encoding="utf-8")
+        brief.write_text(content + "\n- `wc -L tests/checkasm/vvc_mc.c`\n", encoding="utf-8")
+        rc, _, error = self.run_cli("check", str(brief), "--runner", str(runner))
+        self.assertEqual(rc, 1, error)
+        self.assertIn(f"{brief}: conflict:", error)
+        self.isolation.assert_not_called()
+        self.assertFalse(calls.exists())
+
+    def test_conflict_case_1a_refused(self) -> None:
+        """Refuse case 1a naming make in backticks while forbidding praetorctl."""
+        rc, error = self.check_snippet(
+            "- `nice -n 10 make -j6 x > log`\n"
+            "limits: Never run cherry-pick, rebase, lefthook or praetorctl; never\n"
+        )
+        self.assertEqual(rc, 1, error)
+        self.assertIn("conflict:", error)
+        self.assertIn("nice -n 10 make -j6 x > log", error)
+        self.assertIn("praetorctl admit", error)
+
+    def test_conflict_case_1b_passes(self) -> None:
+        """Pass case 1b when Never run forbids both make and praetorctl."""
+        rc, error = self.check_snippet(
+            "host builds.\n"
+            "limits: Never run make, cherry-pick, rebase, lefthook or praetorctl; never\n"
+        )
+        self.assertEqual(rc, 0, error)
+
+    def test_conflict_case_1c_passes(self) -> None:
+        """Pass case 1c when praetorctl is forbidden without any make command."""
+        rc, error = self.check_snippet(
+            "- `git add a`\nlimits: Never run push or praetorctl; never\n"
+        )
+        self.assertEqual(rc, 0, error)
+
+    def test_conflict_case_1d_passes(self) -> None:
+        """Pass case 1d when make is named without forbidding praetorctl."""
+        rc, error = self.check_snippet("- `make fate-x`\nlimits: Never run push; never\n")
+        self.assertEqual(rc, 0, error)
+
+    def test_conflict_case_2a_refused(self) -> None:
+        """Refuse case 2a asking a declaration to become one line under 100 columns."""
+        rc, error = self.check_snippet(
+            "- FFmpeg style: no line you write longer than 100 columns.\n"
+            "  2. `alf_gradient_tmp` (`int32_t`; the two-line declaration becomes one line).\n"
+        )
+        self.assertEqual(rc, 1, error)
+        self.assertIn("conflict:", error)
+        self.assertIn("becomes one line", error)
+        self.assertIn("longer than 100 columns", error)
+        self.assertIn("exact wrapped form", error)
+
+    def test_conflict_case_2b_passes(self) -> None:
+        """Pass case 2b asking for one line when no column limit is set."""
+        rc, error = self.check_snippet("the two-line declaration becomes one line.\n")
+        self.assertEqual(rc, 0, error)
+
+    def test_conflict_case_2c_passes(self) -> None:
+        """Pass case 2c giving a wrapped form under a 100-column limit."""
+        rc, error = self.check_snippet(
+            "no line you write longer than 100 columns.\n"
+            "write it as two lines:\n"
+            "```c\n"
+            "    a *\n"
+            "        b;\n"
+            "```\n"
+        )
+        self.assertEqual(rc, 0, error)
+
+    def test_conflict_case_2d_refused(self) -> None:
+        """Refuse case 2d joining a call onto a single line under 80 cols."""
+        rc, error = self.check_snippet("at most 80 cols.\njoin the call onto a single line.\n")
+        self.assertEqual(rc, 1, error)
+        self.assertIn("conflict:", error)
+        self.assertIn("join the call onto a single line", error)
+        self.assertIn("at most 80 cols", error)
+
+    def test_conflict_case_3a_refused(self) -> None:
+        """Refuse case 3a running awk length on a whole file."""
+        rc, error = self.check_snippet(
+            "- `awk 'length($0) > 100 {print FILENAME\":\"FNR}' "
+            "libavfilter/tests/hqdn3d_vulkan.c` (must print nothing)\n"
+        )
+        self.assertEqual(rc, 1, error)
+        self.assertIn("conflict:", error)
+        self.assertIn("hqdn3d_vulkan.c", error)
+        self.assertIn("added lines of a git diff", error)
+
+    def test_conflict_case_3b_refused(self) -> None:
+        """Refuse case 3b running grep with a dot-repeat width on a whole file."""
+        rc, error = self.check_snippet(r"- `grep -n '.\{101\}' libavcodec/vvc/inter.c`" + "\n")
+        self.assertEqual(rc, 1, error)
+        self.assertIn("conflict:", error)
+        self.assertIn(r"grep -n '.\{101\}' libavcodec/vvc/inter.c", error)
+        self.assertIn("added lines of a git diff", error)
+
+    def test_conflict_case_3c_refused(self) -> None:
+        """Refuse case 3c running wc -L on a whole file."""
+        rc, error = self.check_snippet("- `wc -L tests/checkasm/vvc_mc.c`\n")
+        self.assertEqual(rc, 1, error)
+        self.assertIn("conflict:", error)
+        self.assertIn("wc -L tests/checkasm/vvc_mc.c", error)
+        self.assertIn("added lines of a git diff", error)
+
+    def test_conflict_case_3d_passes(self) -> None:
+        """Pass case 3d piping git diff output into an awk length check."""
+        rc, error = self.check_snippet(
+            "- `git diff -U0 HEAD~1 -- a.c | grep '^+[^+]' | awk 'length($0) > 101'` "
+            "(must print nothing)\n"
+        )
+        self.assertEqual(rc, 0, error)
+
+    def test_conflict_case_3e_passes(self) -> None:
+        """Pass case 3e running awk without a length check."""
+        rc, error = self.check_snippet("- `awk '{print $1}' list.txt`\n")
+        self.assertEqual(rc, 0, error)
+
+    def test_conflict_case_4a_refused(self) -> None:
+        """Refuse case 4a naming a zero-padded 40-hex commit absent from the worktree."""
+        worktree, commit = self.commit_fixture()
+        padded = commit[:7] + ("0" * 33)
+        self.assertNotEqual(padded, commit)
+        rc, error = self.check_snippet(f"HEAD {padded} (origin/main)\n", worktree=worktree)
+        self.assertEqual(rc, 1, error)
+        self.assertIn("conflict:", error)
+        self.assertIn(padded, error)
+        self.assertIn("git rev-parse", error)
+
+    def test_conflict_case_4b_passes(self) -> None:
+        """Pass case 4b naming the full 40-hex commit held by the worktree."""
+        worktree, commit = self.commit_fixture()
+        rc, error = self.check_snippet(f"HEAD {commit} (origin/main)\n", worktree=worktree)
+        self.assertEqual(rc, 0, error)
+
+    def test_conflict_case_4c_passes(self) -> None:
+        """Pass case 4c containing only a short commit name and a 64-hex digest."""
+        worktree, commit = self.commit_fixture()
+        digest = "a" * 64
+        rc, error = self.check_snippet(f"HEAD {commit[:7]}; sha256 {digest}\n", worktree=worktree)
+        self.assertEqual(rc, 0, error)
+
+    def test_conflict_case_4d_passes(self) -> None:
+        """Pass case 4d containing a 41-hex run rather than a standalone 40-hex name."""
+        worktree, commit = self.commit_fixture()
+        rc, error = self.check_snippet(f"HEAD {commit}0 (origin/main)\n", worktree=worktree)
+        self.assertEqual(rc, 0, error)
+
+    def test_conflict_case_4e_fail_closed(self) -> None:
+        """Fail closed with exit 2 for case 4e when the worktree or Git fails."""
+        worktree, commit = self.commit_fixture()
+        not_repo = self.root / "not_repo"
+        not_repo.mkdir()
+        # Stop Git from walking up to an ancestor checkout when TMPDIR sits inside a worktree.
+        (not_repo / ".git").write_text("gitdir: missing\n", encoding="utf-8")
+        rc, error = self.check_snippet(f"HEAD {commit} (origin/main)\n", worktree=not_repo)
+        self.assertEqual(rc, 2, error)
+        self.assertIn("could not resolve", error)
+        self.assertIn(commit, error)
+        with (
+            patch.object(lane_isolation, "common_dir", return_value=worktree / ".git"),
+            patch.object(
+                lane_isolation,
+                "run_git",
+                return_value=subprocess.CompletedProcess([], 128, "", "corrupt repo"),
+            ),
+        ):
+            rc, error = self.check_snippet(f"HEAD {commit} (origin/main)\n", worktree=worktree)
+        self.assertEqual(rc, 2, error)
+        self.assertIn("corrupt repo", error)
+        with patch.object(
+            lane_isolation, "common_dir", side_effect=lane_isolation.IsolationError("timed out")
+        ):
+            rc, error = self.check_snippet(f"HEAD {commit} (origin/main)\n", worktree=worktree)
+        self.assertEqual(rc, 2, error)
+        self.assertIn("timed out", error)
+
+    def test_conflict_alternate_forms_refused(self) -> None:
+        """Refuse alternate column-limit, one-line join, and ERE grep length forms."""
+        for snippet in (
+            "over 100 columns.\nask it to go to one line.\n",
+            "more than 120 columns.\nit must be joined into one line.\n",
+            "<= 80 columns.\ncode becomes a single line.\n",
+            "- `grep -E '.{101}' a.c`\n",
+        ):
+            with self.subTest(snippet=snippet):
+                rc, error = self.check_snippet(snippet)
+                self.assertEqual(rc, 1, error)
+                self.assertIn("conflict:", error)
+
     @unittest.skipUnless(
         hasattr(os, "mkfifo") and hasattr(signal, "SIGALRM"), "FIFO alarm unavailable"
     )

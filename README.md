@@ -438,6 +438,8 @@ A tag `vX.Y.Z` publishes a release; `vX.Y.Z-rc.N` publishes a prerelease.
 
 The release notes list the base and every patch with its upstream state, and
 show the verify commands. A consumer pins the tag and the tarball's sha256.
+For the full pin set and the shared admission helper, see
+[docs/consumer-admission.md](docs/consumer-admission.md).
 
 Versions follow SemVer and start below 1.0.0:
 

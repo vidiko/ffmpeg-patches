@@ -30,24 +30,24 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-import re
 import subprocess  # nosec B404 - allow-listed cosign argv, no shell, bounded timeout.
 import sys
 from pathlib import Path
 
-NUMBER = r"(0|[1-9][0-9]*)"
-FINAL = re.compile(rf"v{NUMBER}\.{NUMBER}\.{NUMBER}")
-CANDIDATE = re.compile(rf"v{NUMBER}\.{NUMBER}\.{NUMBER}-rc\.[1-9][0-9]*")
-SUMS_LINE = re.compile(r"([0-9a-f]{64}) [ *](.+)")
-OIDC_ISSUER = "https://token.actions.githubusercontent.com"
+if __package__:
+    from . import admit_series
+else:
+    import admit_series
 
-
-class GuardError(Exception):
-    """The guard cannot run; main() exits 2."""
-
-
-class Refused(Exception):
-    """A guard refuses; main() exits 1."""
+CANDIDATE = admit_series.CANDIDATE
+FINAL = admit_series.FINAL
+GuardError = admit_series.GuardError
+NUMBER = admit_series.NUMBER
+OIDC_ISSUER = admit_series.OIDC_ISSUER
+Refused = admit_series.Refused
+SUMS_LINE = admit_series.SUMS_LINE
+read_sums = admit_series.read_sums
+signer_identity = admit_series.signer_identity
 
 
 def classify(tag: str) -> str:
@@ -83,25 +83,6 @@ def check_published(expected: str, actual: str) -> None:
         raise Refused(f"the release has isPrerelease={actual}, expected {expected}")
 
 
-def read_sums(sums: Path) -> list[tuple[str, str]]:
-    """Read checksum entries or report an unreadable listing with its path."""
-    try:
-        text = sums.read_text(encoding="utf-8")
-    except OSError as exc:
-        raise GuardError(f"{sums}: {exc.strerror}") from exc
-    except UnicodeDecodeError as exc:
-        raise GuardError(f"{sums}: {exc}") from exc
-    entries = []
-    for number, line in enumerate(text.splitlines(), 1):
-        match = SUMS_LINE.fullmatch(line)
-        if not match:
-            raise Refused(f"{sums}:{number}: not a SHA-256 checksum line")
-        entries.append((match.group(1), match.group(2)))
-    if not entries:
-        raise Refused(f"{sums}: lists no file")
-    return entries
-
-
 def check_sums(sums: Path) -> list[str]:
     """Check every listed file; return one `name: OK` line per file."""
     lines = []
@@ -114,11 +95,6 @@ def check_sums(sums: Path) -> list[str]:
             raise Refused(f"{name}: checksum does not match {sums.name}")
         lines.append(f"{name}: OK")
     return lines
-
-
-def signer_identity(repository: str, ref: str) -> str:
-    """The certificate identity of release-build.yml in REPOSITORY at REF."""
-    return f"https://github.com/{repository}/.github/workflows/release-build.yml@{ref}"
 
 
 def cosign_arguments(args: argparse.Namespace) -> list[str]:

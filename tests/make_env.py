@@ -6,7 +6,9 @@ from __future__ import annotations
 
 import os
 
-_MAKE_CHANNELS = frozenset({"MAKEFLAGS", "MFLAGS", "GNUMAKEFLAGS", "MAKELEVEL", "MAKEOVERRIDES"})
+_MAKE_CHANNELS = frozenset(
+    {"MAKEFLAGS", "MFLAGS", "GNUMAKEFLAGS", "MAKELEVEL", "MAKEOVERRIDES", "MAKEFILES"}
+)
 
 
 def make_environment(*extra_names: str) -> dict[str, str]:

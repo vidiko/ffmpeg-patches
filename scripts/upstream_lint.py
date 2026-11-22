@@ -291,6 +291,7 @@ MAX_CLAIM_COMMITS = 1000
 MAX_ENV_ENTRIES = 16384
 MAX_JSON_KEYS = 2000
 MAX_COMMAND_ARGS = 2000
+MAX_DIAGNOSTIC_KEY = 256
 RUN_TIMEOUT = 1800
 C_RULES_TIMEOUT = 300
 DOCSTRINGS_TIMEOUT = 300
@@ -1586,16 +1587,34 @@ def _hunk_functions(hunks: list[str]) -> list[str]:
     return found
 
 
+def _function_names_from_added(added: list[str]) -> list[str]:
+    """Collect function names introduced on added source lines."""
+    found: list[str] = []
+    for line in added[:MAX_PATHS]:
+        match = FUNCTION_NAME.search(line)
+        if match:
+            found.append(match[1])
+    return found
+
+
+def _bounded_key_text(key: str) -> str:
+    """Return key text capped for schema diagnostics."""
+    if len(key) <= MAX_DIAGNOSTIC_KEY:
+        return key
+    return f"{key[:MAX_DIAGNOSTIC_KEY]}..."
+
+
 def reach_names(paths: list[str], patch: str) -> frozenset[str]:
-    """Collect reachable source file stems and hunk-header function names."""
+    """Collect reachable source file stems and function names from patches."""
     names: set[str] = set()
     for path in paths:
         if is_source_path(path):
             stem = PurePosixPath(path).stem
             names.update((stem, LAVFI_PREFIX.sub("", stem)))
-    for path, hunks, _ in _patch_files(patch):
+    for path, hunks, added in _patch_files(patch):
         if is_source_path(path):
             names.update(_hunk_functions(hunks))
+            names.update(_function_names_from_added(added))
     return frozenset(names)
 
 
@@ -1698,6 +1717,27 @@ def _skip_commit_history(
     return True
 
 
+def _commit_source_patch_args(commit: str, *, root: bool) -> list[str]:
+    """Build bounded git diff-tree argv listing one fix commit's source patch."""
+    options = ["--no-replace-objects", "diff-tree"]
+    if root:
+        options.append("--root")
+    options.extend(
+        [
+            "--no-commit-id",
+            "-r",
+            "-p",
+            "-U0",
+            "--no-color",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--no-renames",
+            commit,
+        ]
+    )
+    return options
+
+
 def _fix_commits(
     tree: Path,
     base: str,
@@ -1739,20 +1779,7 @@ def _fix_commits(
             continue
         paths = _commit_paths(tree, commit)
         if any(is_source_path(path) for path in paths[:MAX_PATHS]):
-            patch = _git(
-                tree,
-                "--no-replace-objects",
-                "diff-tree",
-                "--no-commit-id",
-                "-r",
-                "-p",
-                "-U0",
-                "--no-color",
-                "--no-ext-diff",
-                "--no-textconv",
-                "--no-renames",
-                commit,
-            )
+            patch = _git(tree, *_commit_source_patch_args(commit, root=not parents.strip()))
             fixes.append((commit, subject, reach_names(paths, patch)))
     return fixes
 
@@ -1828,7 +1855,7 @@ def _no_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
     result: dict[str, object] = {}
     for key, value in pairs[:MAX_JSON_KEYS]:
         if key in result:
-            raise ValueError(f"duplicate key: {key}")
+            raise ValueError(f"duplicate key: {_bounded_key_text(key)}")
         result[key] = value
     return result
 
@@ -1849,7 +1876,7 @@ def _is_command_list(value: object) -> bool:
         and 0 < len(value) <= MAX_COMMAND_ARGS
         and isinstance(value[0], str)
         and bool(value[0])
-        and all(isinstance(item, str) for item in value[:MAX_COMMAND_ARGS])
+        and all(isinstance(item, str) and "\0" not in item for item in value[:MAX_COMMAND_ARGS])
     )
 
 
@@ -1890,7 +1917,7 @@ def _revert_proof_schema_error(payload: dict[str, object]) -> str | None:
         return f"missing key: {', '.join(missing)}"
     extra = sorted(payload.keys() - REVERT_PROOF_KEYS)
     if extra:
-        return f"extra key: {', '.join(extra)}"
+        return f"extra key: {', '.join(_bounded_key_text(key) for key in extra)}"
     return _revert_proof_type_error(payload)
 
 
@@ -1932,6 +1959,21 @@ def _read_revert_proof(
 
 def _record_binding_error(tree: Path, record: dict[str, object]) -> str | None:
     """Require the stored head commit tree and the exact stored fix source path set."""
+    head_commit = _run(
+        [
+            "git",
+            "--no-replace-objects",
+            "rev-parse",
+            "--verify",
+            "--end-of-options",
+            f"{record['head']}^{{commit}}",
+        ],
+        tree,
+    )
+    if head_commit.returncode != 0 or head_commit.timed_out:
+        return "head does not resolve to a commit"
+    if head_commit.stdout.strip() != record["head"]:
+        return "head is not an exact commit id"
     resolved = _run(
         [
             "git",
@@ -1980,8 +2022,6 @@ def _load_revert_proofs(
     tree: Path,
 ) -> tuple[dict[str, tuple[list[str], bool]], dict[str, list[str]], list[str]]:
     """Evaluate matching records immediately, retaining only verdicts, pass flags and errors."""
-    if len(records) > MAX_PATHS:
-        raise RuntimeError(f"revert-proof records exceed MAX_PATHS={MAX_PATHS}: {len(records)}")
     by_commit: dict[str, tuple[list[str], bool]] = {}
     errors_by_commit: dict[str, list[str]] = {}
     unmatched_errors: list[str] = []
@@ -2072,6 +2112,10 @@ def _revert_proof_result(
     """Evaluate records against the stored head tree and collect bounded, waivable findings."""
     fixes, history_errors = history
     summary = f"{len(fixes)} fix commit(s), {len(records)} revert-proof record(s)"
+    if len(records) > MAX_PATHS:
+        return _revert_proof_limit_step(
+            f"revert-proof records exceed MAX_PATHS={MAX_PATHS}: {len(records)}", waiver
+        )
     head_tree = _git(
         tree, "--no-replace-objects", "rev-parse", "--verify", f"{head}^{{tree}}"
     ).strip()

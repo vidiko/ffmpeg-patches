@@ -455,6 +455,21 @@ class TestReachTest(unittest.TestCase):
             frozenset({"aom_film_grain", "parse_sets"}),
         )
 
+    def test_added_source_line_supplies_function_without_hunk_name(self) -> None:
+        """Added source definitions contribute function names when the hunk header has none."""
+        patch = (
+            "diff --git a/libavfilter/vf_root.c b/libavfilter/vf_root.c\n"
+            "new file mode 100644\n"
+            "--- /dev/null\n"
+            "+++ b/libavfilter/vf_root.c\n"
+            "@@ -0,0 +1,4 @@\n"
+            "+int ff_value(void)\n"
+            "+{\n"
+            "+    return 1;\n"
+            "+}\n"
+        )
+        self.assertIn("ff_value", upstream_lint.reach_names(["libavfilter/vf_root.c"], patch))
+
     def test_deleted_source_file_keeps_old_path_and_function(self) -> None:
         """Deleted source diffs retain the --- a/ path for hunk function extraction."""
         patch = (
@@ -2044,6 +2059,8 @@ class FixtureTest(unittest.TestCase):
                 "-c",
                 "commit.gpgsign=false",
                 "-c",
+                "tag.gpgsign=false",
+                "-c",
                 "core.hooksPath=/dev/null",
                 *args,
             ],
@@ -2505,7 +2522,9 @@ class PipelineTest(FixtureTest):
         self.commit("avfilter/vf_y: fix z")
         rc, output = self.check()
         self.assertEqual(rc, 1, output)
-        self.assertIn("avfilter/vf_y: fix z: test paths changed but none names vf_y, y", output)
+        self.assertIn(
+            "avfilter/vf_y: fix z: test paths changed but none names ff_other, vf_y, y", output
+        )
         self.assertNotIn("avfilter/vf_x: fix y: test paths changed", output)
 
     def test_fix_with_binary_test_fixture_passes(self) -> None:
@@ -4504,6 +4523,24 @@ class RevertProofStepTest(FixtureTest):
         self.git("merge-base", "--is-ancestor", self.base, head)
         return commit, head, self.git("rev-parse", "HEAD^{tree}").strip()
 
+    def test_imported_root_regression_reaches_function_only_test_reference(self) -> None:
+        """An imported root fix passes regression-test when a changed test names only ff_value."""
+        self.import_root_commit("libavfilter/vf_root.c", "avfilter/vf_root: fix imported value")
+        self.write(
+            "libavutil/tests/film_grain_params.c",
+            "int main(void)\n{\n    return ff_value();\n}\n",
+        )
+        self.commit("tests: exercise imported root function")
+        rc, output = self.check(
+            "--no-revert-proof-reason",
+            "regression-test fixture",
+            "--no-revert-proof-reason",
+            "imported-root fixture",
+        )
+        self.assertEqual(rc, 0, output)
+        self.assertIn("step: regression-test rc: 0", output)
+        self.assertIn("1 fix commit(s), 1 test path(s) changed", output)
+
     def test_imported_root_source_fix_requires_record(self) -> None:
         """An imported root source fix cannot silently pass as a zero-fix range."""
         commit, _, _ = self.import_root_commit(
@@ -4726,6 +4763,90 @@ class RevertProofStepTest(FixtureTest):
         self.assertIn("step: revert-proof rc: 1", output)
         self.assertIn(f"{commit[:12]}: avfilter/vf_x: fix y", output)
         self.assertIn("extra key", output)
+
+    def test_step_bounds_extra_key_text_in_schema_error(self) -> None:
+        """An oversized extra key name is truncated in the revert-proof schema diagnostic."""
+        commit, head, head_tree = self.add_fix_commit()
+        long_key = "z" * (upstream_lint.MAX_DIAGNOSTIC_KEY + 40)
+        payload = self.valid_record(commit, head, head_tree)
+        payload[long_key] = 1
+        record_file = self.write_record("huge_key.json", payload)
+        _, commit_id, error = upstream_lint._read_revert_proof(record_file)
+        self.assertEqual(commit_id, commit)
+        self.assertIsNotNone(error)
+        self.assertIn("extra key:", error or "")
+        self.assertNotIn(long_key, error or "")
+        self.assertIn("...", error or "")
+
+    def test_step_refuses_nul_in_recorded_command_argument(self) -> None:
+        """A recorded command argument containing NUL bytes is refused before measurement."""
+        commit, head, head_tree = self.add_fix_commit()
+        payload = self.valid_record(commit, head, head_tree, command=["pytest", "a\x00b"])
+        record_file = self.write_record("nul_arg.json", payload)
+        result = upstream_lint._read_revert_proof(record_file)
+        self.assertEqual(result[0], None)
+        self.assertIn("wrong value type for command", result[2] or "")
+
+    def test_step_refuses_tag_object_id_as_record_head(self) -> None:
+        """A record whose head field names an annotated tag is refused as inexact."""
+        commit, head, head_tree = self.add_fix_commit()
+        tag = f"proof-head-tag-{commit[:8]}"
+        self.git("tag", "-a", tag, "-m", "proof fixture tag", head)
+        tag_sha = self.git("rev-parse", tag).strip()
+        self.assertNotEqual(tag_sha, head)
+        record_file = self.write_record(
+            "tag_head.json", self.valid_record(commit, tag_sha, head_tree)
+        )
+        rc, output = self.check("--revert-proof", str(record_file))
+        self.assertEqual(rc, 1, output)
+        self.assertIn("head is not an exact commit id", output)
+
+    def test_record_count_overflow_waiver_passes_with_reason(self) -> None:
+        """A non-blank revert-proof waiver covers record-count overflow before loading."""
+        commit, head, head_tree = self.add_fix_commit()
+        first = self.write_record("first.json", self.valid_record(commit, head, head_tree))
+        second = self.write_record(
+            "second.json", self.valid_record(commit, head, head_tree, rc_reverted=2)
+        )
+        fixes = upstream_lint._fix_commits(self.root, self.base, head)
+        real_result = upstream_lint._revert_proof_result
+
+        def capped_result(tree, head_sha, history, records, waiver):
+            with unittest.mock.patch.object(upstream_lint, "MAX_PATHS", 1):
+                return real_result(tree, head_sha, history, records, waiver)
+
+        with unittest.mock.patch.object(
+            upstream_lint, "_revert_proof_result", side_effect=capped_result
+        ):
+            step = upstream_lint._revert_proof(
+                self.root,
+                self.base,
+                head,
+                (first, second),
+                "fixture duplicate records",
+            )
+        self.assertEqual(step.rc, 0, step.output)
+        self.assertIn("waived: fixture duplicate records", step.output)
+        self.assertIn("revert-proof records exceed MAX_PATHS=1: 2", step.output)
+        self.assertEqual(len(fixes), 1)
+
+    def test_record_count_overflow_blank_waiver_fails(self) -> None:
+        """Record-count overflow without a waiver keeps revert-proof rc 1."""
+        commit, head, head_tree = self.add_fix_commit()
+        first = self.write_record("first.json", self.valid_record(commit, head, head_tree))
+        second = self.write_record("second.json", self.valid_record(commit, head, head_tree))
+        real_result = upstream_lint._revert_proof_result
+
+        def capped_result(tree, head_sha, history, records, waiver):
+            with unittest.mock.patch.object(upstream_lint, "MAX_PATHS", 1):
+                return real_result(tree, head_sha, history, records, waiver)
+
+        with unittest.mock.patch.object(
+            upstream_lint, "_revert_proof_result", side_effect=capped_result
+        ):
+            step = upstream_lint._revert_proof(self.root, self.base, head, (first, second))
+        self.assertEqual(step.rc, 1, step.output)
+        self.assertIn("revert-proof records exceed MAX_PATHS=1: 2", step.output)
 
     def test_step_refuses_wrong_type(self) -> None:
         """A record JSON file with a wrong field value type fails and names the commit."""

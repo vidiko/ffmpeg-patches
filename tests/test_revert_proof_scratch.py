@@ -10,11 +10,12 @@ import stat
 import subprocess  # nosec B404 - bounded fixture Git initialization errors only.
 import sys
 import unittest.mock
+from pathlib import Path
 
 from scripts import revert_proof, upstream_lint
 from tests import revert_proof_helpers
 from tests.helpers import capture_main, run_git
-from tests.revert_proof_helpers import BASE_SOURCE, RevertProofFixture
+from tests.revert_proof_helpers import BASE_SOURCE, FIXED_SOURCE, RevertProofFixture
 
 
 class RevertProofScratchTest(RevertProofFixture):
@@ -78,6 +79,74 @@ class RevertProofScratchTest(RevertProofFixture):
         self.assertIn("fixture.txt", error)
         self.assertFalse(self.record_path.exists())
 
+    def test_check_attr_batches_bound_encoded_path_bytes(self) -> None:
+        """Long valid paths split into byte-bounded check-attr batches before measurement."""
+        segment = "a" * 900
+        paths = [f"libavfilter/{segment}_{index}.c" for index in range(4)]
+        with unittest.mock.patch.object(revert_proof, "MAX_CHECK_ATTR_BYTES", 2_000):
+            batches = revert_proof._filter_path_batches(paths)
+        self.assertGreater(len(batches), 1)
+        for batch in batches:
+            size = sum(revert_proof._check_attr_path_bytes(path) for path in batch)
+            self.assertLessEqual(size, revert_proof.MAX_CHECK_ATTR_BYTES)
+
+    def test_non_utf8_head_filter_refuses_before_measurement(self) -> None:
+        """Non-UTF-8 HEAD paths with a configured smudge filter refuse before measurement."""
+        raw = b"libavfilter/vf_\xff.c"
+        try:
+            path = os.fsdecode(raw)
+            relative = self.tree / path
+            relative.parent.mkdir(parents=True, exist_ok=True)
+            relative.write_bytes(BASE_SOURCE.encode())
+        except OSError as error:
+            self.skipTest(f"filesystem refuses non-UTF-8 name: {error}")
+        (self.tree / ".gitattributes").write_bytes(raw + b" filter=counter\n")
+        self.commit("add non-UTF-8 filtered source")
+        run_git(self.tree, "config", "filter.counter.smudge", "exit 99", preserve_config=True)
+        head = run_git(self.tree, "rev-parse", "HEAD", preserve_config=True)
+        with self.assertRaises(revert_proof._PreflightError) as caught:
+            revert_proof._check_head_checkout_filters(self.tree, head)
+        self.assertIn("counter", str(caught.exception))
+
+    def test_check_attr_batches_count_fsencode_path_bytes(self) -> None:
+        """Non-UTF-8 repository paths batch by the bytes Git receives via os.fsencode."""
+        raw = b"libavfilter/vf_\xff.c"
+        path = os.fsdecode(raw)
+        self.assertEqual(revert_proof._check_attr_path_bytes(path), len(raw) + 1)
+        filler = "libavfilter/other.c"
+        limit = revert_proof._check_attr_path_bytes(path)
+        with unittest.mock.patch.object(revert_proof, "MAX_CHECK_ATTR_BYTES", limit):
+            batches = revert_proof._filter_path_batches([path, filler])
+        self.assertEqual([path], batches[0])
+        self.assertEqual([filler], batches[1])
+
+    def test_filter_driver_named_set_refuses_when_configured(self) -> None:
+        """A filter attribute value 'set' reaches the driver lookup and refuses when configured."""
+        self.write(".gitattributes", "fixture.txt filter=set\n")
+        self.write("fixture.txt", "fixture bytes\n")
+        fix = self.make_fix()
+        run_git(self.tree, "config", "filter.set.smudge", "exit 99", preserve_config=True)
+        rc, _, error = self.run_cli(fix, [sys.executable, "-c", "pass"], expect_scratch=False)
+        self.assertEqual(rc, 2, error)
+        self.assertIn("'set'", error)
+        self.assertFalse(self.record_path.exists())
+
+    def test_source_path_filter_checked_when_absent_from_head(self) -> None:
+        """A configured filter on a fix-only deleted path is refused before reverse apply."""
+        self.write(".gitattributes", "libavfilter/vf_del.c filter=counter\n")
+        self.write("libavfilter/vf_del.c", BASE_SOURCE)
+        self.write("libavfilter/vf_x.c", BASE_SOURCE)
+        self.commit("add filtered fixture and source")
+        run_git(self.tree, "config", "filter.counter.smudge", "exit 99", preserve_config=True)
+        self.write("libavfilter/vf_x.c", FIXED_SOURCE)
+        (self.tree / "libavfilter/vf_del.c").unlink()
+        fix = self.commit("fix source and remove filtered path")
+        rc, _, error = self.run_cli(fix, [sys.executable, "-c", "pass"], expect_scratch=False)
+        self.assertEqual(rc, 2, error)
+        self.assertIn("vf_del.c", error)
+        self.assertIn("counter", error)
+        self.assertFalse(self.record_path.exists())
+
     def test_head_filter_scan_path_bound(self) -> None:
         """The HEAD filter scan refuses overflow and accepts its exact scalar path bound."""
         fix = self.make_fix()
@@ -112,6 +181,40 @@ class RevertProofScratchTest(RevertProofFixture):
         rc, _, error = self.run_cli(fix, [sys.executable, "-c", "pass"])
         self.assertEqual(rc, 0, error)
         self.assertTrue(self.record_path.is_file())
+
+    def test_scratch_checkout_runs_filter_preflight_before_reset(self) -> None:
+        """The scratch checkout repeats the filter preflight after worktree registration."""
+        fix = self.make_fix()
+        scratch_roots: list[Path] = []
+        real_check = revert_proof._check_head_checkout_filters
+
+        def capture_check(tree: Path, head: str) -> set[str]:
+            if tree != self.tree:
+                scratch_roots.append(tree)
+            return real_check(tree, head)
+
+        with unittest.mock.patch.object(
+            revert_proof, "_check_head_checkout_filters", side_effect=capture_check
+        ):
+            rc, _, error = self.run_cli(fix, [sys.executable, "-c", "pass"])
+        self.assertEqual(rc, 0, error)
+        self.assertEqual(len(scratch_roots), 2)
+
+    def test_record_missing_at_requested_path_refuses_success(self) -> None:
+        """Publication fails when the record is not left at the requested path."""
+        fix = self.make_fix()
+        parent = self.record_path.parent
+        real_write = revert_proof._write_record
+
+        def remove_record(descriptor: int, name: str, payload: dict[str, object]) -> None:
+            real_write(descriptor, name, payload)
+            self.record_path.unlink()
+
+        with unittest.mock.patch.object(revert_proof, "_write_record", side_effect=remove_record):
+            rc, _, error = self.run_cli(fix, [sys.executable, "-c", "pass"])
+        self.assertEqual(rc, 2, error)
+        self.assertIn(f"record directory changed: {parent}", error)
+        self.assertFalse(self.record_path.exists())
 
     def test_worktree_count_uses_nul_field_boundaries(self) -> None:
         """A worktree path containing the field marker and a newline counts once."""

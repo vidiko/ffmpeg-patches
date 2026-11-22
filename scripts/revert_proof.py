@@ -73,6 +73,7 @@ DEFAULT_TIMEOUT = 1800
 MAX_TIMEOUT = 7200
 GIT_TIMEOUT = 60
 MAX_HEAD_PATHS = 100_000
+MAX_CHECK_ATTR_BYTES = 1_500_000
 
 
 class _PreflightError(ValueError):
@@ -188,15 +189,41 @@ def _check_object_format(tree: Path) -> None:
         raise _PreflightError(f"unsupported Git object format: {object_format}")
 
 
+def _check_attr_path_bytes(path: str) -> int:
+    """Count argv bytes Git receives for one fsdecoded repository path plus its NUL."""
+    return len(os.fsencode(path)) + 1
+
+
+def _filter_path_batches(paths: list[str]) -> list[list[str]]:
+    """Split paths into bounded check-attr batches by count and encoded argument bytes."""
+    batches: list[list[str]] = []
+    current: list[str] = []
+    byte_count = 0
+    for path in paths[:MAX_HEAD_PATHS]:
+        path_bytes = _check_attr_path_bytes(path)
+        if current and (
+            len(current) >= upstream_lint.MAX_PATHS
+            or byte_count + path_bytes > MAX_CHECK_ATTR_BYTES
+        ):
+            batches.append(current)
+            current = []
+            byte_count = 0
+        current.append(path)
+        byte_count += path_bytes
+    if current:
+        batches.append(current)
+    return batches
+
+
 def _check_filter_attributes(tree: Path, head: str, paths: list[str], checked: set[str]) -> None:
-    """Refuse active checkout drivers in one bounded batch of HEAD path attributes."""
+    """Refuse active checkout drivers in one bounded batch of path filter attributes."""
     output = git_result(tree, "check-attr", f"--source={head}", "-z", "filter", "--", *paths)
     fields = output.stdout.removesuffix("\0").split("\0")
     if len(fields) != 3 * len(paths):
         raise _PreflightError("unexpected HEAD filter attribute listing")
     for offset in range(0, 3 * len(paths), 3):
         path, _, driver = fields[offset : offset + 3]
-        if driver in ("unspecified", "unset", "set") or driver in checked:
+        if driver in checked:
             continue
         checked.add(driver)
         for kind in ("smudge", "process"):
@@ -209,17 +236,25 @@ def _check_filter_attributes(tree: Path, head: str, paths: list[str], checked: s
                 )
 
 
-def _check_checkout_filters(tree: Path, head: str) -> None:
+def _check_checkout_filters(
+    tree: Path, attr_source: str, paths: list[str], checked: set[str] | None = None
+) -> None:
+    """Reject configured checkout filters on bounded path batches before measurement."""
+    if checked is None:
+        checked = set()
+    for batch in _filter_path_batches(paths):
+        _check_filter_attributes(tree, attr_source, batch, checked)
+
+
+def _check_head_checkout_filters(tree: Path, head: str) -> set[str]:
     """Bound the full HEAD listing and reject configured checkout filters before measurement."""
     output = git_result(tree, "ls-tree", "-r", "--name-only", "-z", head).stdout
     paths = output.removesuffix("\0").split("\0") if output else []
     if len(paths) > MAX_HEAD_PATHS:
         raise _PreflightError(f"HEAD paths exceed MAX_HEAD_PATHS={MAX_HEAD_PATHS}: {len(paths)}")
     checked: set[str] = set()
-    for offset in range(0, len(paths), upstream_lint.MAX_PATHS):
-        _check_filter_attributes(
-            tree, head, paths[offset : offset + upstream_lint.MAX_PATHS], checked
-        )
+    _check_checkout_filters(tree, head, paths, checked)
+    return checked
 
 
 def prepare_tree(tree: Path, raw_commit: str) -> tuple[str, str, str, list[str], str]:
@@ -230,7 +265,7 @@ def prepare_tree(tree: Path, raw_commit: str) -> tuple[str, str, str, list[str],
     head_ref = git_out(tree, "rev-parse", "--symbolic-full-name", "HEAD").strip()
     head = git_out(tree, "rev-parse", "--verify", f"{head_ref}^{{commit}}").strip()
     head_tree = git_out(tree, "rev-parse", "--verify", f"{head}^{{tree}}").strip()
-    _check_checkout_filters(tree, head)
+    checked = _check_head_checkout_filters(tree, head)
     if tracked_status(tree):
         raise _PreflightError(
             f"dirty tree: uncommitted changes to tracked files that git status shows in {tree}; "
@@ -252,7 +287,9 @@ def prepare_tree(tree: Path, raw_commit: str) -> tuple[str, str, str, list[str],
     )
     if ancestor.returncode != 0:
         raise _PreflightError(f"commit {commit} is not an ancestor of HEAD ({head})")
-    return commit, head, head_tree, _source_paths(tree, commit), head_ref
+    source_paths = _source_paths(tree, commit)
+    _check_checkout_filters(tree, commit, source_paths, checked)
+    return commit, head, head_tree, source_paths, head_ref
 
 
 def _source_paths(tree: Path, commit: str) -> list[str]:
@@ -537,6 +574,7 @@ def measure_scratch(
             str(scratch),
             head,
         )
+        _check_head_checkout_filters(scratch, head)
         git_out(
             scratch,
             "-c",
@@ -584,6 +622,9 @@ def run_proof(config: ProofConfig) -> None:
         }
         _verify_record_directory(config, descriptor)
         _write_record(descriptor, config.record.name, payload)
+        _verify_record_directory(config, descriptor)
+        if not config.record.is_file():
+            raise _PreflightError(f"record directory changed: {config.record.parent}")
     finally:
         os.close(descriptor)
 

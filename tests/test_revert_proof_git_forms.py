@@ -68,6 +68,17 @@ def _has_global_isolation(arguments: list[ast.expr]) -> bool:
     return isolated and not consume
 
 
+def _nested_control_flow(function: ast.FunctionDef, lineno: int) -> bool:
+    """Return whether lineno sits inside a conditional or loop statement body."""
+    for stmt in function.body:
+        end = getattr(stmt, "end_lineno", stmt.lineno)
+        if stmt.lineno <= lineno <= end and isinstance(
+            stmt, (ast.If, ast.For, ast.While, ast.Try, ast.With)
+        ):
+            return True
+    return False
+
+
 def _find_git_run_errors(source: str) -> list[int]:
     """Find dynamic calls or Git reads without isolation in the literal global prefix."""
     tree = ast.parse(source)
@@ -86,7 +97,13 @@ def _find_git_run_errors(source: str) -> list[int]:
             findings.append(node.lineno)
             continue
         arguments = node.args[0].elts
-        if arguments and _is_string(arguments[0], "git") and not _has_global_isolation(arguments):
+        if not arguments:
+            findings.append(node.lineno)
+            continue
+        if not isinstance(arguments[0], ast.Constant) or not isinstance(arguments[0].value, str):
+            findings.append(node.lineno)
+            continue
+        if _is_string(arguments[0], "git") and not _has_global_isolation(arguments):
             findings.append(node.lineno)
     return sorted(findings)
 
@@ -122,11 +139,15 @@ def _find_git_result_append_errors(source: str) -> list[int]:
             and len(node.args) == 1
             and _is_string(node.args[0], "--no-replace-objects")
         ]
+        unconditional = [line for line in appends if not _nested_control_flow(function, line)]
         findings.extend(
             node.lineno
             for node in calls
             if _is_attribute(node.func, "upstream_lint", "_run")
-            and (not any(line < node.lineno for line in appends) or not _forwards_git_options(node))
+            and (
+                not any(line < node.lineno for line in unconditional)
+                or not _forwards_git_options(node)
+            )
         )
     return sorted(findings)
 
@@ -178,6 +199,12 @@ class RevertProofGitFormsTest(unittest.TestCase):
         """Unreviewed nonliteral command lists fail while the caller-command wrapper passes."""
         self.assertEqual(_find_git_run_errors("upstream_lint._run(command, tree)"), [1])
         self.assertEqual(
+            _find_git_run_errors(
+                'executable = "git"\nupstream_lint._run([executable, "log"], tree)'
+            ),
+            [2],
+        )
+        self.assertEqual(
             _find_git_run_errors("def run_test_command():\n    upstream_lint._run(command, tree)"),
             [],
         )
@@ -197,6 +224,10 @@ class RevertProofGitFormsTest(unittest.TestCase):
                 '    upstream_lint._run(["git", *args, *options], tree)'
             ),
             'options.append("--no-replace-objects")\n    upstream_lint._run(command, tree)',
+            (
+                'if debug:\n        options.append("--no-replace-objects")\n'
+                '    upstream_lint._run(["git", *options, *args], tree)'
+            ),
         ):
             with self.subTest(body=body):
                 self.assertEqual(

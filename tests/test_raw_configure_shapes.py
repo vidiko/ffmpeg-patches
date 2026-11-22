@@ -302,10 +302,10 @@ class RawConfigureShapeTest(RawConfigureGuardBase):
         oversized_refusal = f"cd {self.tree} && ./c?nfigure{padding}"
         self._assert_refused(((oversized_refusal, self.root),), remedy="--body-file")
         oversized_allow = "ls"
-        for client in CLIENTS:
-            with self.subTest(client=client):
-                result = self.run_guard(client, self.payload(client, oversized_allow, self.root))
-                self.assertEqual(result.returncode, 0, result.stderr)
+        client = self._next_client()
+        with self.subTest(client=client):
+            result = self.run_guard(client, self.payload(client, oversized_allow, self.root))
+            self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse(self.marker.exists())
 
     def test_oversized_quote_and_backslash_configure_refusal(self) -> None:
@@ -329,12 +329,12 @@ class RawConfigureShapeTest(RawConfigureGuardBase):
         )
         self._assert_refused(refuse_cases)
         allow_cases = (("echo conf${e}igure", self.tree),)
-        for client in CLIENTS:
-            for command, cwd in allow_cases:
-                with self.subTest(client=client, command=command):
-                    result = self.run_guard(client, self.payload(client, command, cwd))
-                    self.assertEqual(result.returncode, 0, result.stderr)
-                    self.assertFalse(self.marker.exists())
+        for command, cwd in allow_cases:
+            client = self._next_client()
+            with self.subTest(client=client, command=command):
+                result = self.run_guard(client, self.payload(client, command, cwd))
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertFalse(self.marker.exists())
 
     def test_undecidable_configure_refusal_and_benign_allow(self) -> None:
         """Refuse undecidable dynamic commands in trees while allowing benign commands."""

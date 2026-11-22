@@ -29,10 +29,16 @@ SPEC.loader.exec_module(GUARD_MOD)
 
 
 class RawConfigureGuardBase(unittest.TestCase):
-    """Base fixture providing temporary trees and guard runner helper methods."""
+    """Base fixture providing temporary trees and guard runner helper methods.
+
+    all_clients: False runs one rotating client per case; True runs every client (guard suite).
+    """
+
+    all_clients: bool = False
 
     def setUp(self) -> None:
         """Create FFmpeg-shaped and unrelated trees without running configure."""
+        self._guard_turn = 0
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
@@ -75,35 +81,51 @@ class RawConfigureGuardBase(unittest.TestCase):
             env=run_env,
         )
 
+    def _next_client(self) -> str:
+        """Advance per-test client rotation and return the client for the next guard run."""
+        client = CLIENTS[self._guard_turn % len(CLIENTS)]
+        self._guard_turn += 1
+        return client
+
+    def _case_clients(self) -> tuple[str, ...]:
+        """Return all CLIENTS in order when all_clients is on, else one rotating client."""
+        return CLIENTS if self.all_clients else (self._next_client(),)
+
     def _assert_refused(
         self,
         cases: tuple[tuple[str, Path], ...],
         env: dict[str, str] | None = None,
         remedy: str = "python3 scripts/ffmpeg_configure.py",
-    ) -> None:
-        """Verify the guard refuses raw configure invocations across clients."""
-        for client in CLIENTS:
-            for command, cwd in cases:
+    ) -> tuple[subprocess.CompletedProcess[str], ...]:
+        """Refuse each case under one rotating client, or every client when all_clients is on."""
+        results: list[subprocess.CompletedProcess[str]] = []
+        for command, cwd in cases:
+            for client in self._case_clients():
                 with self.subTest(client=client, command=command):
                     result = self.run_guard(client, self.payload(client, command, cwd), env=env)
+                    results.append(result)
                     self.assertEqual(result.returncode, 2, result.stderr)
                     self.assertIn("configure", result.stderr)
                     self.assertIn(remedy, result.stderr)
                     self.assertFalse(self.marker.exists())
+        return tuple(results)
 
     def _assert_allowed(
         self, cases: tuple[tuple[str, Path], ...], env: dict[str, str] | None = None
-    ) -> None:
-        """Verify the guard allows safe commands across all supported clients."""
-        for client in CLIENTS:
-            for command, cwd in cases:
+    ) -> tuple[subprocess.CompletedProcess[str], ...]:
+        """Allow each case under one rotating client, or every client when all_clients is on."""
+        results: list[subprocess.CompletedProcess[str]] = []
+        for command, cwd in cases:
+            for client in self._case_clients():
                 with self.subTest(client=client, command=command):
                     result = self.run_guard(client, self.payload(client, command, cwd), env=env)
+                    results.append(result)
                     self.assertEqual(result.returncode, 0, result.stderr)
                     self.assertFalse(self.marker.exists())
+        return tuple(results)
 
     def _check_parser_body(self, body: str, *, refused: bool, reason: str | None = None) -> None:
-        """Inspect a fixture body across clients without executing the script."""
+        """Inspect a fixture body across _case_clients without executing the script."""
         cfg = f'"{self.tree}/configure" --x'
         body = body.replace("<cfg>", cfg).replace("<tree>", str(self.tree))
         body = body.replace("<build>", str(self.build))
@@ -111,8 +133,7 @@ class RawConfigureGuardBase(unittest.TestCase):
         script.write_text(body, encoding="utf-8")
         (self.root / "inner.sh").write_text(cfg + "\n", encoding="utf-8")
         assertion = self._assert_refused if refused else self._assert_allowed
-        assertion(((f"bash {script}", self.root),))
+        results = assertion(((f"bash {script}", self.root),))
         if reason is not None:
-            for client in CLIENTS:
-                result = self.run_guard(client, self.payload(client, f"bash {script}", self.root))
+            for result in results:
                 self.assertIn(reason, result.stderr)

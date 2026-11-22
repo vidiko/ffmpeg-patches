@@ -153,6 +153,43 @@ def _dependency_attribution_error(sentence: str, first: re.Match[str], end: int)
     )
 
 
+def _dependency_list_lead_historical(
+    sentence: str, first: re.Match[str], end: int | None = None
+) -> bool:
+    """Return whether list history appears before the first member annotation."""
+    window = len(sentence) if end is None else end
+    lead_start = _dependency_clause_start(sentence, 0, first.start())
+    gap_end = first.end()
+    if DEPENDENCY_SEPARATOR.match(sentence, gap_end, window) is None:
+        member_end = _dependency_member_end(sentence, first.end(), window)
+        for index in range(first.end(), min(member_end, window)):
+            if sentence[index] in "([":
+                gap_end = index
+                break
+        else:
+            gap_end = member_end
+    lead = sentence[lead_start:gap_end]
+    return bool(HISTORY_WORDS.search(lead) or re.search(r"\bpreviously\b", lead, re.IGNORECASE))
+
+
+def _dependency_hidden_scan_end(sentence: str, list_parse_end: int, end: int) -> int:
+    """Extend hidden-member scans through unparsed separator-led continuations."""
+    cursor = list_parse_end
+    for _ in range(end - list_parse_end + 1):
+        extended = False
+        for separator in DEPENDENCY_SEPARATOR.finditer(sentence, cursor, end):
+            member = DEPENDENCY_MEMBER.match(sentence, separator.end(), end)
+            if member is None:
+                break
+            next_end = _dependency_member_end(sentence, member.end(), end)
+            cursor = max(member.end(), next_end)
+            extended = True
+            break
+        if not extended:
+            break
+    return cursor
+
+
 def _reject_hidden_dependency_members(
     sentence: str, first: re.Match[str], end: int, parsed_starts: set[int]
 ) -> None:
@@ -205,10 +242,15 @@ def _dependency_lists(sentence: str) -> Iterator[list[tuple[re.Match[str], int]]
                 break
             reference = following
         parsed_starts = {reference.start() for reference, _ in members[1:]}
-        _reject_hidden_dependency_members(sentence, first, end, parsed_starts)
+        list_parse_end = members[-1][1]
+        lead_historical = _dependency_list_lead_historical(sentence, first, end)
+        if not lead_historical:
+            scan_end = _dependency_hidden_scan_end(sentence, list_parse_end, end)
+            _reject_hidden_dependency_members(sentence, first, scan_end, parsed_starts)
         if len(members) == 1:
             members[0] = (members[0][0], end)
-        _reject_unpaired_dependency_heads(sentence, members, end)
+        if not lead_historical:
+            _reject_unpaired_dependency_heads(sentence, members, end)
         yield members
 
 
@@ -230,11 +272,8 @@ def _dependency_list_history(
 ) -> tuple[int, bool]:
     """Locate the lead clause and judge history shared by every list member."""
     lead_start = _dependency_clause_start(sentence, 0, first.start())
-    lead_end = heads[0].start(1) if heads else first.end()
-    boundary = next(CLAUSE_BREAK.finditer(sentence, first.end(), lead_end), None)
-    lead = sentence[lead_start : boundary.start() if boundary else lead_end]
-    historical = HISTORY_WORDS.search(lead) or re.search(r"\bpreviously\b", lead, re.IGNORECASE)
-    return lead_start, bool(historical)
+    historical = _dependency_list_lead_historical(sentence, first, len(sentence))
+    return lead_start, historical
 
 
 def _current_dependency_heads(
@@ -261,17 +300,19 @@ def _dependency_list_claims(
     sentence: str, members: list[tuple[re.Match[str], int]]
 ) -> list[tuple[int, str | None]]:
     """Pair nearest-reference member heads, judging history before ambiguity."""
+    if _dependency_list_lead_historical(sentence, members[0][0]):
+        return []
     heads = [_dependency_member_heads(sentence, reference, end) for reference, end in members]
     current = _current_dependency_heads(sentence, members, heads)
     if any(heads) and not any(current):
         return []
     _reject_ambiguous_dependency_list(members, heads)
     claims: list[tuple[int, str | None]] = []
-    for (reference, _), member_heads in zip(members, current, strict=True):
+    for (reference, _), member_heads, member_heads_raw in zip(members, current, heads, strict=True):
         number = int(reference.group(1))
         if number == 0:
             continue
-        if len(members) > 1:
+        if len(members) > 1 and (member_heads or not member_heads_raw):
             claims.append((number, None))
         claims.extend((number, head.group(1).lower()) for head in member_heads)
     return claims

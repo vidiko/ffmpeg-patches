@@ -812,6 +812,52 @@ class BaseClaimsTest(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertEqual(base_claims.find_dependency_claims(text), [])
 
+    def test_dependency_list_see_prose_does_not_hide_later_and_members(self) -> None:
+        """Unrelated prose after parsed members ends the hidden-member scan at , see."""
+        text = (
+            "Depends on #12 (head aaaaaaa) and #13 (head bbbbbbb), see #14 and #15 for benchmarks."
+        )
+        self.assertEqual(
+            base_claims.find_dependency_claims(text), [(12, "aaaaaaa"), (13, "bbbbbbb")]
+        )
+
+    def test_dependency_list_hidden_member_before_see_prose_still_raises(self) -> None:
+        """A hidden truncated member before see prose still fails closed."""
+        text = (
+            "Depends on #12 (head aaaaaaa), #13: aaaaaaa, #14 (head bbbbbbb), see #15 for context."
+        )
+        with self.assertRaisesRegex(ValueError, r"#12.*#13.*#14"):
+            base_claims.find_dependency_claims(text)
+
+    def test_dependency_list_historical_lead_skips_hidden_truncated_members(self) -> None:
+        """A Previously lead is historical first; truncated list yields no claims or numbers."""
+        text = "Previously stacked on #12 ~ head aaaaaaa, #13 (head bbbbbbb)."
+        self.assertEqual(base_claims.find_dependency_claims(text), [])
+        self.assertEqual(base_claims._dependency_numbers([("body", text)]), [])
+
+    def test_dependency_list_historical_lead_without_heads_yields_no_member_numbers(self) -> None:
+        """Headless historical lists emit no claims and no numbers to fetch."""
+        text = "Previously stacked on #12 and #13."
+        self.assertEqual(base_claims.find_dependency_claims(text), [])
+        self.assertEqual(base_claims._dependency_numbers([("body", text)]), [])
+
+    def test_dependency_list_truncated_without_historical_lead_still_raises(self) -> None:
+        """The truncated middle form without Previously still fails closed."""
+        text = "Depends on #12 ~ head aaaaaaa, #13 (head bbbbbbb)."
+        with self.assertRaisesRegex(ValueError, r"#12.*#13"):
+            base_claims.find_dependency_claims(text)
+
+    def test_dependency_list_bracketed_old_is_local_to_one_member(self) -> None:
+        """Bracketed old on one member drops only that head and keeps later members."""
+        text = "Depends on #12 [old head aaaaaaa], #13 [head bbbbbbb]"
+        self.assertEqual(base_claims.find_dependency_claims(text), [(13, "bbbbbbb")])
+        self.assertEqual(base_claims._dependency_numbers([("body", text)]), [13])
+
+    def test_dependency_list_current_depends_on_two_members_unchanged(self) -> None:
+        """Depends on #12 and #13 still lists both numbers without a historical lead."""
+        text = "Depends on #12 and #13."
+        self.assertEqual(base_claims._dependency_numbers([("body", text)]), [12, 13])
+
     def test_dependency_cli_historical_lists_need_no_dependency_json(self) -> None:
         """Historical lists pass check mode without any live dependency JSON mappings."""
         for text in (

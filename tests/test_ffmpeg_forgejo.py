@@ -1373,15 +1373,29 @@ class EditBodyTest(ForgejoTest):
         self.assertEqual(self.patches(stub), [original])
 
     def test_edit_body_base_read_is_the_head_reread(self) -> None:
-        """The Autolabel head re-read performs the base check without a later pull read."""
+        """The base check uses the Autolabel head re-read; a final head read precedes the PATCH."""
 
-        stub = Stub([A, A, B], {A: [[label("success")]]})
+        stub = Stub([A, A, A], {A: [[label("success")]]})
         proc = self.run_command(
             stub, "edit-body", "--no-test-claims", "1", str(self.tmp / "body.md")
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(self.patches(stub), [BODY])
-        self.assertEqual(stub.head_reads, 2)
+        self.assertEqual(stub.head_reads, 3)
+
+    def test_edit_body_no_test_claims_head_change_before_patch_exits_76(self) -> None:
+        """A final head read before PATCH exits 76 when it differs from the loop head."""
+
+        stub = Stub([A, A, B], {A: [[label("success")]]})
+        proc = self.run_command(
+            stub, "edit-body", "--no-test-claims", "1", str(self.tmp / "body.md")
+        )
+        self.assertEqual(proc.returncode, 76, proc.stderr)
+        self.assertIn(A, proc.stderr)
+        self.assertIn(B, proc.stderr)
+        self.assertIn("Autolabel and base checks used", proc.stderr)
+        self.assertEqual(self.patches(stub), [])
+        self.assertEqual(stub.head_reads, 3)
 
     def test_edit_body_head_change_in_base_read_exits_75(self) -> None:
         """A head change seen by the base-check pull read exits 75 without a PATCH."""

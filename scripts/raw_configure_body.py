@@ -14,7 +14,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, NamedTuple
 
-from scripts.raw_configure_lex import _tokens, blank_herestring_fds
+from scripts.raw_configure_lex import (
+    _tokens,
+    collect_error_nodes,
+    descriptor_tail_mark_count,
+    errors_within_tail_span,
+    find_descriptor_herestring_tail,
+    tail_line_is_toplevel,
+)
 from scripts.raw_configure_unwrap import _unwrap_command
 from scripts.raw_configure_words import (
     CONFIGURE_WORD,
@@ -461,9 +468,6 @@ ERROR_COMMANDS = SHELLS | frozenset(
         "sudo",
     )
 )
-FORBIDDEN_BLANK_NODES = frozenset(
-    ["heredoc_body", "heredoc_end", "string", "raw_string", "ansi_c_string", "comment"]
-)
 _PARSERS: list[Any] = []
 
 
@@ -491,6 +495,7 @@ class BodyBudget:
     peeks: int = 0
     rebound_scripts: set[Path] = field(default_factory=set)
     rebound_unknown: bool = False
+    suppress_fd_tail_allow: bool = False
 
 
 class _DirState(NamedTuple):
@@ -588,6 +593,9 @@ class _Scan:
     prefix: str | None = None
     stack: list[tuple[Any, bytes, bool]] = field(default_factory=list)
     refusal: str | None = None
+    fd_tail_allow: bool | None = None
+    redirect_target_ok: dict[str, bool] = field(default_factory=dict)
+    syntax_root: Any | None = None
 
 
 def bash_parser() -> Any | str:
@@ -606,73 +614,6 @@ def bash_parser() -> Any | str:
         )
     _PARSERS.append(parser)
     return parser
-
-
-def _diff_runs(raw: bytes, blanked: bytes) -> list[tuple[int, int]]:
-    """Collect maximal half-open byte intervals where blanked differs from raw."""
-    runs: list[tuple[int, int]] = []
-    limit = len(raw)
-    idx = 0
-    for _ in range(limit):
-        if idx >= limit:
-            break
-        if raw[idx] == blanked[idx]:
-            idx += 1
-            continue
-        start = idx
-        for _ in range(limit - idx):
-            if idx >= limit or raw[idx] == blanked[idx]:
-                break
-            idx += 1
-        runs.append((start, idx))
-    return runs
-
-
-def _herestring_starts_at(root: Any, offset: int, limit: int) -> bool:
-    """Check whether byte offset is the start byte of a herestring_redirect node."""
-    if offset >= limit:
-        return False
-    cur = root.descendant_for_byte_range(offset, offset + 1)
-    for _ in range(MAX_BODY_NODES):
-        if cur is None or cur.start_byte < offset:
-            break
-        if cur.type == "herestring_redirect" and cur.start_byte == offset:
-            return True
-        cur = cur.parent
-    return False
-
-
-def _blank_run_valid(root: Any, start: int, end: int, limit: int) -> bool:
-    """Verify one blanked byte run precedes herestring_redirect outside literal/comment spans."""
-    if not _herestring_starts_at(root, end, limit):
-        return False
-    cur = root.descendant_for_byte_range(start, end)
-    for _ in range(MAX_BODY_NODES):
-        if cur is None:
-            return True
-        if cur.type in FORBIDDEN_BLANK_NODES:
-            return False
-        cur = cur.parent
-    return False
-
-
-def parse_bash(raw: bytes) -> Any:
-    """Parse blanked fd here-strings when verified, or fall back to parsing raw bytes."""
-    parser = bash_parser()
-    blanked = blank_herestring_fds(raw)
-    if len(blanked) != len(raw):
-        return parser.parse(raw)
-    tree = parser.parse(blanked)
-    if blanked == raw:
-        return tree
-    runs = _diff_runs(raw, blanked)
-    for _ in range(len(runs)):
-        if not runs:
-            break
-        start, end = runs.pop(0)
-        if not _blank_run_valid(tree.root_node, start, end, len(raw)):
-            return parser.parse(raw)
-    return tree
 
 
 def _text(node: Any, raw: bytes) -> str:
@@ -817,7 +758,13 @@ def _queue_inline(body: str, scan: _Scan, *, source: bool = False) -> None:
     raw = body.encode("utf-8", "surrogateescape")
     if scan.span_held:
         scan.prefix_spans.append((raw, 0, len(raw) + 1, scan.span_held))
-    root = parse_bash(raw).root_node
+    root = bash_parser().parse(raw).root_node
+    hit = _unterminated_heredoc_refusal(root, raw)
+    if hit is not None:
+        scan.refusal = hit
+        return
+    scan.syntax_root = root
+    scan.fd_tail_allow = None
     if source:
         watched = set(scan.literals) | {o for o in scan.script_dirs.values() if o is not None}
         names = _assignment_texts(root, raw, scan.budget, scan.var_scope)
@@ -1403,9 +1350,8 @@ def _pipeline_hit(node: Any, raw: bytes, scan: _Scan) -> str | None:
     return None
 
 
-def _error_hit(node: Any, raw: bytes) -> str | None:
-    """Refuse malformed spans that can name commands and leave other spans as data."""
-    text = _text(node, raw)
+def _dangerous_unparsed_text(text: str) -> bool:
+    """Return whether unparsed shell text names a listed command or a concrete path."""
     dangerous = bool(CONFIGURE_WORD.search(text))
     words = re.split(r"[\s;&|()<>]+", text)
     for i in range(len(words)):
@@ -1414,7 +1360,125 @@ def _error_hit(node: Any, raw: bytes) -> str | None:
         path = "/" in word and "$" not in word and "`" not in word
         concrete = bool(DECIDABLE_NAME.fullmatch(base) and re.search(r"[A-Za-z0-9]", base))
         dangerous |= base in ERROR_COMMANDS or (path and concrete)
-    if dangerous:
+    return dangerous
+
+
+def _probe_clean_redirect_target(
+    target: str, context: InspectionContext, budget: BodyBudget
+) -> bool:
+    """Return whether a lone cat here-string redirect to target passes inspection."""
+    parser = bash_parser()
+    if isinstance(parser, str):
+        return False
+    clean = f'cat <<< "$d" > {target}\n'
+    raw = clean.encode("utf-8", "surrogateescape")
+    probe = BodyBudget(
+        nodes=budget.nodes,
+        inline_bodies=budget.inline_bodies,
+        peeks=budget.peeks,
+        rebound_scripts=budget.rebound_scripts,
+        rebound_unknown=budget.rebound_unknown,
+        suppress_fd_tail_allow=True,
+    )
+    scan = _Scan(context, probe, dir_changed=context.directory_changed)
+    root = parser.parse(raw).root_node
+    if _unterminated_heredoc_refusal(root, raw) is not None:
+        return False
+    if descriptor_tail_mark_count(raw) > 1:
+        return False
+    hit, *_ = _run_scan_walk(root, raw, scan, probe, None)
+    return hit is None
+
+
+def _prime_fd_tail_verdicts(
+    scan: _Scan, context: InspectionContext, budget: BodyBudget, raw: bytes
+) -> None:
+    """Precompute clean redirect verdicts for descriptor tail targets before the walk."""
+    tail = find_descriptor_herestring_tail(raw)
+    if tail is None:
+        return
+    verdicts: dict[str, bool] = {}
+    for target in tail[3]:
+        text = target.decode("utf-8", "surrogateescape")
+        verdicts[text] = _probe_clean_redirect_target(text, context, budget)
+    scan.redirect_target_ok = verdicts
+
+
+def _fd_herestring_tail_allowlisted(scan: _Scan, raw: bytes) -> bool:
+    """Return whether descriptor here-string ERROR spans match the narrow allow-list."""
+    if scan.budget.suppress_fd_tail_allow:
+        return False
+    if scan.fd_tail_allow is not None:
+        return scan.fd_tail_allow
+    allowed = False
+    root = scan.syntax_root
+    tail = find_descriptor_herestring_tail(raw) if root is not None else None
+    if root is not None and tail is not None:
+        digit_byte, _line_start, line_end, targets = tail
+        errors = collect_error_nodes(root)
+        spans_ok = not errors or errors_within_tail_span(errors, digit_byte, line_end, len(raw))
+        targets_ok = spans_ok and tail_line_is_toplevel(root, digit_byte)
+        for target in targets:
+            text = target.decode("utf-8", "surrogateescape")
+            targets_ok = targets_ok and scan.redirect_target_ok.get(text, False)
+        allowed = targets_ok
+    scan.fd_tail_allow = allowed
+    return allowed
+
+
+def _unterminated_heredoc_refusal(root: Any, raw: bytes) -> str | None:
+    """Refuse when a missing heredoc end leaves dangerous bytes after the opener line."""
+    stack = [root]
+    seen: set[int] = set()
+    for _ in range(MAX_BODY_NODES):
+        if not stack:
+            break
+        node = stack.pop()
+        if node.type != "heredoc_redirect" or id(node) in seen:
+            stack.extend(node.children)
+            continue
+        seen.add(id(node))
+        missing_end = any(
+            child.type == "heredoc_end" and child.is_missing for child in node.children
+        )
+        if not missing_end:
+            stack.extend(node.children)
+            continue
+        start_byte = node.start_byte
+        line_end = raw.find(b"\n", start_byte)
+        if line_end < 0:
+            line_end = len(raw)
+        tail = raw[line_end + 1 :]
+        if not tail:
+            stack.extend(node.children)
+            continue
+        text = tail.decode("utf-8", "surrogateescape")
+        if _dangerous_unparsed_text(text):
+            row = node.start_point.row + 1
+            return f"unparsable shell text naming a command near line {row}"
+        stack.extend(node.children)
+    return None
+
+
+def _error_hit(node: Any, raw: bytes, scan: _Scan) -> str | None:
+    """Refuse malformed spans that can name commands and leave other spans as data."""
+    if _fd_herestring_tail_allowlisted(scan, raw):
+        return None
+    root = scan.syntax_root
+    tail = find_descriptor_herestring_tail(raw) if root is not None else None
+    if tail is not None and scan.redirect_target_ok:
+        digit_byte, _, line_end, targets = tail
+        errors = collect_error_nodes(root)
+        spans_ok = not errors or errors_within_tail_span(errors, digit_byte, line_end, len(raw))
+        blocked = spans_ok and any(
+            not scan.redirect_target_ok.get(piece.decode("utf-8", "surrogateescape"), False)
+            for piece in targets
+        )
+        if blocked:
+            row = node.start_point.row + 1
+            return f"unparsable shell text naming a command near line {row}"
+    text = _text(node, raw)
+    if _dangerous_unparsed_text(text):
         return f"unparsable shell text naming a command near line {node.start_point.row + 1}"
     return None
 
@@ -1872,7 +1936,7 @@ def _visit(node: Any, raw: bytes, data_only: bool, scan: _Scan) -> str | None:
     if node.parent is not None and node.parent.type == "program":
         _note_statement(node, raw, scan)
     if kind == "ERROR":
-        return _error_hit(node, raw)
+        return _error_hit(node, raw, scan)
     if kind in LEAVES:
         return None
     if kind in ("command_substitution", "process_substitution"):
@@ -3022,7 +3086,7 @@ def _arithmetic_writes(text: str) -> bool:
     if not any(mark in text for mark in ("$", "`")) or not ARITHMETIC_WRITE.search(text):
         return False
     raw = (": $((" + text + "))").encode("utf-8", "surrogateescape")
-    root = parse_bash(raw).root_node
+    root = bash_parser().parse(raw).root_node
     if root.has_error:
         return True
     stack = [root]
@@ -3105,8 +3169,7 @@ def _inline_roots(
             continue
         names.parsed += 1
         data = body.encode("utf-8", "surrogateescape")
-        root = parse_bash(data).root_node
-        roots.append((root, data, owners, True))
+        roots.append((bash_parser().parse(data).root_node, data, owners, True))
     names.inline.clear()
     return roots
 
@@ -3336,6 +3399,35 @@ def _environment_rebinds(context: InspectionContext, budget: BodyBudget) -> bool
     )
 
 
+def _run_scan_walk(
+    root: Any,
+    raw: bytes,
+    scan: _Scan,
+    budget: BodyBudget,
+    directory_state: list[bool] | None,
+) -> tuple[str | None, list[tuple[str, bool, bool]], list[str], list[tuple[str, bool, bool]]]:
+    """Drive the bounded syntax walk after a parsed root is accepted."""
+    scan.syntax_root = root
+    scan.fd_tail_allow = None
+    _prime_names(scan, _assignment_texts(root, raw, budget), raw)
+    if scan.context.script_dir is not None:
+        scan.rebound = _environment_rebinds(scan.context, budget)
+    scan.stack.append((root, raw, False))
+    limit = "shell syntax tree larger than inspect limit"
+    for _ in range(MAX_BODY_NODES):
+        if not scan.stack:
+            return _finish(scan, directory_state)
+        if budget.nodes >= MAX_BODY_NODES:
+            return limit, [], [], []
+        node, source, mode = scan.stack.pop()
+        _merge_source_literals(node, scan)
+        budget.nodes += 1
+        hit = _visit(node, source, mode, scan)
+        if hit is not None or scan.refusal is not None:
+            return hit or scan.refusal, [], [], []
+    return (limit, [], [], []) if scan.stack else _finish(scan, directory_state)
+
+
 def scan_body(
     body: str,
     context: InspectionContext,
@@ -3344,26 +3436,25 @@ def scan_body(
 ) -> tuple[str | None, list[tuple[str, bool, bool]], list[str], list[tuple[str, bool, bool]]]:
     """Walk a file and inline bodies with one bounded stack and shared node accounting."""
     parser = bash_parser()
+    empty: list = []
     if isinstance(parser, str):
-        return parser, [], [], []
+        return parser, empty, empty, empty
     raw = body.encode("utf-8", "surrogateescape")
     scan = _Scan(context, budget, dir_changed=context.directory_changed)
-    root = parse_bash(raw).root_node
-    _prime_names(scan, _assignment_texts(root, raw, budget), raw)
-    if context.script_dir is not None:
-        scan.rebound = _environment_rebinds(context, budget)
-    scan.stack.append((root, raw, False))
-    for _ in range(MAX_BODY_NODES):
-        if not scan.stack:
-            return _finish(scan, directory_state)
-        if budget.nodes >= MAX_BODY_NODES:
-            return "shell syntax tree larger than inspect limit", [], [], []
-        node, source, mode = scan.stack.pop()
-        _merge_source_literals(node, scan)
-        budget.nodes += 1
-        hit = _visit(node, source, mode, scan)
-        if hit is not None or scan.refusal is not None:
-            return hit or scan.refusal, [], [], []
-    if scan.stack:
-        return "shell syntax tree larger than inspect limit", [], [], []
-    return _finish(scan, directory_state)
+    root = parser.parse(raw).root_node
+    prelude = _unterminated_heredoc_refusal(root, raw)
+    if prelude is not None:
+        return prelude, empty, empty, empty
+    if descriptor_tail_mark_count(raw) > 1:
+        msg = "descriptor here-string tail appears more than once in the script"
+        return msg, empty, empty, empty
+    tail = find_descriptor_herestring_tail(raw)
+    if tail is not None and not tail_line_is_toplevel(root, tail[0]):
+        return (
+            "descriptor here-string tail sits outside a top-level simple command",
+            empty,
+            empty,
+            empty,
+        )
+    _prime_fd_tail_verdicts(scan, context, budget, raw)
+    return _run_scan_walk(root, raw, scan, budget, directory_state)

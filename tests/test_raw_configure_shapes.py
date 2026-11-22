@@ -4,108 +4,102 @@
 
 from __future__ import annotations
 
+import ast
 import io
 import json
 import os
 import unittest.mock
+from pathlib import Path
 
-from scripts import raw_configure_body, raw_configure_lex
+from scripts import raw_configure_body as body_mod
+from scripts import raw_configure_lex as lex_mod
+from scripts.raw_configure_body import (
+    BodyBudget,
+    InspectionContext,
+    _probe_clean_redirect_target,
+    scan_body,
+)
 from tests.raw_configure_support import CLIENTS, GUARD_MOD, RawConfigureGuardBase
 
-FD_HERESTRING_G1 = """\
-#!/bin/bash
-delay=$((1 << 2))
-if ! python3 - x 3<<< "$d" > y <<'PYTHON'
-import sys
-PYTHON
-then
-  echo no
-fi
-"""
-
-FD_HERESTRING_G6_PY = """\
-import json
-import os
-import sys
-
-with os.fdopen(3) as handle:
-    data = json.load(handle)
-print(sys.argv[1], len(data))\
-"""
-
-FD_HERESTRING_G6 = f"""\
-#!/bin/bash
-# squash-merge helper shape: retry backoff with an arithmetic shift, then an
-# interpreter fed one value on fd 3 and its program on stdin from a heredoc.
-set -eu
-
-retry() {{
-    local attempt delay
-    for attempt in 1 2 3; do
-        if "$@"; then
-            return 0
-        fi
-        delay=$(((1 << (attempt - 1)) + RANDOM % 2))
-        sleep "$delay"
-    done
-    return 1
-}}
-
-judge_paths() {{
-    local clone_dir=$1 dump_json=$2 tree_file=$3 paths_file=$4
-    if ! timeout 60 git -C "$clone_dir" ls-tree -rz --name-only HEAD > "$tree_file"; then
-        echo "ls-tree failed" >&2
-        return 1
-    fi
-    if ! python3 - "$tree_file" 3<<< "$dump_json" > "$paths_file" <<'PYTHON'
-{FD_HERESTRING_G6_PY}
-PYTHON
-    then
-        echo "judge failed" >&2
-        return 1
-    fi
-}}
-
-retry true
-judge_paths . '{{}}' tree.txt paths.txt
-"""
-
-FD_HERESTRING_F1 = (
-    "echo \"$(cat <<'3<<<' # \"\n"
-    "3<<<\n"
-    "./configure --prefix=/x\n"
-    "cat <<true >/dev/null\n"
-    "3<<<\n"
-    "true\n"
-    ')" >/dev/null\n'
+GUARDFD_G1 = (
+    "#!/bin/bash\n"
+    "delay=$((1 << 2))\n"
+    "if ! python3 - x 3<<< \"$d\" > y <<'PYTHON'\n"
+    "import sys\n"
+    "PYTHON\n"
+    "then\n  echo no\n"
+    "fi\n"
 )
 
-FD_HERESTRING_F2 = (
-    "echo $(true)#; cat <<'3<<<' >/dev/null\n"
-    "3<<<\n"
-    "./configure --prefix=/x\n"
-    "cat <<true >/dev/null\n"
-    "3<<<\n"
-    "true\n"
+GUARDFD_G6 = (
+    "#!/bin/bash\n"
+    "set -eu\n"
+    "retry() {\n"
+    "  delay=$(((1 << (1 - 1)) + 1))\n"
+    "  sleep 0\n"
+    "}\n"
+    "judge_paths() {\n"
+    '  if ! python3 - "$tree_file" 3<<< "$dump_json" > "$paths_file" <<\'PYTHON\'\n'
+    "import json\n"
+    "import os\n"
+    "import sys\n\n"
+    "with os.fdopen(3) as handle:\n"
+    "    data = json.load(handle)\n"
+    "print(sys.argv[1], len(data))\n"
+    "PYTHON\n"
+    "  then\n"
+    "    return 1\n"
+    "  fi\n"
+    "}\n"
+    "retry true\n"
+    "judge_paths . '{}' tree.txt paths.txt\n"
 )
 
-FD_HERESTRING_F3 = (
-    "echo $(( $(cat <<'3<<<' >/dev/null\n"
-    "3<<<\n"
-    "./configure --prefix=/x >&2\n"
-    "case x in x) case x in x) case x in x) :;; esac;; esac;; esac\n"
-    "cat <<true >/dev/null\n"
-    "3<<<\n"
-    "true\n"
-    "echo 0) )) >/dev/null\n"
-)
-
-OWN_DIR_HEADER = '#!/bin/bash\nHERE=$(dirname "$(readlink -f "$0")")\n'
+_BODY_PATH = Path(body_mod.__file__)
+_LEX_PATH = Path(lex_mod.__file__)
 
 
-def _desync_first_herestring_delim(data: bytes) -> bytes:
-    """Simulate a desynchronized lexer blanking the first 3<<< heredoc delimiter line."""
-    return data.replace(b"\n3<<<\n", b"\n <<<\n", 1)
+def _ast_module_funcs(path: Path) -> dict[str, ast.FunctionDef]:
+    """Collect top-level function definitions from one module file."""
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    out: dict[str, ast.FunctionDef] = {}
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef):
+            out[node.name] = node
+    return out
+
+
+def _body_lex_call_edges(
+    body_funcs: dict[str, ast.FunctionDef], lex_funcs: dict[str, ast.FunctionDef]
+) -> dict[str, set[str]]:
+    """Build plain-name call edges between body and lex module-level functions."""
+    body_names = set(body_funcs)
+    lex_names = set(lex_funcs)
+    edges: dict[str, set[str]] = {name: set() for name in body_names | lex_names}
+    for home, func in {**body_funcs, **lex_funcs}.items():
+        for node in ast.walk(func):
+            if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name):
+                continue
+            callee = node.func.id
+            if (callee in body_names and home != callee) or callee in lex_names:
+                edges[home].add(callee)
+    return edges
+
+
+def _find_call_cycle(edges: dict[str, set[str]]) -> str | None:
+    """Return one call cycle path when present, otherwise None."""
+    for start in edges:
+        stack = [(start, [start])]
+        for _ in range(4096):
+            if not stack:
+                break
+            node, path = stack.pop()
+            for nxt in edges.get(node, ()):
+                if nxt == start and len(path) > 1:
+                    return " -> ".join(path + [nxt])
+                if nxt not in path and nxt in edges:
+                    stack.append((nxt, path + [nxt]))
+    return None
 
 
 PROBE_GAP_SHAPES = (
@@ -496,224 +490,183 @@ class RawConfigureShapeTest(RawConfigureGuardBase):
                     self.assertEqual(result.returncode, 2, result.stderr)
                     self.assertIn("scripts/ffmpeg_configure.py", result.stderr)
 
-    def test_allows_fd_herestring_g1_script(self) -> None:
-        """Allow a script combining an arithmetic shift, an fd here-string, and a heredoc."""
-        script = self.root / "g1.sh"
-        script.write_text(FD_HERESTRING_G1, encoding="utf-8")
-        self._assert_allowed(((f"bash {script}", self.root),))
-
-    def test_allows_fd_herestring_g6_script(self) -> None:
-        """Allow the squash-merge helper shape feeding Python on fd 3 alongside a heredoc."""
-        script = self.root / "g6.sh"
-        script.write_text(FD_HERESTRING_G6, encoding="utf-8")
-        self._assert_allowed(((f"bash {script}", self.root),))
-
-    def test_fd_herestring_parses_without_error_node(self) -> None:
-        """Parse a numbered-descriptor here-string with zero ERROR nodes after blanking."""
-        parser = raw_configure_body.bash_parser()
-        self.assertFalse(isinstance(parser, str))
-        blanked = raw_configure_lex.blank_herestring_fds(b'cat 3<<< "$d"\n')
-        root = parser.parse(blanked).root_node
-        self.assertFalse(root.has_error)
-        stack = [root]
-        errors: list[str] = []
-        for _ in range(64):
-            if not stack:
-                break
-            node = stack.pop()
-            if node.type == "ERROR" or node.is_missing:
-                errors.append(node.type)
-            stack.extend(node.children)
-        self.assertEqual(errors, [])
-
-    def test_refuses_fd_herestring_configure_forms(self) -> None:
-        """Keep configure invocations paired with numbered here-string redirects refused."""
-        case_b = 'sh -s 0<<< "./configure --prefix=/x"'
-        case_c = FD_HERESTRING_G6.replace("python3 -", "bash -s").replace(
-            FD_HERESTRING_G6_PY, "./configure --enable-gpl"
+    def test_refuses_fd_descriptor_herestring_fail_open_shapes(self) -> None:
+        """Refuse main-line fail-open f shapes hidden by missing heredoc ends."""
+        bodies = (
+            'delay=$((1 << 2))\ncat scripts/x.py 3<<< "$d"\n./configure --prefix=/x\n',
+            'delay=$((1 << 2))\ncat 3<<< "$d"\n./configure --prefix=/x\n',
+            'delay=$((1 << 2))\ncat - x 3<<< "$d" > y\n./configure --prefix=/x\n',
         )
-        case_d = "timeout 60 ./configure 3<<< x"
-        case_e = FD_HERESTRING_G6.replace(
-            'timeout 60 git -C "$clone_dir" ls-tree -rz --name-only HEAD',
-            'timeout 60 "$clone_dir"/configure --enable-gpl',
+        for body in bodies:
+            self._check_parser_body(body, refused=True)
+
+    def test_refuses_fd_descriptor_herestring_known_bad_shapes(self) -> None:
+        """Refuse empty here-strings, semicolon tails, and configure in tail payloads."""
+        bodies = (
+            "cat 3<<< x\n./configure --prefix=/x\n",
+            'cat - x 3<<< "$d" > y\n./configure --prefix=/x\n',
+            'delay=$((1 << 2))\ncat 3<<< "$d" > /tmp/y; ./configure --prefix=/x\n',
+            'delay=$((1 << 2))\n./configure 3<<< "$d" > /tmp/y\n',
+            'delay=$((1 << 2))\ncat 3<<< "$(./configure)" > /tmp/y\n',
+            'delay=$((1 << 2))\ncat 3<<< "$d" > /tmp/y 4<<< "$e"\n',
+            'delay=$((1 << 2))\ncat 3<<< "$d" | ./configure\n',
         )
-        bodies = [("b", case_b + "\n"), ("c", case_c), ("d", case_d + "\n"), ("e", case_e)]
-        for _ in range(len(bodies)):
-            if not bodies:
-                break
-            label, text = bodies.pop(0)
-            script = self.root / f"t2_{label}.sh"
-            script.write_text(text, encoding="utf-8")
-            self._assert_refused(((f"bash {script}", self.root),))
-        self._assert_refused(((case_b, self.root), (case_d, self.tree)))
+        for body in bodies:
+            self._check_parser_body(body, refused=True)
 
-    def test_blank_herestring_fds_word_start_and_multi_digit_boundaries(self) -> None:
-        """Preserve mid-word and brace forms while blanking single and multi-digit fds."""
-        cases = [
-            (b"echo a3<<< x", b"echo a3<<< x"),
-            (b"cat 12<<< x", b"cat   <<< x"),
-            (b"cat 3<<< x; cat 4<<< y", b"cat  <<< x; cat  <<< y"),
-            (b"cat {fd}<<< x", b"cat {fd}<<< x"),
-        ]
-        for _ in range(len(cases)):
-            if not cases:
-                break
-            raw, expected = cases.pop(0)
-            actual = raw_configure_lex.blank_herestring_fds(raw)
-            self.assertEqual(actual, expected)
-            self.assertEqual(len(actual), len(raw))
-        parser = raw_configure_body.bash_parser()
-        self.assertFalse(parser.parse(b"cat {fd}<<< x\n").root_node.has_error)
+    def test_refuses_fd_descriptor_herestring_review2_shapes(self) -> None:
+        """Refuse the round-2 review desync shapes without lexer blanking."""
+        bodies = (
+            (
+                "((cat <<- 3<<<'true' >y\nx; delay=$((1 << 2));\n"
+                "if cat - x 3<<< \"$d\" > y <<'true'\n"
+                "3\nif ./configure --prefix=/x\ntrue\nthen :; fi\n); true)\n"
+            ),
+            (
+                "delay=$((1 << 2))\ncat <<'EOF' >y\nEOF\r\n\nif cat - x 3<<< \"$d\" > y <<'true'\n"
+                "EOF\nif ./configure --prefix=/x\ntrue\nthen :; fi\n"
+            ),
+            (
+                "delay=$((1 << 2))\ncat <<'E'\\\n'OF' >y\nE\nif cat - x 3<<< \"$d\" > y <<'true'\n"
+                "EOF\nif ./configure --prefix=/x\ntrue\nthen :; fi\n"
+            ),
+            (
+                "delay=$((1 << 2))\necho `echo \\` #\\` ; cat <<'EOF' >y`\n"
+                "if cat - x 3<<< \"$d\" > y <<'true'\n"
+                "EOF\nif ./configure --prefix=/x\ntrue\nthen :; fi\n"
+            ),
+            (
+                "((cat <<'EOF' >y\nx; if cat - x 3<<< \"$d\" > y <<'true'\n"
+                "EOF\nif ./configure --prefix=/x\ntrue\nthen :; fi\n); true)\n"
+            ),
+        )
+        for body in bodies:
+            self._check_parser_body(body, refused=True)
 
-    def test_blank_herestring_fds_quotes_comments_and_heredocs(self) -> None:
-        """Leave digits before <<< untouched inside quotes, comments and heredoc bodies."""
-        unchanged = [
-            b"echo '3<<< x'",
-            b'echo "3<<< x"',
-            b"echo 'cat 3<<< x'",
-            b'echo "cat 3<<< x"',
-            b"cat <<'EOF'\n3<<< x\nEOF\n",
-            b"# 3<<< x\n",
-        ]
-        for _ in range(len(unchanged)):
-            if not unchanged:
-                break
-            raw = unchanged.pop(0)
-            actual = raw_configure_lex.blank_herestring_fds(raw)
-            self.assertEqual(actual, raw)
-            self.assertEqual(len(actual), len(raw))
+    def test_refuses_fd_descriptor_herestring_guardfd_shapes(self) -> None:
+        """Refuse guardfd fixtures that combine heredocs with descriptor tails."""
+        self._check_parser_body(GUARDFD_G1, refused=True)
+        self._check_parser_body(GUARDFD_G6, refused=True)
 
-    def test_refuses_heredoc_delimiter_herestring_desync_scripts(self) -> None:
-        """Refuse scripts whose 3<<< heredoc delimiter could hide raw configure calls."""
-        bodies = [("f1", FD_HERESTRING_F1), ("f2", FD_HERESTRING_F2), ("f3", FD_HERESTRING_F3)]
-        for _ in range(len(bodies)):
-            if not bodies:
-                break
-            label, text = bodies.pop(0)
-            script = self.root / f"t4_{label}.sh"
-            script.write_text(text, encoding="utf-8")
-            self._assert_refused(((f"bash {script}", self.tree),))
+    def test_refuses_fd_descriptor_herestring_boundary_mutations(self) -> None:
+        """Refuse allow-list boundary violations around the p1 tail shape."""
+        base = 'delay=$((1 << 2))\npython3 - x 3<<< "$d" > /tmp/y\n'
+        bodies = (
+            'delay=$((1 << 2))\npython3 - x 3<<< "$d" > /tmp/y # x\n',
+            'delay=$((1 << 2))\npython3 - x 3<<< "$(x)" > /tmp/y\n',
+            base + 'delay=$((1 << 2))\ncat 4<<< "$e" > /tmp/z\n',
+            'delay=$((1 << 2))\r\npython3 - x 3<<< "$d" > /tmp/y\n',
+            'delay=$((1 << 2))\\\npython3 - x 3<<< "$d" > /tmp/y\n',
+            '# `x`\ndelay=$((1 << 2))\npython3 - x 3<<< "$d" > /tmp/y\n',
+            'if true; then\npython3 - x 3<<< "$d" > /tmp/y\nfi\n',
+            'delay=$((1 << 2))\npython3 - x 10<<< "$d" > /tmp/y\n',
+            'delay=$((1 << 2))\ncat 3<<< "$d" > /tmp/a\ncat 4<<< "$e" > /tmp/b\n',
+        )
+        for body in bodies:
+            self._check_parser_body(body, refused=True)
 
-    def _collect_tree_errors(self, root: object) -> list[str]:
-        """Collect ERROR and missing node types from a syntax tree with a bounded stack."""
-        stack = [root]
-        errors: list[str] = []
-        for _ in range(512):
-            if not stack:
-                break
-            node = stack.pop()
-            if node.type == "ERROR" or node.is_missing:
-                errors.append(node.type)
-            stack.extend(node.children)
-        return errors
+    def test_allows_fd_descriptor_herestring_pass_shapes(self) -> None:
+        """Allow shift-prefixed descriptor here-string tails blocked only by ERROR spans."""
+        bodies = (
+            'delay=$((1 << 2))\npython3 - x 3<<< "$d" > /tmp/y\n',
+            'delay=$((1 << 2))\ncat - 3<<< "$d" > out/y\n',
+            'delay=$((1 << 2))\npython3 scripts/x.py 3<<< "$d" > /tmp/y 2>&1\n',
+            'python3 - x 3<<< "$d" > /tmp/y\n',
+            'delay=$((1 << 2))\npython3 - x 3<<< "$d" > /tmp/y\necho done\n',
+            "delay=$((1 << 2))\npython3 - x 3<<< '$d' > /tmp/y\n",
+        )
+        for body in bodies:
+            self._check_parser_body(body, refused=False)
 
-    def test_parse_bash_verifies_blanked_runs_or_falls_back(self) -> None:
-        """Fall back to raw parse on desynced blanking and keep valid blanked trees."""
-        parser = raw_configure_body.bash_parser()
-        items = [FD_HERESTRING_F1, FD_HERESTRING_F2, FD_HERESTRING_F3]
-        for _ in range(len(items)):
-            if not items:
-                break
-            raw = items.pop(0).encode("utf-8")
-            orig_sexp = str(parser.parse(raw).root_node)
-            bad_sexp = str(parser.parse(_desync_first_herestring_delim(raw)).root_node)
-            self.assertNotEqual(orig_sexp, bad_sexp)
-            self.assertEqual(str(raw_configure_body.parse_bash(raw).root_node), orig_sexp)
-            with unittest.mock.patch.object(
-                raw_configure_body,
-                "blank_herestring_fds",
-                side_effect=_desync_first_herestring_delim,
+    def test_b5_descriptor_tail_matches_b6_clean_redirect(self) -> None:
+        """Give b5 the same verdict as the clean here-string redirect in b6."""
+        b5 = 'delay=$((1 << 2))\ncat 3<<< "$d" > ./configure\n'
+        b6 = 'cat <<< "$d" > ./configure\n'
+        for body in (b5, b6):
+            self._check_parser_body(body, refused=False)
+
+    def test_clean_redirect_targets_match_descriptor_tail_targets(self) -> None:
+        """Pin descriptor-tail redirect targets to clean here-string redirect checks."""
+        context = InspectionContext(
+            cwd=self.root,
+            directory_changed=False,
+            files_read=[],
+            classifier=lambda _words: None,
+            script_dir=self.root,
+        )
+        budget = BodyBudget()
+        for target in ("./configure", "/tmp/y", "out/y"):
+            self.assertTrue(_probe_clean_redirect_target(target, context, budget))
+
+    def test_raw_configure_body_lex_call_graph_acyclic(self) -> None:
+        """Assert module-level calls between body and lex helpers form an acyclic graph."""
+        body_funcs = _ast_module_funcs(_BODY_PATH)
+        lex_funcs = _ast_module_funcs(_LEX_PATH)
+        cycle = _find_call_cycle(_body_lex_call_edges(body_funcs, lex_funcs))
+        if cycle is not None:
+            self.fail(f"call cycle: {cycle}")
+
+    def test_refuses_descriptor_tail_when_clean_redirect_probe_fails(self) -> None:
+        """Refuse an otherwise valid tail when the precomputed redirect verdict is false."""
+        context = InspectionContext(
+            cwd=self.root,
+            directory_changed=False,
+            files_read=[],
+            classifier=lambda _words: None,
+            script_dir=self.root,
+        )
+        body = 'delay=$((1 << 2))\npython3 - x 3<<< "$d" > /tmp/y\n'
+        patch = unittest.mock.patch.object(
+            body_mod, "_probe_clean_redirect_target", return_value=False
+        )
+        with patch:
+            hit = scan_body(body, context, BodyBudget())[0]
+        self.assertIsNotNone(hit)
+
+    def test_refuses_fd_descriptor_herestring_outside_toplevel_command(self) -> None:
+        """Refuse descriptor tails embedded outside a top-level simple command."""
+        p1 = 'delay=$((1 << 2))\npython3 - x 3<<< "$d" > /tmp/y\n'
+        tail = p1.split("\n", 1)[1]
+        bodies = (
+            f"delay=$((1 << 2))\nif true; then\n  {tail}fi\n",
+            f"delay=$((1 << 2))\nwhile false; do\n  {tail}done\n",
+            f"delay=$((1 << 2))\nf() {{\n  {tail}}}\n",
+            f"delay=$((1 << 2))\n{{\n  {tail}}}\n",
+        )
+        for body in bodies:
+            self._check_parser_body(body, refused=True)
+
+    def test_fd_descriptor_top_level_rule_isolates_nontop_tail(self) -> None:
+        """Measure whether disabling only the top-level rule allows a nested tail shape."""
+        p1 = 'delay=$((1 << 2))\npython3 - x 3<<< "$d" > /tmp/y\n'
+        tail = p1.split("\n", 1)[1]
+        shapes = (
+            f"delay=$((1 << 2))\nif true; then\n  {tail}fi\n",
+            f"delay=$((1 << 2))\nwhile false; do\n  {tail}done\n",
+            f"delay=$((1 << 2))\nf() {{\n  {tail}}}\n",
+            f"delay=$((1 << 2))\n{{\n  {tail}}}\n",
+        )
+        flips = 0
+        for body in shapes:
+            refused_on = self._parser_refused(body)
+            self.assertTrue(refused_on)
+            with unittest.mock.patch(
+                "scripts.raw_configure_body.tail_line_is_toplevel", return_value=True
             ):
-                fallback = raw_configure_body.parse_bash(raw)
-            self.assertEqual(str(fallback.root_node), orig_sexp)
-        g6_raw = FD_HERESTRING_G6.encode("utf-8")
-        g6_blank_sexp = str(parser.parse(raw_configure_lex.blank_herestring_fds(g6_raw)).root_node)
-        g6_tree = raw_configure_body.parse_bash(g6_raw)
-        self.assertFalse(g6_tree.root_node.has_error)
-        self.assertEqual(self._collect_tree_errors(g6_tree.root_node), [])
-        self.assertEqual(str(g6_tree.root_node), g6_blank_sexp)
+                refused_off = self._parser_refused(body)
+            if refused_on and not refused_off:
+                flips += 1
+        self.assertFalse(self._parser_refused(p1))
+        with unittest.mock.patch(
+            "scripts.raw_configure_body.tail_line_is_toplevel", return_value=True
+        ):
+            self.assertFalse(self._parser_refused(p1))
 
-    def test_blank_herestring_fds_vertical_tab_comment(self) -> None:
-        """Keep a comment containing a vertical tab before 3<<< intact on one LF line."""
-        raw = b"# c\x0b 3<<< x\n"
-        actual = raw_configure_lex.blank_herestring_fds(raw)
-        self.assertEqual(actual, raw)
-        self.assertEqual(len(actual), len(raw))
-
-    def test_blank_herestring_fds_lexer_sync_and_quote_removal(self) -> None:
-        """Sync nested substitutions, )#, and delimiter quote removal before real fd<<<."""
-        cases = [
-            (FD_HERESTRING_F1.encode("utf-8"), FD_HERESTRING_F1.encode("utf-8")),
-            (FD_HERESTRING_F2.encode("utf-8"), FD_HERESTRING_F2.encode("utf-8")),
-            (FD_HERESTRING_F3.encode("utf-8"), FD_HERESTRING_F3.encode("utf-8")),
-            (
-                b'echo "$(cat <<\'EOF\' # "\n3<<<\nEOF\n)"; cat 3<<< x\n',
-                b'echo "$(cat <<\'EOF\' # "\n3<<<\nEOF\n)"; cat  <<< x\n',
-            ),
-            (
-                b'echo "`cat <<\'EOF\' # "\n3<<<\nEOF\n`"; cat 3<<< x\n',
-                b'echo "`cat <<\'EOF\' # "\n3<<<\nEOF\n`"; cat  <<< x\n',
-            ),
-            (
-                b"echo $(true)#; cat <<'EOF'\n3<<<\nEOF\ncat 3<<< x\n",
-                b"echo $(true)#; cat <<'EOF'\n3<<<\nEOF\ncat  <<< x\n",
-            ),
-            (b"echo $((1))#; cat 3<<< x\n", b"echo $((1))#; cat  <<< x\n"),
-            (
-                b"echo $(( $(cat <<'EOF'\n3<<<\nEOF\necho 1) )); cat 3<<< x\n",
-                b"echo $(( $(cat <<'EOF'\n3<<<\nEOF\necho 1) )); cat  <<< x\n",
-            ),
-            (
-                b"(( $(cat <<'EOF'\n3<<<\nEOF\necho 1) )); cat 3<<< x\n",
-                b"(( $(cat <<'EOF'\n3<<<\nEOF\necho 1) )); cat  <<< x\n",
-            ),
-            (
-                b"cat <<E\\OF\n3<<<\nEOF\ncat 3<<< x\n",
-                b"cat <<E\\OF\n3<<<\nEOF\ncat  <<< x\n",
-            ),
-            (
-                b"cat <<'E'OF\nE\n3<<<\nEOF\ncat 3<<< x\n",
-                b"cat <<'E'OF\nE\n3<<<\nEOF\ncat  <<< x\n",
-            ),
-            (
-                b"cat <<''EOF\n3<<<\nEOF\ncat 3<<< x\n",
-                b"cat <<''EOF\n3<<<\nEOF\ncat  <<< x\n",
-            ),
-        ]
-        for _ in range(len(cases)):
-            if not cases:
-                break
-            raw, expected = cases.pop(0)
-            actual = raw_configure_lex.blank_herestring_fds(raw)
-            self.assertEqual(actual, expected)
-            self.assertEqual(len(actual), len(raw))
-
-    def test_secondary_site_queue_inline_fd_herestring(self) -> None:
-        """Allow sourced script bodies using numbered fd here-strings via _queue_inline."""
-        sub = self.root / "sub_fd.sh"
-        sub.write_text(FD_HERESTRING_G1, encoding="utf-8")
-        caller = self.root / "caller_queue_inline.sh"
-        caller.write_text(f'. "{sub}"\n', encoding="utf-8")
-        self._assert_allowed(((f"bash {caller}", self.root),))
-
-    def test_secondary_site_arithmetic_writes_fd_herestring(self) -> None:
-        """Allow static arithmetic writes whose RHS runs a numbered fd here-string."""
-        (self.root / "clean_arith.sh").write_text("echo ok\n", encoding="utf-8")
-        caller = self.root / "caller_arith.sh"
-        caller.write_text(
-            OWN_DIR_HEADER + ': $(( x = $(cat 3<<< "$d") ))\nbash "$HERE/clean_arith.sh"\n',
-            encoding="utf-8",
-        )
-        self._assert_allowed(((f"bash {caller}", self.root),))
-
-    def test_secondary_site_inline_roots_fd_herestring(self) -> None:
-        """Refuse dynamic printf -v writers inside eval with a numbered fd here-string."""
-        (self.root / "clean_inline.sh").write_text("echo ok\n", encoding="utf-8")
-        caller = self.root / "caller_inline_roots.sh"
-        caller.write_text(
-            OWN_DIR_HEADER
-            + 'n=HE\nm=RE\neval \'printf 3<<< "$d" -v "$n$m" /tmp\'\n'
-            + 'bash "$HERE/clean_inline.sh"\n',
-            encoding="utf-8",
-        )
-        self._assert_refused(((f"bash {caller}", self.root),))
+    def _parser_refused(self, body: str) -> bool:
+        """Return whether the inline guard refuses a script body."""
+        cfg = f'"{self.tree}/configure" --x'
+        body = body.replace("<cfg>", cfg).replace("<tree>", str(self.tree))
+        script = self.root / "parser_body.sh"
+        script.write_text(body, encoding="utf-8")
+        result = self.run_guard("claude", self.payload("claude", f"bash {script}", self.root))
+        return result.returncode == 2

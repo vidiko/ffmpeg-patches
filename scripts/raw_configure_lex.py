@@ -7,7 +7,6 @@ from __future__ import annotations
 import re
 import shlex
 import sys
-from dataclasses import dataclass, field
 from pathlib import Path
 
 # Ensure repository root is on sys.path for test/tool imports
@@ -24,65 +23,12 @@ from scripts.raw_configure_words import (  # noqa: E402
     SEPARATORS,
 )
 
-HERESTRING_WORD_STARTS = frozenset(" \t\n;&|()")
-_DELIM_BREAKS = frozenset(" \t;&|<>()\n\r")
-_DQ_ESCAPABLE = frozenset('$`"\\\n')
-_CASE_CMD_WORDS = frozenset(
-    ["if", "then", "elif", "else", "do", "while", "until", "time", "!", "{"]
+_TAIL_WORD = re.compile(rb"[A-Za-z0-9_./:,=+\-]+")
+_DQ_TAIL_INNER = re.compile(
+    rb"^[A-Za-z0-9_ ./:,=+\-]*"
+    rb"(?:\$(?:\{[A-Za-z_][A-Za-z0-9_]*\}|[A-Za-z_][A-Za-z0-9_]*))*$"
 )
-_WORD_TOKEN_CHARS = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_!{}")
-_WORD_DELIMS = frozenset(" \t\r\n;&|()<>")
-_ANSI_SIMPLE = {
-    "a": "\a",
-    "b": "\b",
-    "e": "\x1b",
-    "E": "\x1b",
-    "f": "\f",
-    "n": "\n",
-    "r": "\r",
-    "t": "\t",
-    "v": "\v",
-    "\\": "\\",
-    "'": "'",
-    '"': '"',
-    "?": "?",
-}
-_ANSI_RE = re.compile(
-    r"\\(?:([0-7]{1,3})|x([0-9A-Fa-f]{1,2})|u([0-9A-Fa-f]{1,4})|U([0-9A-Fa-f]{1,8})|c(.)|(.))",
-    re.S,
-)
-
-
-@dataclass
-class _LexFrame:
-    """Saved outer quote, arithmetic and substitution state for nested lexing."""
-
-    quote: str | None
-    arith_depth: int
-    arith_word: bool
-    sub_kind: str | None
-    paren_depth: int
-    cases: list[str]
-    case_parens: list[int]
-    cmd_pos: bool
-
-
-@dataclass
-class _LexState:
-    """Track active quote, word-boundary, continuation and nested shell state across lines."""
-
-    quote: str | None = None
-    word_start: bool = True
-    continued: bool = False
-    arith_depth: int = 0
-    arith_word: bool = False
-    sub_kind: str | None = None
-    paren_depth: int = 0
-    cases: list[str] = field(default_factory=list)
-    case_parens: list[int] = field(default_factory=list)
-    cmd_pos: bool = True
-    stack: list[_LexFrame] = field(default_factory=list)
-    heredocs: list[tuple[str, bool]] = field(default_factory=list)
+_TAIL_MARK = re.compile(rb"(?<![0-9A-Za-z_])(\d)<<<")
 
 
 def _append_redirect_fd(punc: str, tokens: list[str], raw_tokens: list[str], idx: int) -> int:
@@ -247,111 +193,42 @@ def _restore_tokens(tokens: list[str], replacements: list[tuple[str, str]]) -> l
     return restored
 
 
-def _decode_ansi_escape(match: re.Match[str]) -> str:
-    """Decode one ANSI-C backslash escape inside a $'...' delimiter segment."""
-    octal, hex2, hex4, hex8, ctrl, other = match.groups()
-    if octal is not None:
-        return chr(int(octal, 8) & 0xFF)
-    if hex2 is not None:
-        return chr(int(hex2, 16))
-    digits = hex4 or hex8
-    if digits is not None:
-        code = int(digits, 16)
-        return chr(code) if code <= 0x10FFFF and not (0xD800 <= code <= 0xDFFF) else ""
-    if ctrl is not None:
-        return chr(ord(ctrl) & 0x1F)
-    return _ANSI_SIMPLE.get(other, "\\" + other)
-
-
-def _read_single_quoted(line: str, pos: int, line_len: int) -> tuple[str, int]:
-    """Read a single-quoted segment starting at the opening apostrophe."""
-    pos += 1
-    start = pos
-    for _ in range(line_len - pos + 1):
-        if pos >= line_len or line[pos] == "'":
-            break
-        pos += 1
-    return line[start:pos], (pos + 1 if pos < line_len else pos)
-
-
-def _read_ansi_quoted(line: str, pos: int, line_len: int) -> tuple[str, int]:
-    """Read and decode an ANSI-C $'...' segment starting at the leading $."""
-    pos += 2
-    start = pos
-    for _ in range(line_len - pos + 1):
-        if pos >= line_len or line[pos] == "'":
-            break
-        pos += 2 if line[pos] == "\\" and pos + 1 < line_len else 1
-    body = _ANSI_RE.sub(_decode_ansi_escape, line[start:pos]).split("\x00", 1)[0]
-    return body, (pos + 1 if pos < line_len else pos)
-
-
-def _read_double_quoted(line: str, pos: int, line_len: int) -> tuple[str, int]:
-    """Read a double-quoted or $"..." segment with Bash double-quote escapes."""
-    pos += 2 if line[pos : pos + 2] == '$"' else 1
-    chars: list[str] = []
-    for _ in range(line_len - pos + 1):
-        if pos >= line_len or line[pos] == '"':
-            break
-        if line[pos] == "\\" and pos + 1 < line_len and line[pos + 1] in _DQ_ESCAPABLE:
-            if line[pos + 1] != "\n":
-                chars.append(line[pos + 1])
-            pos += 2
-        else:
-            chars.append(line[pos])
-            pos += 1
-    return "".join(chars), (pos + 1 if pos < line_len else pos)
-
-
-def _read_delim_step(line: str, pos: int, line_len: int) -> tuple[str, int, str]:
-    """Read one quoted, escaped or plain piece of a delimiter token."""
-    if line[pos] == "'":
-        piece, nxt = _read_single_quoted(line, pos, line_len)
-        return piece, nxt, "'"
-    if line[pos : pos + 2] == "$'":
-        piece, nxt = _read_ansi_quoted(line, pos, line_len)
-        return piece, nxt, '"'
-    if line[pos] == '"' or line[pos : pos + 2] == '$"':
-        piece, nxt = _read_double_quoted(line, pos, line_len)
-        return piece, nxt, '"'
-    if line[pos] == "\\":
-        nxt_ch = line[pos + 1 : pos + 2]
-        kept = "" if nxt_ch in ("", "\n", "\r") else nxt_ch
-        return kept, min(pos + 2, line_len), '"'
-    return line[pos], pos + 1, ""
-
-
 def _read_delim(line: str, pos: int, line_len: int) -> tuple[str, int, str | None]:
-    """Read a heredoc or here-string word and apply quote removal across all parts."""
-    parts: list[str] = []
-    kinds: list[str] = []
-    for _ in range(line_len - pos + 1):
-        if pos >= line_len or line[pos] in _DELIM_BREAKS:
-            break
-        piece, pos, kind = _read_delim_step(line, pos, line_len)
-        parts.append(piece)
-        kinds.append(kind)
-    if not any(kinds):
-        return "".join(parts), pos, None
-    q_char = "'" if set(kinds) == {"'"} else '"'
-    return "".join(parts), pos, q_char
-
-
-def _skip_blanks(text: str, pos: int, limit: int) -> int:
-    """Advance past space and horizontal tab characters up to limit."""
-    for _ in range(limit - pos):
-        if pos >= limit or text[pos] not in " \t":
-            break
+    """Read a heredoc delimiter token starting at the given position."""
+    if pos < line_len and line[pos] in ("'", '"'):
+        q_char = line[pos]
         pos += 1
-    return pos
+        start_q = pos
+        for _ in range(line_len - pos + 1):
+            if pos >= line_len or line[pos] == q_char:
+                break
+            pos += 1
+        delim = line[start_q:pos]
+        return delim, (pos + 1 if pos < line_len else pos), q_char
+    quoted: str | None = None
+    if pos < line_len and line[pos] == "\\":
+        quoted = "\\"
+        pos += 1
+    start_d = pos
+    for _ in range(line_len - pos + 1):
+        if pos >= line_len or line[pos] in " \t;&|<>()\n\r":
+            break
+        if line[pos] in ("\\", "'", '"'):
+            quoted = "\\"
+        pos += 1
+    return line[start_d:pos], pos, quoted
 
 
 def _parse_heredoc_at(line: str, pos: int, line_len: int) -> tuple[int, str, bool, bool] | None:
     """Parse heredoc marker details starting after << operator."""
     tab_strip = pos < line_len and line[pos] == "-"
-    pos = _skip_blanks(line, pos + (1 if tab_strip else 0), line_len)
+    pos += 1 if tab_strip else 0
+    for _ in range(line_len - pos):
+        if line[pos] not in " \t":
+            break
+        pos += 1
     delim, pos, q_delim = _read_delim(line, pos, line_len)
-    if delim or q_delim is not None:
+    if delim:
         return pos, delim, tab_strip, q_delim is not None
     return None
 
@@ -382,21 +259,6 @@ def _scan_heredoc_line(line: str, line_len: int) -> tuple[int, int, str, bool, b
     return None
 
 
-def _consume_heredoc_body(
-    lines: list[str], idx: int, delim: str, tab_strip: bool
-) -> tuple[int, bool]:
-    """Advance past one heredoc body to its delimiter line and report closure."""
-    num_lines = len(lines)
-    for _ in range(num_lines - idx + 1):
-        if idx >= num_lines:
-            break
-        check = lines[idx].lstrip("\t") if tab_strip else lines[idx]
-        idx += 1
-        if check.rstrip("\r\n") == delim:
-            return idx, True
-    return idx, False
-
-
 def _scan_heredocs(command: str) -> tuple[str, dict[str, str], set[str]] | None:
     """Extract heredocs outside quotes and replace declarations with placeholders."""
     if len(command) > MAX_COMMAND:
@@ -421,452 +283,22 @@ def _scan_heredocs(command: str) -> tuple[str, dict[str, str], set[str]] | None:
         if not is_quoted:
             expanding_tags.add(tag)
         out_lines.append(line[:start_hd] + tag + line[end_hd:])
-        end_idx, closed = _consume_heredoc_body(lines, idx, delim, tab_strip)
+        body: list[str] = []
+        closed = False
+        for _ in range(num_lines - idx + 1):
+            if idx >= num_lines:
+                break
+            b_line = lines[idx]
+            idx += 1
+            check = b_line.lstrip("\t") if tab_strip else b_line
+            if check.rstrip("\r\n") == delim:
+                closed = True
+                break
+            body.append(b_line)
         if not closed:
             return None
-        heredocs[tag] = "".join(lines[idx : end_idx - 1])
-        idx = end_idx
+        heredocs[tag] = "".join(body)
     return "".join(out_lines), heredocs, expanding_tags
-
-
-def _herestring_fd_end(line: str, pos: int, line_len: int) -> int | None:
-    """Return the end offset of an ASCII digit run followed immediately by <<<."""
-    end = pos
-    for _ in range(line_len - pos):
-        if end >= line_len or not ("0" <= line[end] <= "9"):
-            break
-        end += 1
-    return end if end > pos and line[end : end + 3] == "<<<" else None
-
-
-def _note_non_keyword(state: _LexState) -> None:
-    """Advance active case-header state on a quoted, expansion or non-keyword word."""
-    if state.cases:
-        if state.cases[-1] == "word":
-            state.cases[-1] = "in"
-        elif state.cases[-1] == "pat":
-            state.cases[-1] = "pat_seen"
-    state.cmd_pos = False
-
-
-def _push_sub(state: _LexState, sub_kind: str, arith_depth: int = 0) -> None:
-    """Push current lexing context and enter a nested command or arithmetic substitution."""
-    if state.quote is None and state.arith_depth == 0:
-        _note_non_keyword(state)
-    state.stack.append(
-        _LexFrame(
-            state.quote,
-            state.arith_depth,
-            state.arith_word,
-            state.sub_kind,
-            state.paren_depth,
-            state.cases,
-            state.case_parens,
-            state.cmd_pos,
-        )
-    )
-    state.quote = None
-    state.arith_depth = arith_depth
-    state.arith_word = arith_depth > 0
-    state.sub_kind = sub_kind
-    state.paren_depth = 1 if sub_kind == "$(" else 0
-    state.cases = []
-    state.case_parens = []
-    state.cmd_pos = True
-    state.word_start = True
-
-
-def _pop_sub(state: _LexState) -> None:
-    """Restore the enclosing lexing context when a nested substitution closes."""
-    frame = state.stack.pop()
-    state.quote = frame.quote
-    state.arith_depth = frame.arith_depth
-    state.arith_word = frame.arith_word
-    state.sub_kind = frame.sub_kind
-    state.paren_depth = frame.paren_depth
-    state.cases = frame.cases
-    state.case_parens = frame.case_parens
-    state.cmd_pos = False
-    state.word_start = frame.arith_depth > 0
-
-
-def _step_double_quoted(line: str, pos: int, state: _LexState) -> int:
-    """Advance one character, escape or nested substitution inside double quotes."""
-    ch = line[pos]
-    if ch == "\\":
-        step = 3 if line[pos + 1 : pos + 3] == "\r\n" else 2
-        return min(pos + step, len(line))
-    if line[pos : pos + 3] == "$((":
-        _push_sub(state, "$((", arith_depth=2)
-        return pos + 3
-    if line[pos : pos + 2] == "$(":
-        _push_sub(state, "$(")
-        return pos + 2
-    if ch == "`":
-        _push_sub(state, "`")
-        return pos + 1
-    if ch == '"':
-        state.word_start = False
-        state.quote = None
-    return pos + 1
-
-
-def _step_quoted(line: str, pos: int, state: _LexState) -> int:
-    """Advance past one token inside an active single, ANSI-C or double quote."""
-    if state.quote == '"':
-        return _step_double_quoted(line, pos, state)
-    ch = line[pos]
-    if state.quote == "$'" and ch == "\\":
-        return min(pos + 2, len(line))
-    if ch == "'":
-        state.word_start = False
-        state.quote = None
-    return pos + 1
-
-
-def _comment_end(line: str, pos: int, state: _LexState) -> int:
-    """Return the end of a # comment, stopping before an unescaped closing backtick."""
-    line_len = len(line)
-    if state.sub_kind == "`":
-        idx = pos + 1
-        for _ in range(line_len - idx):
-            if idx >= line_len:
-                break
-            if line[idx] == "\\":
-                idx += 2
-                continue
-            if line[idx] == "`":
-                state.word_start = False
-                return idx
-            idx += 1
-    state.word_start = line.endswith("\n")
-    if line.endswith("\n") and (not state.cases or state.cases[-1] == "body"):
-        state.cmd_pos = True
-    return line_len
-
-
-def _step_backslash(line: str, pos: int, state: _LexState) -> int:
-    """Advance past a backslash line continuation or escaped unquoted character."""
-    if line[pos + 1 : pos + 3] == "\r\n":
-        state.continued = True
-        return pos + 3
-    if line[pos + 1 : pos + 2] == "\n":
-        state.continued = True
-        return pos + 2
-    if state.arith_depth == 0:
-        _note_non_keyword(state)
-    state.word_start = False
-    return min(pos + 2, len(line))
-
-
-def _enter_quote(line: str, pos: int, state: _LexState) -> int:
-    """Enter single, double, locale or ANSI-C quote mode from unquoted text."""
-    if state.arith_depth == 0:
-        _note_non_keyword(state)
-    state.word_start = False
-    two = line[pos : pos + 2]
-    if two == "$'":
-        state.quote = "$'"
-        return pos + 2
-    if two == '$"':
-        state.quote = '"'
-        return pos + 2
-    state.quote = line[pos]
-    return pos + 1
-
-
-def _step_escape_or_quote(line: str, pos: int, state: _LexState) -> int | None:
-    """Handle backslash escapes, comments and quote starts in unquoted shell text."""
-    ch = line[pos]
-    if ch == "\\":
-        return _step_backslash(line, pos, state)
-    if ch == "#" and state.word_start and state.arith_depth == 0:
-        return _comment_end(line, pos, state)
-    if line[pos : pos + 2] in ("$'", '$"') or ch in ("'", '"'):
-        return _enter_quote(line, pos, state)
-    return None
-
-
-def _step_sub(line: str, pos: int, state: _LexState) -> int | None:
-    """Open or close command substitutions at $( and unescaped backticks."""
-    if line[pos] == "`":
-        if state.sub_kind == "`":
-            _pop_sub(state)
-        else:
-            _push_sub(state, "`")
-        return pos + 1
-    if line[pos : pos + 2] == "$(" and line[pos : pos + 3] != "$((":
-        _push_sub(state, "$(")
-        return pos + 2
-    return None
-
-
-def _close_arith_paren(state: _LexState) -> None:
-    """Decrement arithmetic parenthesis depth and restore word boundary on closure."""
-    state.arith_depth -= 1
-    if state.arith_depth > 0:
-        state.word_start = True
-    elif state.sub_kind == "$((":
-        _pop_sub(state)
-    else:
-        state.word_start = not state.arith_word
-        state.arith_word = False
-
-
-def _enter_arith(line: str, pos: int, state: _LexState) -> int | None:
-    """Enter $(( or (( arithmetic mode from unquoted non-arithmetic text."""
-    if line[pos : pos + 3] == "$((":
-        _note_non_keyword(state)
-        state.arith_depth = 2
-        state.arith_word = True
-        state.word_start = True
-        return pos + 3
-    in_pat = bool(state.cases and state.cases[-1] in ("pat", "pat_seen"))
-    if line[pos : pos + 2] == "((" and not in_pat:
-        state.arith_depth = 2
-        state.arith_word = False
-        state.word_start = True
-        return pos + 2
-    return None
-
-
-def _step_arith(line: str, pos: int, state: _LexState) -> int | None:
-    """Track $(( and (( arithmetic parenthesis depth at one unquoted position."""
-    if state.arith_depth == 0:
-        return _enter_arith(line, pos, state)
-    if line[pos : pos + 3] == "$((":
-        state.arith_depth += 2
-        state.word_start = True
-        return pos + 3
-    if line[pos] == "(":
-        state.arith_depth += 1
-        state.word_start = True
-        return pos + 1
-    if line[pos] == ")":
-        _close_arith_paren(state)
-        return pos + 1
-    return None
-
-
-def _step_open_case(tok: str, state: _LexState) -> bool:
-    """Advance an already-open case frame if tok belongs to its header or close."""
-    top = state.cases[-1]
-    if top == "word":
-        state.cases[-1] = "in"
-        return True
-    if top == "in":
-        if tok == "in":
-            state.cases[-1] = "pat"
-        else:
-            state.cases.pop()
-        return True
-    if top in ("pat", "pat_seen", "pat_paren"):
-        if top == "pat":
-            if tok == "esac":
-                state.cases.pop()
-            else:
-                state.cases[-1] = "pat_seen"
-        return True
-    if state.cmd_pos and tok == "esac":
-        state.cases.pop()
-        return True
-    return False
-
-
-def _step_case_word(tok: str, state: _LexState) -> None:
-    """Update case/esac and command-position state inside $(...) for one plain word."""
-    if state.cases and _step_open_case(tok, state):
-        state.cmd_pos = False
-        return
-    if state.cmd_pos:
-        if tok == "case":
-            state.cases.append("word")
-            state.cmd_pos = False
-        elif tok not in _CASE_CMD_WORDS:
-            state.cmd_pos = False
-
-
-def _open_cmdsub_paren(state: _LexState) -> None:
-    """Record an opening parenthesis inside $(...) and mark paren-prefixed case patterns."""
-    if state.cases and state.cases[-1] == "pat":
-        state.cases[-1] = "pat_paren"
-        state.case_parens.append(state.paren_depth)
-    state.paren_depth += 1
-    state.word_start = True
-    state.cmd_pos = True
-
-
-def _close_cmdsub_paren(state: _LexState) -> None:
-    """Handle ) inside $(...) across case patterns, subshells and command-sub closure."""
-    if state.cases and state.cases[-1] in ("pat", "pat_seen"):
-        state.cases[-1] = "body"
-        state.word_start = True
-        state.cmd_pos = True
-        return
-    state.paren_depth -= 1
-    if state.paren_depth == 0:
-        _pop_sub(state)
-        return
-    if (
-        state.cases
-        and state.cases[-1] == "pat_paren"
-        and state.paren_depth == state.case_parens[-1]
-    ):
-        state.cases[-1] = "body"
-        state.case_parens.pop()
-    state.word_start = True
-    state.cmd_pos = True
-
-
-def _step_cmdsub_punct(line: str, pos: int, state: _LexState) -> int | None:
-    """Track case terminators and parentheses inside an active $(...) substitution."""
-    if state.sub_kind != "$(" or state.arith_depth > 0:
-        return None
-    semi3 = line[pos : pos + 3] == ";;&"
-    if semi3 or line[pos : pos + 2] in (";;", ";&"):
-        if state.cases and state.cases[-1] == "body":
-            state.cases[-1] = "pat"
-        state.word_start = True
-        state.cmd_pos = False
-        return pos + 2 + int(semi3)
-    if line[pos] == "(":
-        _open_cmdsub_paren(state)
-        return pos + 1
-    if line[pos] == ")":
-        _close_cmdsub_paren(state)
-        return pos + 1
-    return None
-
-
-def _step_heredoc_op(line: str, pos: int, state: _LexState) -> int | None:
-    """Queue a heredoc delimiter at << outside arithmetic and return the next offset."""
-    if line[pos : pos + 2] != "<<" or line[pos : pos + 3] == "<<=":
-        return None
-    state.word_start = False
-    if state.arith_depth > 0:
-        return pos + 2
-    parsed = _parse_heredoc_at(line, pos + 2, len(line))
-    if parsed is None:
-        return pos + 2
-    state.heredocs.append((parsed[1], parsed[2]))
-    return parsed[0]
-
-
-def _step_plain_word(line: str, pos: int, state: _LexState) -> int:
-    """Advance past an unquoted plain word token and update $(...) case state."""
-    line_len = len(line)
-    end = pos
-    for _ in range(line_len - pos):
-        if end >= line_len or line[end] not in _WORD_TOKEN_CHARS:
-            break
-        end += 1
-    if end == line_len or line[end] in _WORD_DELIMS:
-        _step_case_word(line[pos:end], state)
-    else:
-        _note_non_keyword(state)
-    state.word_start = False
-    return end
-
-
-def _step_word_or_sep(line: str, pos: int, state: _LexState) -> int:
-    """Update word-start and $(...) case state across one unquoted word or delimiter."""
-    ch = line[pos]
-    if state.sub_kind == "$(" and state.arith_depth == 0:
-        if state.word_start and ch in _WORD_TOKEN_CHARS:
-            return _step_plain_word(line, pos, state)
-        if ch in "\n;&|" and (not state.cases or state.cases[-1] == "body"):
-            state.cmd_pos = True
-        elif ch not in " \t\r\n;&|":
-            _note_non_keyword(state)
-    state.word_start = ch in HERESTRING_WORD_STARTS
-    return pos + 1
-
-
-def _step_herestring_or_char(line: str, pos: int, chars: list[str], state: _LexState) -> int:
-    """Blank word-initial fd digits before <<< or advance one unquoted token."""
-    line_len = len(line)
-    ch = line[pos]
-    if state.word_start and "0" <= ch <= "9":
-        fd_end = _herestring_fd_end(line, pos, line_len)
-        if fd_end is not None:
-            chars[pos:fd_end] = [" "] * (fd_end - pos)
-            state.word_start = False
-            return _skip_blanks(line, fd_end + 3, line_len)
-    if line[pos : pos + 3] == "<<<":
-        state.word_start = False
-        return _skip_blanks(line, pos + 3, line_len)
-    hd_next = _step_heredoc_op(line, pos, state)
-    if hd_next is not None:
-        return hd_next
-    return _step_word_or_sep(line, pos, state)
-
-
-def _blank_line(line: str, state: _LexState) -> str:
-    """Blank word-initial fd digits before <<< across one line and update lex state."""
-    chars = list(line)
-    state.continued = False
-    pos = 0
-    line_len = len(line)
-    for _ in range(line_len):
-        if pos >= line_len:
-            break
-        if state.quote is not None:
-            pos = _step_quoted(line, pos, state)
-            continue
-        nxt = _step_escape_or_quote(line, pos, state)
-        if nxt is None:
-            nxt = _step_sub(line, pos, state)
-        if nxt is None:
-            nxt = _step_arith(line, pos, state)
-        if nxt is None:
-            nxt = _step_cmdsub_punct(line, pos, state)
-        if nxt is not None:
-            pos = nxt
-            continue
-        pos = _step_herestring_or_char(line, pos, chars, state)
-    return "".join(chars)
-
-
-def _split_lines_lf(text: str) -> list[str]:
-    """Split shell text on LF only while preserving each terminating LF."""
-    if not text:
-        return []
-    parts = text.split("\n")
-    pending = list(reversed(parts[:-1]))
-    lines: list[str] = []
-    for _ in range(len(pending)):
-        if not pending:
-            break
-        lines.append(pending.pop() + "\n")
-    if parts[-1]:
-        lines.append(parts[-1])
-    return lines
-
-
-def blank_herestring_fds(raw: bytes) -> bytes:
-    """Return equal-length shell bytes with word-initial fd digits before <<< made spaces."""
-    if b"<<<" not in raw:
-        return bytes(raw)
-    lines = _split_lines_lf(raw.decode("utf-8", "surrogateescape"))
-    out_lines: list[str] = []
-    state = _LexState()
-    idx = 0
-    num_lines = len(lines)
-    for _ in range(num_lines):
-        if idx >= num_lines:
-            break
-        line = lines[idx]
-        out_lines.append(_blank_line(line, state))
-        idx += 1
-        if state.quote is None and not state.continued and line.endswith("\n"):
-            for _ in range(len(state.heredocs)):
-                if not state.heredocs:
-                    break
-                delim, tab_strip = state.heredocs.pop(0)
-                end_idx, _ = _consume_heredoc_body(lines, idx, delim, tab_strip)
-                out_lines.extend(lines[idx:end_idx])
-                idx = end_idx
-    return "".join(out_lines).encode("utf-8", "surrogateescape")
 
 
 def _scan_herestrings(command: str) -> tuple[str, dict[str, str], list[str]]:
@@ -885,7 +317,11 @@ def _scan_herestrings(command: str) -> tuple[str, dict[str, str], list[str]]:
             if ch in ("'", '"'):
                 quote = ch
             elif command[pos : pos + 3] == "<<<":
-                pos = _skip_blanks(command, pos + 3, cmd_len)
+                pos += 3
+                for _ in range(cmd_len - pos):
+                    if command[pos] not in " \t":
+                        break
+                    pos += 1
                 val, pos, q_delim = _read_delim(command, pos, cmd_len)
                 tag = f"__RCG_HS_{len(herestrings)}__"
                 herestrings[tag] = val
@@ -949,3 +385,248 @@ def _strip_redirections(tokens: list[str]) -> tuple[list[str], list[str]]:
             continue
         words.append(tok)
     return words, attached
+
+
+def _line_arith_spans(line: bytes) -> list[tuple[int, int]]:
+    """Return byte spans of one-line arithmetic expansions on a line."""
+    spans: list[tuple[int, int]] = []
+    start = 0
+    for _ in range(16):
+        idx = line.find(b"$((", start)
+        if idx < 0:
+            break
+        depth = 1
+        pos = idx + 3
+        while pos < len(line) and depth:
+            if line[pos : pos + 2] == b"((":
+                depth += 1
+                pos += 2
+            elif line[pos : pos + 2] == b"))":
+                depth -= 1
+                pos += 2
+            else:
+                pos += 1
+        if depth == 0:
+            spans.append((idx, pos))
+        start = idx + 3
+    return spans
+
+
+def _shift_allowed(line: bytes, offset: int) -> bool:
+    """Accept << at offset only when it is part of <<< or a one-line arithmetic shift."""
+    if offset + 2 < len(line) and line[offset : offset + 3] == b"<<<":
+        return True
+    if line[offset : offset + 2] != b"<<":
+        return False
+    return any(begin <= offset < end for begin, end in _line_arith_spans(line))
+
+
+def script_blocks_fd_herestring_allowlist(raw: bytes) -> bool:
+    """Return whether script-wide preconditions forbid a descriptor here-string allow-list."""
+    if b"\r" in raw or b"\\\n" in raw or b"`" in raw:
+        return True
+    offset = 0
+    while offset < len(raw):
+        pos = raw.find(b"<<", offset)
+        if pos < 0:
+            break
+        line_start = raw.rfind(b"\n", 0, pos) + 1
+        line_end = raw.find(b"\n", pos)
+        if line_end < 0:
+            line_end = len(raw)
+        line = raw[line_start:line_end]
+        local = pos - line_start
+        if not _shift_allowed(line, local):
+            return True
+        offset = pos + 2
+    return False
+
+
+def _parse_herestring_word(line: bytes, pos: int) -> int | None:
+    """Return the byte offset after one here-string word starting at pos."""
+    end: int | None = None
+    if pos < len(line) and line[pos] == ord(b"'"):
+        stop = line.find(b"'", pos + 1)
+        end = stop + 1 if stop >= 0 else None
+    elif pos < len(line) and line[pos] == ord(b'"'):
+        stop = line.find(b'"', pos + 1)
+        if stop >= 0:
+            inner = line[pos + 1 : stop]
+            if b"$(" not in inner and b"`" not in inner and _DQ_TAIL_INNER.fullmatch(inner):
+                end = stop + 1
+    else:
+        match = _TAIL_WORD.match(line, pos)
+        end = match.end() if match else None
+    return end
+
+
+def _redirect_target_slice(line: bytes, pos: int) -> tuple[int, bytes] | None:
+    """Return the index after one redirect target word and the target bytes."""
+    while pos < len(line) and line[pos : pos + 1] in (b" ", b"\t"):
+        pos += 1
+    word_end = _parse_herestring_word(line, pos)
+    if word_end is not None:
+        return word_end, line[pos:word_end]
+    match = _TAIL_WORD.match(line, pos)
+    if match:
+        return match.end(), line[pos : match.end()]
+    return None
+
+
+def _append_redirect_target(line: bytes, pos: int, targets: list[bytes]) -> int | None:
+    """Parse a redirect with a target word and append the target bytes."""
+    taken = _redirect_target_slice(line, pos)
+    if taken is None:
+        return None
+    targets.append(taken[1])
+    return taken[0]
+
+
+def _parse_digit_redirect(line: bytes, pos: int, targets: list[bytes]) -> int | None:
+    """Parse a one-digit fd redirect or duplicator starting at pos."""
+    if pos + 1 < len(line) and line[pos + 1 : pos + 3] == b">&":
+        if pos + 3 >= len(line) or not (ord(b"0") <= line[pos + 3] <= ord(b"9")):
+            return None
+        return pos + 4
+    if pos + 2 < len(line) and line[pos + 1 : pos + 3] == b">>":
+        return _append_redirect_target(line, pos + 3, targets)
+    if pos + 1 < len(line) and line[pos + 1 : pos + 2] in (b">", b"<"):
+        return _append_redirect_target(line, pos + 2, targets)
+    return None
+
+
+def _parse_tail_redirect(line: bytes, pos: int, targets: list[bytes]) -> int | None:
+    """Parse one redirection starting at pos or return None on rejection."""
+    while pos < len(line) and line[pos : pos + 1] in (b" ", b"\t"):
+        pos += 1
+    if pos >= len(line):
+        return len(line)
+    next_pos: int | None = None
+    if line[pos : pos + 2] == b">&":
+        next_pos = (
+            pos + 3 if pos + 2 < len(line) and ord(b"0") <= line[pos + 2] <= ord(b"9") else None
+        )
+    elif ord(b"0") <= line[pos] <= ord(b"9"):
+        next_pos = _parse_digit_redirect(line, pos, targets)
+    elif line[pos : pos + 2] == b">>":
+        next_pos = _append_redirect_target(line, pos + 2, targets)
+    elif line[pos : pos + 1] in (b">", b"<"):
+        next_pos = _append_redirect_target(line, pos + 1, targets)
+    return next_pos
+
+
+def _tail_line_suffix_valid(line: bytes, digit: int) -> tuple[bool, list[bytes]]:
+    """Validate the tail suffix from a descriptor digit through end of line."""
+    if line[digit + 1 : digit + 4] != b"<<<":
+        return False, []
+    pos = digit + 4
+    while pos < len(line) and line[pos : pos + 1] == b" ":
+        pos += 1
+    word_end = _parse_herestring_word(line, pos)
+    if word_end is None:
+        return False, []
+    pos = word_end
+    targets: list[bytes] = []
+    for _ in range(8):
+        nxt = _parse_tail_redirect(line, pos, targets)
+        if nxt is None:
+            return False, []
+        pos = nxt
+        if pos >= len(line):
+            break
+    while pos < len(line) and line[pos : pos + 1] == b" ":
+        pos += 1
+    return pos >= len(line), targets
+
+
+def descriptor_tail_mark_count(raw: bytes) -> int:
+    """Count descriptor digit occurrences immediately followed by <<< in raw script bytes."""
+    count = 0
+    line_start = 0
+    for _ in range(256):
+        if line_start >= len(raw):
+            break
+        line_end = raw.find(b"\n", line_start)
+        if line_end < 0:
+            line_end = len(raw)
+        line = raw[line_start:line_end]
+        count += len(_TAIL_MARK.findall(line))
+        line_start = line_end + 1
+    return count
+
+
+def find_descriptor_herestring_tail(raw: bytes) -> tuple[int, int, int, list[bytes]] | None:
+    """Locate exactly one allowed descriptor here-string tail line in raw script bytes."""
+    if script_blocks_fd_herestring_allowlist(raw):
+        return None
+    marks: list[tuple[bytes, int, int, int]] = []
+    line_start = 0
+    for _ in range(256):
+        if line_start >= len(raw):
+            break
+        line_end = raw.find(b"\n", line_start)
+        if line_end < 0:
+            line_end = len(raw)
+        line = raw[line_start:line_end]
+        for match in _TAIL_MARK.finditer(line):
+            marks.append((line, match.start(1), line_start, line_end))
+        line_start = line_end + 1
+    if len(marks) != 1:
+        return None
+    line, digit, line_start, line_end = marks[0]
+    ok, targets = _tail_line_suffix_valid(line, digit)
+    if not ok:
+        return None
+    return line_start + digit, line_start, line_end, targets
+
+
+def collect_error_nodes(root: object) -> list[tuple[int, int]]:
+    """Collect ERROR node byte spans from a syntax tree with a bounded walk."""
+    stack = [root]
+    spans: list[tuple[int, int]] = []
+    for _ in range(4096):
+        if not stack:
+            break
+        node = stack.pop()
+        if node.type == "ERROR":
+            spans.append((node.start_byte, node.end_byte))
+        stack.extend(node.children)
+    return spans
+
+
+_BLOCKED_ANCESTORS = frozenset(
+    {
+        "function_definition",
+        "if_statement",
+        "elif_clause",
+        "else_clause",
+        "for_statement",
+        "while_statement",
+        "until_statement",
+        "case_statement",
+        "case_item",
+        "compound_statement",
+        "subshell",
+    }
+)
+
+
+def tail_line_is_toplevel(root: object, digit_byte: int) -> bool:
+    """Return whether a tail digit sits on a top-level simple command line."""
+    node = root.descendant_for_byte_range(digit_byte, digit_byte + 1)
+    cur = node
+    for _ in range(32):
+        if cur is None or cur.type == "program":
+            return cur is not None
+        if cur.type in _BLOCKED_ANCESTORS:
+            return False
+        cur = cur.parent
+    return False
+
+
+def errors_within_tail_span(
+    errors: list[tuple[int, int]], digit_byte: int, line_end: int, raw_len: int
+) -> bool:
+    """Return whether every ERROR span lies inside the tail digit through line end."""
+    limit = line_end + 1 if line_end < raw_len else line_end
+    return all(start >= digit_byte and end <= limit for start, end in errors)

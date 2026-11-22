@@ -1795,6 +1795,17 @@ class ForgeFileCountTest(unittest.TestCase):
             f"{API}/pulls/25879/files?limit=50&page=1": self.rows,
         }
 
+    def own_zero_overlap_answers(self) -> dict:
+        """Serve pull 25879 at changed_files zero beside one overlapping list candidate."""
+        write_manifest(self.root, [manifest_entry(25879)])
+        url = f"{API}/pulls/25879/files?limit=50&page=1"
+        return {
+            f"{API}/pulls/25879": COUNT_PULL | {"changed_files": 0},
+            url: self.rows,
+            self.page: [forge_pull(10) | {"changed_files": 1}],
+            f"{API}/pulls/10/files?limit=50&page=1": [{"filename": "file-3.c"}],
+        }
+
     def test_candidate_integer_count_reads_endpoint_and_reports_overlap(self) -> None:
         """Read integer-count candidate names from the endpoint and preserve overlap."""
         forge = FakeForge(self.candidate_answers())
@@ -1813,6 +1824,16 @@ class ForgeFileCountTest(unittest.TestCase):
                 forge = FakeForge(answers)
                 self.assertEqual(run_cli(self.root, forge, "check"), (0, "", ""))
                 self.assertEqual(forge.read.count(url), 1)
+
+    def test_own_pull_zero_changed_files_reports_overlap(self) -> None:
+        """Zero changed_files on the own pull still resolves names and reports file overlap."""
+        url = f"{API}/pulls/25879/files?limit=50&page=1"
+        forge = FakeForge(self.own_zero_overlap_answers())
+        rc, out, err = run_cli(self.root, forge, "check")
+        self.assertEqual((rc, err), (1, ""))
+        self.assertEqual(forge.read.count(url), 1)
+        self.assertIn("25879 10", out)
+        self.assertIn("same-files", out)
 
     def test_shared_endpoint_name_reports_candidate_overlap(self) -> None:
         """A candidate whose file list shares an endpoint name must print an overlap line."""

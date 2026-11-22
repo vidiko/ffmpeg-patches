@@ -96,7 +96,7 @@ index b1656f0f803081cecc0f9ac7136c2d08d0494ca1..231c6b67c5dd7564633dc0801adc81cf
  iccgen_filter_deps="lcms2"
  identity_filter_select="scene_sad"
 diff --git a/doc/filters.texi b/doc/filters.texi
-index 459af37f9eb6190eb44c940d63e78638557577a1..999aef0c6c2177e7525148700d4fc645798576a3 100644
+index 86294f40d36f4f4c0ceaa7b9bc110c3b8e987049..525706fc0c42450387d7d31f4038df39050fdde0 100644
 --- a/doc/filters.texi
 +++ b/doc/filters.texi
 @@ -15792,6 +15792,55 @@ The command accepts the same syntax of the corresponding option.

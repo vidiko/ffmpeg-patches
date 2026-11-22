@@ -47,7 +47,7 @@ index d386cc831d5e7265f8f73f42692a91ea57bdf4cb..0ebe83a5ae70d894b284b8715cc98628
  iccdetect_filter_deps="lcms2"
  iccgen_filter_deps="lcms2"
 diff --git a/doc/filters.texi b/doc/filters.texi
-index 8d7032c74cbfbc9ca215c19e6875ea19726f5c5c..551277d920bb0d669640904835ccd5ec9462e104 100644
+index 37b9bcaebc7ff97fefa3158bd6cfa6649201ceb7..fcbb25ca0d56d0d2828392a269cab7f887f39ed9 100644
 --- a/doc/filters.texi
 +++ b/doc/filters.texi
 @@ -15857,6 +15857,39 @@ The filter accepts the same options as @ref{hqdn3d}:

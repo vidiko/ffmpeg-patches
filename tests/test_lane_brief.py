@@ -678,34 +678,260 @@ class LaneBriefTest(unittest.TestCase):
         rc, error = self.check_snippet(f"HEAD {commit}0 (origin/main)\n", worktree=worktree)
         self.assertEqual(rc, 0, error)
 
+    def nested_commit_fixture(self) -> tuple[Path, str, str]:
+        """Create a worktree repository with a distinct nested repository under sub/nested."""
+        worktree, outer_commit = self.commit_fixture()
+        nested = worktree / "sub" / "nested"
+        nested.parent.mkdir(parents=True)
+        repo(nested)
+        run_git(nested, "commit", "-q", "--allow-empty", "-m", "nested-only", preserve_config=True)
+        nested_commit = run_git(nested, "rev-parse", "HEAD", preserve_config=True)
+        self.assertNotEqual(nested_commit, outer_commit)
+        return worktree, outer_commit, nested_commit
+
     def test_conflict_case_4e_fail_closed(self) -> None:
         """Fail closed with exit 2 for case 4e when the worktree or Git fails."""
         worktree, commit = self.commit_fixture()
+        resolved_top = f"{worktree.resolve()}\n"
         not_repo = self.root / "not_repo"
         not_repo.mkdir()
-        # Stop Git from walking up to an ancestor checkout when TMPDIR sits inside a worktree.
         (not_repo / ".git").write_text("gitdir: missing\n", encoding="utf-8")
-        rc, error = self.check_snippet(f"HEAD {commit} (origin/main)\n", worktree=not_repo)
+        with self.subTest(case="not_repo"):
+            rc, error = self.check_snippet(f"HEAD {commit} (origin/main)\n", worktree=not_repo)
+            self.assertEqual(rc, 2, error)
+            self.assertIn("could not resolve", error)
+            self.assertIn(commit, error)
+        for case, stderr, expected in (
+            ("corrupt_repo", "corrupt repo", "corrupt repo"),
+            ("empty_stderr", "", "git cat-file exited 128"),
+        ):
+            with self.subTest(case=case):
+
+                def fake_git(
+                    args: list[str], text: str = stderr
+                ) -> subprocess.CompletedProcess[str]:
+                    """Stub toplevel resolution and a failing cat-file probe."""
+                    if "--show-toplevel" in args:
+                        return subprocess.CompletedProcess(args, 0, resolved_top, "")
+                    if "cat-file" in args:
+                        return subprocess.CompletedProcess(args, 128, "", text)
+                    return subprocess.CompletedProcess(args, 0, "", "")
+
+                with patch.object(lane_isolation, "run_git", side_effect=fake_git):
+                    rc, error = self.check_snippet(
+                        f"HEAD {commit} (origin/main)\n", worktree=worktree
+                    )
+                self.assertEqual(rc, 2, error)
+                self.assertIn(expected, error)
+        with self.subTest(case="timed_out"):
+
+            def timeout_git(args: list[str]) -> subprocess.CompletedProcess[str]:
+                """Raise an isolation timeout on the repository-root query."""
+                if "--show-toplevel" in args:
+                    raise lane_isolation.IsolationError("timed out")
+                return subprocess.CompletedProcess(args, 0, f"{worktree / '.git'}\n", "")
+
+            with patch.object(lane_isolation, "run_git", side_effect=timeout_git):
+                rc, error = self.check_snippet(f"HEAD {commit} (origin/main)\n", worktree=worktree)
+            self.assertEqual(rc, 2, error)
+            self.assertIn("timed out", error)
+
+    def test_conflict_stub_c1_passes(self) -> None:
+        """Pass stub c1 recording a host-ran make verify-all line under Never run."""
+        rc, error = self.check_snippet(
+            "limits: Never run make verify-all, lefthook or praetorctl.\n"
+            "- host ran: `make verify-all` (rc 0)\n"
+        )
+        self.assertEqual(rc, 0, error)
+
+    def test_conflict_stub_c2_passes(self) -> None:
+        """Pass stub c2 recording a host-ran make target under a praetorctl ban."""
+        rc, error = self.check_snippet(
+            "limits: Never run lefthook or praetorctl.\n- host ran: `make fate-vvc` (rc 0)\n"
+        )
+        self.assertEqual(rc, 0, error)
+
+    def test_conflict_stub_c3_passes(self) -> None:
+        """Pass stub c3 forbidding a one-line join under a 100-column limit."""
+        rc, error = self.check_snippet(
+            "no line you write longer than 100 columns.\n"
+            "- do not join the declaration onto one line.\n"
+        )
+        self.assertEqual(rc, 0, error)
+
+    def test_conflict_stub_c4_passes(self) -> None:
+        """Pass stub c4 checking awk field length rather than whole-line length."""
+        rc, error = self.check_snippet("- check `awk 'length($1) == 40' refs.txt`\n")
+        self.assertEqual(rc, 0, error)
+
+    def test_conflict_stub_c5_passes(self) -> None:
+        """Pass stub c5 carrying an external 40-hex commit inside a URL token."""
+        worktree, _ = self.commit_fixture()
+        rc, error = self.check_snippet(
+            "see https://example.org/commit/1111111111111111111111111111111111111111 for context\n",
+            worktree=worktree,
+        )
+        self.assertEqual(rc, 0, error)
+
+    def test_conflict_stub_c7_exits_2(self) -> None:
+        """Fail closed with exit 2 for stub c7 on a plain subdirectory inside a checkout."""
+        worktree, commit = self.commit_fixture()
+        plain = worktree / "notrepo"
+        plain.mkdir()
+        self.assertFalse((plain / ".git").exists())
+        rc, error = self.check_snippet(f"base {commit}\n", worktree=plain)
         self.assertEqual(rc, 2, error)
         self.assertIn("could not resolve", error)
         self.assertIn(commit, error)
-        with (
-            patch.object(lane_isolation, "common_dir", return_value=worktree / ".git"),
-            patch.object(
-                lane_isolation,
-                "run_git",
-                return_value=subprocess.CompletedProcess([], 128, "", "corrupt repo"),
+
+    def test_conflict_stub_c8_passes(self) -> None:
+        """Pass stub c8 when backtick spans appear inside the Never run clause itself."""
+        rc, error = self.check_snippet("Never run `make verify-all` or `praetorctl`.\n")
+        self.assertEqual(rc, 0, error)
+
+    def test_conflict_make_branch_allowances_pass(self) -> None:
+        """Pass make spans with except-admit, scoped praetorctl bans, or verify-all spans."""
+        for snippet in (
+            "limits: Never run lefthook or praetorctl except praetorctl admit.\n- `make fate-x`\n",
+            "limits: Never run praetorctl gate.\n- `make fate-x`\n",
+            "limits: Never run praetorctl admit.\n- `make fate-x`\n",
+            "limits: Never run make verify-all or praetorctl.\nSee `make verify-all`.\n",
+        ):
+            with self.subTest(snippet=snippet):
+                rc, error = self.check_snippet(snippet)
+                self.assertEqual(rc, 0, error)
+
+    def test_conflict_make_verify_all_ban_still_refuses_make(self) -> None:
+        """Refuse a make span outside Never run when the clause only bans make verify-all."""
+        rc, error = self.check_snippet(
+            "limits: Never run make verify-all or praetorctl.\n- `make fate-x`\n"
+        )
+        self.assertEqual(rc, 1, error)
+        self.assertIn("conflict:", error)
+
+    def test_conflict_join_negations_and_records_pass(self) -> None:
+        """Pass negated join clauses and finding or host-ran lines under a column limit."""
+        for snippet in (
+            "at most 100 cols.\n- don't join the call onto one line.\n",
+            "at most 100 cols.\n- never let the call go to one line.\n",
+            (
+                "no line you write longer than 100 columns.\n"
+                "  - finding: round 1 joined the call into one line.\n"
+            ),
+            (
+                "no line you write longer than 100 columns.\n"
+                "- host ran: joined the call into one line.\n"
             ),
         ):
-            rc, error = self.check_snippet(f"HEAD {commit} (origin/main)\n", worktree=worktree)
-        self.assertEqual(rc, 2, error)
-        self.assertIn("corrupt repo", error)
-        with patch.object(
-            lane_isolation, "common_dir", side_effect=lane_isolation.IsolationError("timed out")
+            with self.subTest(snippet=snippet):
+                rc, error = self.check_snippet(snippet)
+                self.assertEqual(rc, 0, error)
+
+    def test_conflict_join_after_negated_sentence_refused(self) -> None:
+        """Refuse a join phrase in a later sentence after an earlier negated sentence."""
+        for snippet in (
+            (
+                "no line you write longer than 100 columns.\n"
+                "Do not touch the header. Join the call onto one line.\n"
+            ),
+            (
+                "no line you write longer than 100 columns.\n"
+                "Do not join the header onto one line. Join the call onto one line.\n"
+            ),
         ):
-            rc, error = self.check_snippet(f"HEAD {commit} (origin/main)\n", worktree=worktree)
+            with self.subTest(snippet=snippet):
+                rc, error = self.check_snippet(snippet)
+                self.assertEqual(rc, 1, error)
+                self.assertIn("conflict:", error)
+
+    def test_conflict_whole_file_skipped_contexts_pass(self) -> None:
+        """Pass whole-file length spans inside Never run or host-ran lines and 1-digit dots."""
+        for snippet in (
+            "limits: Never run `wc -L tests/checkasm/vvc_mc.c`.\n",
+            "- host ran: `wc -L tests/checkasm/vvc_mc.c` (rc 0)\n",
+            "- `rg 'foo.{2}bar' a.c`\n",
+        ):
+            with self.subTest(snippet=snippet):
+                rc, error = self.check_snippet(snippet)
+                self.assertEqual(rc, 0, error)
+
+    def test_conflict_whole_file_extra_forms_refused(self) -> None:
+        """Refuse bare awk length, empty-arg length, gawk, rg, and wc --max-line-length."""
+        for snippet in (
+            "- `awk 'length > 100' a.c`\n",
+            "- `awk 'length() > 100' a.c`\n",
+            "- `gawk 'length($0) > 100' a.c`\n",
+            "- `rg '.{101}' a.c`\n",
+            "- `wc --max-line-length a.c`\n",
+        ):
+            with self.subTest(snippet=snippet):
+                rc, error = self.check_snippet(snippet)
+                self.assertEqual(rc, 1, error)
+                self.assertIn("conflict:", error)
+
+    def test_conflict_nested_repository_passes(self) -> None:
+        """Accept a 40-hex commit held by a nested repository named with git -C."""
+        worktree, _, nested_commit = self.nested_commit_fixture()
+        snippet = f"- `git -C sub/nested rev-parse HEAD`\nHEAD {nested_commit}\n"
+        rc, error = self.check_snippet(snippet, worktree=worktree)
+        self.assertEqual(rc, 0, error)
+
+    def test_conflict_nested_repository_without_git_c_refused(self) -> None:
+        """Refuse a nested repository commit when the brief omits git -C for it."""
+        worktree, _, nested_commit = self.nested_commit_fixture()
+        rc, error = self.check_snippet(f"HEAD {nested_commit}\n", worktree=worktree)
+        self.assertEqual(rc, 1, error)
+        self.assertIn("conflict:", error)
+        self.assertIn(nested_commit, error)
+
+    def test_conflict_nested_repository_outside_worktree_refused(self) -> None:
+        """Ignore a git -C relative path that leaves the worktree via two dots."""
+        worktree, _ = self.commit_fixture()
+        outside = repo(self.root / "outside")
+        run_git(
+            outside, "commit", "-q", "--allow-empty", "-m", "outside-only", preserve_config=True
+        )
+        outside_commit = run_git(outside, "rev-parse", "HEAD", preserve_config=True)
+        snippet = f"- `git -C ../outside rev-parse HEAD`\nHEAD {outside_commit}\n"
+        rc, error = self.check_snippet(snippet, worktree=worktree)
+        self.assertEqual(rc, 1, error)
+        self.assertIn("conflict:", error)
+        self.assertIn(outside_commit, error)
+
+    def test_conflict_plain_slash_object_path_refused(self) -> None:
+        """Check a 40-hex name after a plain slash when no URL scheme separator is present."""
+        worktree, commit = self.commit_fixture()
+        missing = commit[:7] + ("0" * 33)
+        rc, error = self.check_snippet(f"see refs/x/{missing} in tree\n", worktree=worktree)
+        self.assertEqual(rc, 1, error)
+        self.assertIn("conflict:", error)
+        self.assertIn(missing, error)
+
+    def test_conflict_nested_probe_error_and_cap(self) -> None:
+        """Fail closed on nested Git errors and ignore non-root or excess git -C paths."""
+        worktree, _, nested_commit = self.nested_commit_fixture()
+        (worktree / "plain").mkdir()
+        extra = " ".join(f"`git -C plain{i} status`" for i in range(8))
+        rc, error = self.check_snippet(
+            f"{extra} `git -C sub/nested status`\nHEAD {nested_commit}\n", worktree=worktree
+        )
+        self.assertEqual(rc, 1, error)
+        nested_path = str((worktree / "sub" / "nested").resolve())
+        real_run_git = lane_isolation.run_git
+
+        def fail_nested_probe(args: list[str]) -> subprocess.CompletedProcess[str]:
+            """Fail cat-file on the nested repository with exit status 128."""
+            if "cat-file" in args and nested_path in args:
+                return subprocess.CompletedProcess(args, 128, "", "nested broken")
+            return real_run_git(args)
+
+        with patch.object(lane_isolation, "run_git", side_effect=fail_nested_probe):
+            rc, error = self.check_snippet(
+                f"- `git -C plain status`\n- `git -C sub/nested status`\nHEAD {nested_commit}\n",
+                worktree=worktree,
+            )
         self.assertEqual(rc, 2, error)
-        self.assertIn("timed out", error)
+        self.assertIn("nested broken", error)
 
     def test_conflict_alternate_forms_refused(self) -> None:
         """Refuse alternate column-limit, one-line join, and ERE grep length forms."""

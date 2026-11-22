@@ -50,7 +50,7 @@ FORBIDDEN_PRAETORCTL = re.compile(r"\bpraetorctl\b(?!\s+(?:gate|admit)\b)", re.I
 ALLOWED_ADMIT = re.compile(r"\bexcept\b[^.;\n]*\badmit\b", re.IGNORECASE)
 FORBIDDEN_MAKE = re.compile(r"\bmake\b(?!\s+verify-all\b)", re.IGNORECASE)
 BACKTICK_SPAN = re.compile(r"(?<!`)`([^`]+)`(?!`)")
-MAKE_INVOCATION = re.compile(r"(?<![.-])\bmake\b(?![/.-])")
+MAKE_INVOCATION = re.compile(r"(?<![.-])\bmake\b(?![/.-])(?!\s+(?i:verify-all)\b)")
 COLUMN_LIMIT = re.compile(
     r"(?:\b(?:(?:longer|more)\s+than|over|at\s+most)\s+|<=\s*)\d{2,3}\s+col(?:umn)?s\b",
     re.IGNORECASE,
@@ -64,13 +64,18 @@ ONE_LINE_JOIN = re.compile(
     r")\b",
     re.IGNORECASE,
 )
+JOIN_NEGATION = re.compile(r"\b(?:not|never|no|don't)\b", re.IGNORECASE)
+JOIN_BOUNDARY = re.compile(r"[;]|[.!?]\s+|\n[ \t]*(?:\n|[-*+#]|\d+[.)][ \t]|\w+:)")
+FINDING_PREFIX = re.compile(r"^[ \t]*(?:(?:[-*+]|\d+[.)])[ \t]+)*finding:", re.IGNORECASE)
 WHOLE_FILE_LENGTH = re.compile(
-    r"\b[gmn]?awk\b[\s\S]*?\blength\s*\("
-    r"|\b(?:[ef]?grep|rg)\b[\s\S]*?(?<!\\)\.\\?\{\d+(?:,\d*)?\\?\}"
+    r"\b[gmn]?awk\b[\s\S]*?(?<![/.-])\blength\b(?:\s*\(\s*(?:\$0\s*)?\)|(?![/.-]|\s*\())"
+    r"|\b(?:[ef]?grep|rg)\b[\s\S]*?(?<!\\)\.\\?\{\d{2,3}(?:,\d*)?\\?\}"
     r"|\bwc\s+(?:-[a-zA-Z]*L\b|--max-line-length\b)"
 )
 GIT_DIFF_COMMAND = re.compile(r"\bgit\b[^|;&]*\bdiff\b")
 STANDALONE_OBJECT = re.compile(r"(?<![0-9a-fA-F])[0-9a-f]{40}(?![0-9a-fA-F])")
+NESTED_GIT_C = re.compile(r"""\bgit\s+-C\s+("[^"\n]+"|'[^'\n]+'|[^\s`'";,|&()<>]+)""")
+MAX_NESTED_REPOS = 8
 
 
 def validate_lines(lines: list[bytes], label: str) -> None:
@@ -314,6 +319,25 @@ def check_isolation(worktree: Path) -> int:
     return 0
 
 
+def line_slice(content: str, start: int, end: int) -> str:
+    """Return the full line or lines spanning start through end in content."""
+    line_start = content.rfind("\n", 0, start) + 1
+    line_end = content.find("\n", end)
+    return content[line_start : len(content) if line_end < 0 else line_end]
+
+
+def non_clause_spans(content: str) -> list[re.Match[str]]:
+    """Return inline backtick matches that lie outside every Never run clause."""
+    clauses = list(NEVER_RUN_CLAUSE.finditer(content))
+    return [
+        match
+        for match in BACKTICK_SPAN.finditer(content)
+        if not any(
+            clause.start() <= match.start() and match.end() <= clause.end() for clause in clauses
+        )
+    ]
+
+
 def conflict_make_without_praetorctl(content: str) -> str:
     """Report a brief that runs make while forbidding praetorctl in Never run."""
     clauses = [match.group(0) for match in NEVER_RUN_CLAUSE.finditer(content)]
@@ -330,8 +354,9 @@ def conflict_make_without_praetorctl(content: str) -> str:
     make_span = next(
         (
             match.group(1)
-            for match in BACKTICK_SPAN.finditer(content)
-            if MAKE_INVOCATION.search(match.group(1))
+            for match in non_clause_spans(content)
+            if "host ran" not in line_slice(content, match.start(), match.end()).lower()
+            and MAKE_INVOCATION.search(match.group(1))
         ),
         "",
     )
@@ -345,11 +370,29 @@ def conflict_make_without_praetorctl(content: str) -> str:
     )
 
 
+def join_is_excluded(content: str, match: re.Match[str]) -> bool:
+    """Return whether a one-line join match is negated or sits on a record line."""
+    line = line_slice(content, match.start(), match.end())
+    if FINDING_PREFIX.match(line) or "host ran" in line.lower():
+        return True
+    earlier = JOIN_BOUNDARY.split(content[: match.start()])[-1]
+    return bool(JOIN_NEGATION.search(earlier))
+
+
 def conflict_join_under_column_limit(content: str) -> str:
     """Report a brief that sets a column limit and asks to join code onto one line."""
     limit_match = COLUMN_LIMIT.search(content)
-    join_match = ONE_LINE_JOIN.search(content)
-    if not limit_match or not join_match:
+    if not limit_match:
+        return ""
+    join_match = next(
+        (
+            match
+            for match in ONE_LINE_JOIN.finditer(content)
+            if not join_is_excluded(content, match)
+        ),
+        None,
+    )
+    if join_match is None:
         return ""
     limit_text = " ".join(limit_match.group(0).split())
     join_text = " ".join(join_match.group(0).split())
@@ -358,7 +401,9 @@ def conflict_join_under_column_limit(content: str) -> str:
 
 def conflict_whole_file_length_check(content: str) -> str:
     """Report a backtick line-length command that does not read a git diff."""
-    for match in BACKTICK_SPAN.finditer(content):
+    for match in non_clause_spans(content):
+        if "host ran" in line_slice(content, match.start(), match.end()).lower():
+            continue
         span = match.group(1)
         if WHOLE_FILE_LENGTH.search(span) and not GIT_DIFF_COMMAND.search(span):
             span_text = " ".join(span.split())
@@ -366,25 +411,84 @@ def conflict_whole_file_length_check(content: str) -> str:
     return ""
 
 
+def standalone_object_names(content: str) -> list[str]:
+    """Collect unique standalone 40-hex names outside URL tokens in content order."""
+    return list(
+        dict.fromkeys(
+            name
+            for token in content.split()
+            if "://" not in token
+            for name in STANDALONE_OBJECT.findall(token)
+        )
+    )
+
+
+def probe_repository_root(directory: Path) -> tuple[Path | None, str]:
+    """Return the resolved directory when Git reports it as its own root, else an error."""
+    lane_isolation = importlib.import_module("scripts.lane_isolation")
+    result = lane_isolation.run_git(["-C", str(directory), "rev-parse", "--show-toplevel"])
+    toplevel = result.stdout.removesuffix("\n")
+    if result.returncode != 0 or not toplevel:
+        return None, result.stderr.strip() or f"{directory}: not a git worktree"
+    resolved = directory.resolve()
+    if Path(toplevel).resolve() != resolved:
+        return None, f"{directory}: not its own repository root"
+    return resolved, ""
+
+
+def valid_nested_root(path: Path, worktree_root: Path) -> bool:
+    """Return whether path is a repository root strictly inside worktree_root."""
+    if path == worktree_root or not path.is_relative_to(worktree_root):
+        return False
+    return probe_repository_root(path)[0] is not None
+
+
+def nested_repositories(content: str, worktree_root: Path) -> list[Path]:
+    """Collect up to 8 resolved nested repository roots named with git -C."""
+    candidates: list[Path] = []
+    for match in list(NESTED_GIT_C.finditer(content))[:MAX_LINES]:
+        raw = match.group(1).strip("\"'")
+        if Path(raw).is_absolute():
+            continue
+        resolved = (worktree_root / raw).resolve()
+        if resolved not in candidates:
+            candidates.append(resolved)
+        if len(candidates) >= MAX_NESTED_REPOS:
+            break
+    return [path for path in candidates if valid_nested_root(path, worktree_root)]
+
+
+def object_exists(repositories: list[Path], name: str) -> bool:
+    """Return whether name exists in any repository, raising IsolationError on Git error."""
+    lane_isolation = importlib.import_module("scripts.lane_isolation")
+    for repository in repositories:
+        probe = lane_isolation.run_git(["-C", str(repository), "cat-file", "-e", name])
+        if probe.returncode == 0:
+            return True
+        if probe.returncode != 1:
+            detail = probe.stderr.strip() or f"git cat-file exited {probe.returncode}"
+            raise lane_isolation.IsolationError(detail)
+    return False
+
+
 def conflict_missing_object(content: str, worktree: Path) -> str:
-    """Report a standalone 40-hex object name that the worktree does not hold."""
-    names = list(dict.fromkeys(STANDALONE_OBJECT.findall(content)))
+    """Report a standalone 40-hex object name absent from the worktree and nested repos."""
+    names = standalone_object_names(content)
     if not names:
         return ""
     lane_isolation = importlib.import_module("scripts.lane_isolation")
     current = names[0]
     try:
-        lane_isolation.common_dir(worktree)
+        worktree_root, root_error = probe_repository_root(worktree)
+        if worktree_root is None:
+            raise lane_isolation.IsolationError(root_error)
+        repositories = [worktree_root, *nested_repositories(content, worktree_root)]
         for current in names:
-            probe = lane_isolation.run_git(["-C", str(worktree), "cat-file", "-e", current])
-            if probe.returncode == 1:
+            if not object_exists(repositories, current):
                 return (
                     f"{current} not in {worktree}: write full names from git rev-parse, "
                     "never extend a short name by hand"
                 )
-            if probe.returncode != 0:
-                detail = probe.stderr.strip() or f"git cat-file exited {probe.returncode}"
-                raise lane_isolation.IsolationError(detail)
     except (lane_isolation.IsolationError, OSError) as error:
         raise lane_isolation.IsolationError(f"could not resolve {current}: {error}") from error
     return ""

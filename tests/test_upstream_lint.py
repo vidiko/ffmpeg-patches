@@ -4332,6 +4332,40 @@ class CRulesTreeTest(_CRulesBlankingMixin, _CRulesFixtureMixin, FixtureTest):
                 self.assertIn(f"{'waived' if unread else 'no waiver'}: {directory}:", step.output)
                 self.assertNotIn(source, step.output)
 
+    def test_scanner_failure_keeps_candidate_waivers_open(self) -> None:
+        """Scanner failure omits scan-candidate paths from the unread waiver report."""
+        directory, source = "libavfilter", "libavfilter/vf_x.c"
+        untouched = "libavutil/none.c"
+        self.write(source, "int ordinary;\n")
+        self.c_rules_json = json.dumps(
+            {
+                "paths": {"scanned": [source]},
+                "results": [],
+                "errors": [
+                    {"type": "Syntax error", "path": source},
+                    {"type": "Unexpected error", "path": source},
+                ],
+            }
+        )
+        waivers = (
+            upstream_lint.UnreadWaiver(source, "fixture", "B", date(2026, 11, 23), False),
+            upstream_lint.UnreadWaiver(untouched, "fixture", "B", date(2026, 11, 23), False),
+            upstream_lint.UnreadWaiver(directory, "fixture", "B", date(2026, 11, 23), False),
+        )
+        with (
+            unittest.mock.patch.object(
+                upstream_lint,
+                "_c_rules_touched",
+                return_value={directory: {1}, source: {1}},
+            ),
+            unittest.mock.patch.object(upstream_lint, "_run", side_effect=self.command),
+        ):
+            step = upstream_lint._c_rules(self.root, self.base, "HEAD", "", waivers)
+        self.assertEqual(step.rc, 2, step.output)
+        self.assertIn(f"waived: {directory}:", step.output)
+        self.assertIn(f"unused waiver: {untouched}", step.output)
+        self.assertNotIn(source, step.output)
+
 
 class CRulesBlankingTest(_CRulesBlankingMixin, unittest.TestCase):
     """Pin discovery, lexical boundaries, scope and unread-source preservation."""
@@ -4891,6 +4925,95 @@ class CRulesBlankingTest(_CRulesBlankingMixin, unittest.TestCase):
         plain = b"#define DECLARE(x) int x;\nDECLARE(a)\nint b;\n"
         expected_plain = b"#define DECLARE(x) int x;\n" + b" " * len(b"DECLARE(a)") + b"\nint b;\n"
         self.assert_blanked(plain, expected_plain)
+
+    def test_split_directive_disables_macro_blanking(self) -> None:
+        """Spliced directive names that disagree with the lexer disable macro-call blanking."""
+        split_else = b"#el\\\nse\n"
+        plain_else = b"#else\n"
+        g1_source = (
+            b"#define VALUE(x) (x)\nstatic int n =\n#if A\n0;\n" + split_else + b"VALUE(1)\n;\n"
+            b"#endif\nint after;\n"
+        )
+        self.assert_blanked(g1_source, g1_source)
+        hash_splice = b"#\\\nelse\n"
+        g1_hash = (
+            b"#define VALUE(x) (x)\nstatic int n =\n#if A\n0;\n" + hash_splice + b"VALUE(1)\n;\n"
+            b"#endif\nint after;\n"
+        )
+        self.assert_blanked(g1_hash, g1_hash)
+        call_body = b"CALL(1)"
+        call_line = call_body + b"\n"
+        attr_line = b"int av_fixture_tag a;\n"
+        split_fixture = (
+            b"#define CALL(x) (x)\n"
+            + attr_line
+            + b"#if A\nint b;\n"
+            + split_else
+            + b"int c;\n#endif\n"
+            + call_line
+            + b"int d;\n"
+        )
+        blanked_attr = b"int " + b" " * len(b"av_fixture_tag") + b" a;\n"
+        expected_split = (
+            b"#define CALL(x) (x)\n"
+            + blanked_attr
+            + b"#if A\nint b;\n"
+            + split_else
+            + b"int c;\n#endif\n"
+            + call_line
+            + b"int d;\n"
+        )
+        self.assert_blanked(split_fixture, expected_split)
+        plain_control = (
+            b"#define CALL(x) (x)\n"
+            + attr_line
+            + b"#if A\nint b;\n"
+            + plain_else
+            + b"int c;\n#endif\n"
+            + call_line
+            + b"int d;\n"
+        )
+        expected_control = (
+            b"#define CALL(x) (x)\n"
+            + blanked_attr
+            + b"#if A\nint b;\n"
+            + plain_else
+            + b"int c;\n#endif\n"
+            + b" " * len(call_body)
+            + b"\nint d;\n"
+        )
+        self.assert_blanked(plain_control, expected_control)
+
+    def test_macro_header_across_conditional_arms_is_kept(self) -> None:
+        """Macro headers are kept only along one preprocessor continuation after the call."""
+        g2_source = (
+            b"#define DECL(x) int x(void)\nDECL(f)\n#if A\n;\n#else\n{ return 0; }\n"
+            b"#endif\nint after;\n"
+        )
+        self.assert_blanked(g2_source, g2_source)
+        g2_variant = (
+            b"#define DECL(x) int x(void)\n#define DECL2(x) int x(int)\n#if A\nDECL(f)\n"
+            b"#else\nDECL2(f)\n#endif\n{\n    return 0;\n}\n"
+        )
+        self.assert_blanked(g2_variant, g2_variant)
+        blanked_if = b"#define DEFINE(x) int x;\n#if CONFIG_X\nDEFINE(foo)\n#endif\nint b;\n"
+        expected_if = (
+            b"#define DEFINE(x) int x;\n#if CONFIG_X\n"
+            + b" " * len(b"DEFINE(foo)")
+            + b"\n#endif\nint b;\n"
+        )
+        self.assert_blanked(blanked_if, expected_if)
+        blanked_else_body = (
+            b"#define DEFINE(x) int x;\n#if CONFIG_X\nDEFINE(foo)\n#else\n{ }\n#endif\nint b;\n"
+        )
+        expected_else_body = (
+            b"#define DEFINE(x) int x;\n#if CONFIG_X\n"
+            + b" " * len(b"DEFINE(foo)")
+            + b"\n#else\n{ }\n#endif\nint b;\n"
+        )
+        self.assert_blanked(blanked_else_body, expected_else_body)
+        nested = b"#define DECLARE(x) int x;\nDECLARE(a)\n#if A\nint b;\n#endif\n"
+        self.assert_blanked(nested, nested)
 
 
 class CRulesTest(unittest.TestCase):

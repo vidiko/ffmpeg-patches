@@ -2519,18 +2519,43 @@ def _c_rules_blank_words(raw: bytes, clean: str, words: re.Pattern[bytes]) -> by
     return bytes(blanked)
 
 
-def _c_rules_depths(lines: list[bytes], code: list[str], directive_count: int) -> list[int]:
-    """Track per-line brace depth across preprocessor conditional arms, or -1 on mismatch."""
-    depths: list[int] = []
-    stack: list[tuple[int, set[int]]] = []
-    depth = 0
-    raw_directives = 0
-    valid = True
+def _c_rules_directive_words(
+    lines: list[bytes], code: list[str], directives: list[str]
+) -> list[bytes] | None:
+    """Map each physical line to its directive word, or None when physical and lexed disagree."""
+    per_line: list[bytes] = []
     for index in range(len(lines)):
         clean = code[index]
         match = re.match(rb"[ \t]*#[ \t]*([A-Za-z_]\w*)", lines[index])
-        word = match[1] if not clean.strip() and match is not None else b""
-        raw_directives += bool(word)
+        word = match.group(1) if not clean.strip() and match is not None else b""
+        per_line.append(word)
+    lexed: list[bytes] = []
+    for index in range(len(directives)):
+        match = re.match(r"(?a)[ \t]*#[ \t]*([A-Za-z_]\w*)", directives[index])
+        lexed.append(match.group(1).encode("ascii") if match else b"")
+    physical = [word for word in per_line if word]
+    logical = [word for word in lexed if word]
+    if len(physical) != len(logical):
+        return None
+    for index in range(len(physical)):
+        if physical[index] != logical[index]:
+            return None
+    return per_line
+
+
+def _c_rules_depths(
+    lines: list[bytes], code: list[str], directive_words: list[bytes] | None
+) -> list[int]:
+    """Track per-line brace depth across preprocessor conditional arms, or -1 on mismatch."""
+    if directive_words is None:
+        return [-1] * len(lines)
+    depths: list[int] = []
+    stack: list[tuple[int, set[int]]] = []
+    depth = 0
+    valid = True
+    for index in range(len(lines)):
+        clean = code[index]
+        word = directive_words[index]
         if word in {b"if", b"ifdef", b"ifndef"} and len(stack) < len(lines):
             stack.append((depth, set()))
         elif word in {b"elif", b"else"} and stack:
@@ -2543,7 +2568,7 @@ def _c_rules_depths(lines: list[bytes], code: list[str], directive_count: int) -
             return [-1] * len(lines)
         depths.append(depth if valid else -1)
         depth += clean.count("{") - clean.count("}")
-    if raw_directives != directive_count or stack:
+    if stack:
         return [-1] * len(lines)
     return depths
 
@@ -2611,7 +2636,7 @@ def _c_rules_scan_line(
 
 
 def _c_rules_arm_state(
-    raw: bytes,
+    word: bytes,
     clean: str,
     state: tuple[int, bool, bool, bool, int, bool, int],
     stack: list[
@@ -2624,8 +2649,6 @@ def _c_rules_arm_state(
     limit: int,
 ) -> tuple[tuple[int, bool, bool, bool, int, bool, int], bool]:
     """Update per-arm boundary, header and initializer state across conditional directives."""
-    match = re.match(rb"[ \t]*#[ \t]*([A-Za-z_]\w*)", raw)
-    word = match[1] if not clean.strip() and match is not None else b""
     if word not in {b"if", b"ifdef", b"ifndef", b"elif", b"else", b"endif"}:
         return state, True
     if word in {b"if", b"ifdef", b"ifndef"} and len(stack) < limit:
@@ -2657,8 +2680,40 @@ def _c_rules_arm_state(
     return (state[0], False, False, False, 0, False, 0), False
 
 
+def _c_rules_blank_call_tail(code: list[str], directive_words: list[bytes], start: int) -> bool:
+    """Walk the single preprocessor path after a macro call and decide whether to blank it."""
+    skip = False
+    nest = 0
+    for index in range(start, len(code)):
+        word = directive_words[index]
+        stripped = code[index].lstrip(" \t\r\f\v")
+        if not skip:
+            if word in {b"if", b"ifdef", b"ifndef"}:
+                return False
+            if word in {b"elif", b"else"}:
+                skip = True
+                nest = 0
+                continue
+            if word == b"endif":
+                continue
+            if word or not stripped:
+                continue
+            return not stripped.startswith("{")
+        if word in {b"if", b"ifdef", b"ifndef"}:
+            nest += 1
+        elif word == b"endif":
+            if nest == 0:
+                skip = False
+            else:
+                nest -= 1
+    return True
+
+
 def _c_rules_blank_call(
-    raw: bytes, clean: str, names: set[str], code: list[str], next_line: int
+    raw: bytes,
+    clean: str,
+    names: set[str],
+    continuation: tuple[list[str], list[bytes], int],
 ) -> bool:
     """Decide whether one boundary line is a standalone macro call not opening a body."""
     invocation = re.fullmatch(rb"[ \t]*([A-Za-z_]\w*)[ \t]*\(.*\)[ \t\r]*", raw)
@@ -2669,11 +2724,8 @@ def _c_rules_blank_call(
         or raw[clean.rfind(")") + 1 :].strip(b" \t\r")
     ):
         return False
-    for index in range(next_line, len(code)):
-        stripped = code[index].lstrip(" \t\r\f\v")
-        if stripped:
-            return not stripped.startswith("{")
-    return True
+    code, directive_words, next_line = continuation
+    return _c_rules_blank_call_tail(code, directive_words, next_line)
 
 
 def _c_rules_blank(source: bytes, attributes: set[bytes]) -> bytes:
@@ -2684,7 +2736,9 @@ def _c_rules_blank(source: bytes, attributes: set[bytes]) -> bytes:
     )
     words = re.compile(rb"\b(?:" + b"|".join(sorted(attributes)) + rb")\b") if attributes else None
     lines = source.split(b"\n")
-    depths = _c_rules_depths(lines, code, len(directives))
+    mapped = _c_rules_directive_words(lines, code, directives)
+    directive_words = mapped if mapped is not None else [b""] * len(lines)
+    depths = _c_rules_depths(lines, code, mapped)
     state = (0, True, False, False, 0, False, 0)
     stack: list[
         tuple[
@@ -2693,16 +2747,17 @@ def _c_rules_blank(source: bytes, attributes: set[bytes]) -> bytes:
             bool,
         ]
     ] = []
-    valid = True
+    valid = mapped is not None
     for index in range(len(lines)):
         raw, clean = lines[index], code[index]
-        state, ok = _c_rules_arm_state(raw, clean, state, stack, len(lines))
+        state, ok = _c_rules_arm_state(directive_words[index], clean, state, stack, len(lines))
         valid = valid and ok
         if (
-            valid
+            mapped is not None
+            and valid
             and depths[index] == 0
             and state[1]
-            and _c_rules_blank_call(raw, clean, names, code, index + 1)
+            and _c_rules_blank_call(raw, clean, names, (code, directive_words, index + 1))
         ):
             lines[index] = re.sub(rb"[^\r]", b" ", raw)
             state = (
@@ -2832,7 +2887,9 @@ def _c_rules(
         )
     if parsed is None:
         step = _c_rules_error(result)
-        unused = _unread_report(prepared_unread, unread_waivers)
+        scan_paths = set(paths)
+        filtered_waivers = tuple(entry for entry in unread_waivers if entry.path not in scan_paths)
+        unused = _unread_report(prepared_unread, filtered_waivers)
         if unused.output:
             output = step.output.rstrip("\n")
             step = Step(step.name, 2, f"{output}\n{unused.output}")

@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, NamedTuple
 
-from scripts.raw_configure_lex import _tokens
+from scripts.raw_configure_lex import _tokens, blank_herestring_fds
 from scripts.raw_configure_unwrap import _unwrap_command
 from scripts.raw_configure_words import (
     CONFIGURE_WORD,
@@ -747,7 +747,7 @@ def _queue_inline(body: str, scan: _Scan, *, source: bool = False) -> None:
     raw = body.encode("utf-8", "surrogateescape")
     if scan.span_held:
         scan.prefix_spans.append((raw, 0, len(raw) + 1, scan.span_held))
-    root = bash_parser().parse(raw).root_node
+    root = bash_parser().parse(blank_herestring_fds(raw)).root_node
     if source:
         watched = set(scan.literals) | {o for o in scan.script_dirs.values() if o is not None}
         names = _assignment_texts(root, raw, scan.budget, scan.var_scope)
@@ -2952,7 +2952,7 @@ def _arithmetic_writes(text: str) -> bool:
     if not any(mark in text for mark in ("$", "`")) or not ARITHMETIC_WRITE.search(text):
         return False
     raw = (": $((" + text + "))").encode("utf-8", "surrogateescape")
-    root = bash_parser().parse(raw).root_node
+    root = bash_parser().parse(blank_herestring_fds(raw)).root_node
     if root.has_error:
         return True
     stack = [root]
@@ -3035,7 +3035,8 @@ def _inline_roots(
             continue
         names.parsed += 1
         data = body.encode("utf-8", "surrogateescape")
-        roots.append((bash_parser().parse(data).root_node, data, owners, True))
+        root = bash_parser().parse(blank_herestring_fds(data)).root_node
+        roots.append((root, data, owners, True))
     names.inline.clear()
     return roots
 
@@ -3277,7 +3278,7 @@ def scan_body(
         return parser, [], [], []
     raw = body.encode("utf-8", "surrogateescape")
     scan = _Scan(context, budget, dir_changed=context.directory_changed)
-    root = parser.parse(raw).root_node
+    root = parser.parse(blank_herestring_fds(raw)).root_node
     _prime_names(scan, _assignment_texts(root, raw, budget), raw)
     if context.script_dir is not None:
         scan.rebound = _environment_rebinds(context, budget)

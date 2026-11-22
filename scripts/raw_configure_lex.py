@@ -7,6 +7,7 @@ from __future__ import annotations
 import re
 import shlex
 import sys
+from dataclasses import dataclass, field
 from pathlib import Path
 
 # Ensure repository root is on sys.path for test/tool imports
@@ -22,6 +23,19 @@ from scripts.raw_configure_words import (  # noqa: E402
     SELF_REDIRECT,
     SEPARATORS,
 )
+
+HERESTRING_WORD_STARTS = frozenset(" \t\n;&|()")
+
+
+@dataclass
+class _LexState:
+    """Track active quote, word-boundary, continuation and arithmetic state across lines."""
+
+    quote: str | None = None
+    word_start: bool = True
+    continued: bool = False
+    arith_depth: int = 0
+    heredocs: list[tuple[str, bool]] = field(default_factory=list)
 
 
 def _append_redirect_fd(punc: str, tokens: list[str], raw_tokens: list[str], idx: int) -> int:
@@ -212,14 +226,19 @@ def _read_delim(line: str, pos: int, line_len: int) -> tuple[str, int, str | Non
     return line[start_d:pos], pos, quoted
 
 
+def _skip_blanks(text: str, pos: int, limit: int) -> int:
+    """Advance past space and horizontal tab characters up to limit."""
+    for _ in range(limit - pos):
+        if pos >= limit or text[pos] not in " \t":
+            break
+        pos += 1
+    return pos
+
+
 def _parse_heredoc_at(line: str, pos: int, line_len: int) -> tuple[int, str, bool, bool] | None:
     """Parse heredoc marker details starting after << operator."""
     tab_strip = pos < line_len and line[pos] == "-"
-    pos += 1 if tab_strip else 0
-    for _ in range(line_len - pos):
-        if line[pos] not in " \t":
-            break
-        pos += 1
+    pos = _skip_blanks(line, pos + (1 if tab_strip else 0), line_len)
     delim, pos, q_delim = _read_delim(line, pos, line_len)
     if delim:
         return pos, delim, tab_strip, q_delim is not None
@@ -252,6 +271,21 @@ def _scan_heredoc_line(line: str, line_len: int) -> tuple[int, int, str, bool, b
     return None
 
 
+def _consume_heredoc_body(
+    lines: list[str], idx: int, delim: str, tab_strip: bool
+) -> tuple[int, bool]:
+    """Advance past one heredoc body to its delimiter line and report closure."""
+    num_lines = len(lines)
+    for _ in range(num_lines - idx + 1):
+        if idx >= num_lines:
+            break
+        check = lines[idx].lstrip("\t") if tab_strip else lines[idx]
+        idx += 1
+        if check.rstrip("\r\n") == delim:
+            return idx, True
+    return idx, False
+
+
 def _scan_heredocs(command: str) -> tuple[str, dict[str, str], set[str]] | None:
     """Extract heredocs outside quotes and replace declarations with placeholders."""
     if len(command) > MAX_COMMAND:
@@ -276,22 +310,154 @@ def _scan_heredocs(command: str) -> tuple[str, dict[str, str], set[str]] | None:
         if not is_quoted:
             expanding_tags.add(tag)
         out_lines.append(line[:start_hd] + tag + line[end_hd:])
-        body: list[str] = []
-        closed = False
-        for _ in range(num_lines - idx + 1):
-            if idx >= num_lines:
-                break
-            b_line = lines[idx]
-            idx += 1
-            check = b_line.lstrip("\t") if tab_strip else b_line
-            if check.rstrip("\r\n") == delim:
-                closed = True
-                break
-            body.append(b_line)
+        end_idx, closed = _consume_heredoc_body(lines, idx, delim, tab_strip)
         if not closed:
             return None
-        heredocs[tag] = "".join(body)
+        heredocs[tag] = "".join(lines[idx : end_idx - 1])
+        idx = end_idx
     return "".join(out_lines), heredocs, expanding_tags
+
+
+def _herestring_fd_end(line: str, pos: int, line_len: int) -> int | None:
+    """Return the end offset of an ASCII digit run followed immediately by <<<."""
+    end = pos
+    for _ in range(line_len - pos):
+        if end >= line_len or not ("0" <= line[end] <= "9"):
+            break
+        end += 1
+    return end if end > pos and line[end : end + 3] == "<<<" else None
+
+
+def _step_quoted(line: str, pos: int, quote: str) -> tuple[int, str | None]:
+    """Advance past one character or backslash escape inside an active quote."""
+    ch = line[pos]
+    if quote != "'" and ch == "\\":
+        return min(pos + 2, len(line)), quote
+    if quote == "$'":
+        return pos + 1, (None if ch == "'" else quote)
+    return pos + 1, _update_quote(ch, quote)
+
+
+def _step_escape_or_quote(line: str, pos: int, state: _LexState) -> int | None:
+    """Handle backslash escapes, comments and quote starts in unquoted shell text."""
+    ch = line[pos]
+    if ch == "\\":
+        crlf = line[pos + 1 : pos + 3] == "\r\n"
+        if crlf or line[pos + 1 : pos + 2] == "\n":
+            state.continued = True
+            return pos + (3 if crlf else 2)
+        state.word_start = False
+        return min(pos + 2, len(line))
+    if ch == "#" and state.word_start:
+        state.word_start = line.endswith("\n")
+        return len(line)
+    if line[pos : pos + 2] == "$'" or ch in ("'", '"'):
+        ansi = line[pos : pos + 2] == "$'"
+        state.quote = "$'" if ansi else _update_quote(ch, state.quote)
+        state.word_start = False
+        return pos + (2 if ansi else 1)
+    return None
+
+
+def _step_arith(line: str, pos: int, state: _LexState) -> int | None:
+    """Track $(( and (( arithmetic parenthesis depth at one unquoted position."""
+    if state.arith_depth == 0:
+        if line[pos : pos + 3] == "$((":
+            state.arith_depth = 2
+            state.word_start = True
+            return pos + 3
+        if line[pos : pos + 2] == "((":
+            state.arith_depth = 2
+            state.word_start = True
+            return pos + 2
+        return None
+    if line[pos] in "()":
+        state.arith_depth += 1 if line[pos] == "(" else -1
+        state.word_start = True
+        return pos + 1
+    return None
+
+
+def _step_heredoc_op(line: str, pos: int, state: _LexState) -> int | None:
+    """Queue a heredoc delimiter at << outside arithmetic and return the next offset."""
+    if line[pos : pos + 2] != "<<" or line[pos : pos + 3] == "<<=":
+        return None
+    state.word_start = False
+    if state.arith_depth > 0:
+        return pos + 2
+    parsed = _parse_heredoc_at(line, pos + 2, len(line))
+    if parsed is None:
+        return pos + 2
+    state.heredocs.append((parsed[1], parsed[2]))
+    return parsed[0]
+
+
+def _step_herestring_or_char(line: str, pos: int, chars: list[str], state: _LexState) -> int:
+    """Blank word-initial fd digits before <<< or advance one unquoted token."""
+    line_len = len(line)
+    ch = line[pos]
+    if state.word_start and "0" <= ch <= "9":
+        fd_end = _herestring_fd_end(line, pos, line_len)
+        if fd_end is not None:
+            chars[pos:fd_end] = [" "] * (fd_end - pos)
+            state.word_start = False
+            return _skip_blanks(line, fd_end + 3, line_len)
+    if line[pos : pos + 3] == "<<<":
+        state.word_start = False
+        return _skip_blanks(line, pos + 3, line_len)
+    hd_next = _step_heredoc_op(line, pos, state)
+    if hd_next is not None:
+        return hd_next
+    state.word_start = ch in HERESTRING_WORD_STARTS
+    return pos + 1
+
+
+def _blank_line(line: str, state: _LexState) -> str:
+    """Blank word-initial fd digits before <<< across one line and update lex state."""
+    chars = list(line)
+    state.continued = False
+    pos = 0
+    line_len = len(line)
+    for _ in range(line_len):
+        if pos >= line_len:
+            break
+        if state.quote is not None:
+            pos, state.quote = _step_quoted(line, pos, state.quote)
+            continue
+        nxt = _step_escape_or_quote(line, pos, state)
+        if nxt is None:
+            nxt = _step_arith(line, pos, state)
+        if nxt is not None:
+            pos = nxt
+            continue
+        pos = _step_herestring_or_char(line, pos, chars, state)
+    return "".join(chars)
+
+
+def blank_herestring_fds(raw: bytes) -> bytes:
+    """Return equal-length shell bytes with word-initial fd digits before <<< made spaces."""
+    if b"<<<" not in raw:
+        return bytes(raw)
+    lines = raw.decode("utf-8", "surrogateescape").splitlines(keepends=True)
+    out_lines: list[str] = []
+    state = _LexState()
+    idx = 0
+    num_lines = len(lines)
+    for _ in range(num_lines):
+        if idx >= num_lines:
+            break
+        line = lines[idx]
+        out_lines.append(_blank_line(line, state))
+        idx += 1
+        if state.quote is None and not state.continued and line.endswith("\n"):
+            for _ in range(len(state.heredocs)):
+                if not state.heredocs:
+                    break
+                delim, tab_strip = state.heredocs.pop(0)
+                end_idx, _ = _consume_heredoc_body(lines, idx, delim, tab_strip)
+                out_lines.extend(lines[idx:end_idx])
+                idx = end_idx
+    return "".join(out_lines).encode("utf-8", "surrogateescape")
 
 
 def _scan_herestrings(command: str) -> tuple[str, dict[str, str], list[str]]:
@@ -310,11 +476,7 @@ def _scan_herestrings(command: str) -> tuple[str, dict[str, str], list[str]]:
             if ch in ("'", '"'):
                 quote = ch
             elif command[pos : pos + 3] == "<<<":
-                pos += 3
-                for _ in range(cmd_len - pos):
-                    if command[pos] not in " \t":
-                        break
-                    pos += 1
+                pos = _skip_blanks(command, pos + 3, cmd_len)
                 val, pos, q_delim = _read_delim(command, pos, cmd_len)
                 tag = f"__RCG_HS_{len(herestrings)}__"
                 herestrings[tag] = val

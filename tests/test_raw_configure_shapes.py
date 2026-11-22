@@ -9,7 +9,66 @@ import json
 import os
 import unittest.mock
 
+from scripts import raw_configure_body, raw_configure_lex
 from tests.raw_configure_support import CLIENTS, GUARD_MOD, RawConfigureGuardBase
+
+FD_HERESTRING_G1 = """\
+#!/bin/bash
+delay=$((1 << 2))
+if ! python3 - x 3<<< "$d" > y <<'PYTHON'
+import sys
+PYTHON
+then
+  echo no
+fi
+"""
+
+FD_HERESTRING_G6_PY = """\
+import json
+import os
+import sys
+
+with os.fdopen(3) as handle:
+    data = json.load(handle)
+print(sys.argv[1], len(data))\
+"""
+
+FD_HERESTRING_G6 = f"""\
+#!/bin/bash
+# squash-merge helper shape: retry backoff with an arithmetic shift, then an
+# interpreter fed one value on fd 3 and its program on stdin from a heredoc.
+set -eu
+
+retry() {{
+    local attempt delay
+    for attempt in 1 2 3; do
+        if "$@"; then
+            return 0
+        fi
+        delay=$(((1 << (attempt - 1)) + RANDOM % 2))
+        sleep "$delay"
+    done
+    return 1
+}}
+
+judge_paths() {{
+    local clone_dir=$1 dump_json=$2 tree_file=$3 paths_file=$4
+    if ! timeout 60 git -C "$clone_dir" ls-tree -rz --name-only HEAD > "$tree_file"; then
+        echo "ls-tree failed" >&2
+        return 1
+    fi
+    if ! python3 - "$tree_file" 3<<< "$dump_json" > "$paths_file" <<'PYTHON'
+{FD_HERESTRING_G6_PY}
+PYTHON
+    then
+        echo "judge failed" >&2
+        return 1
+    fi
+}}
+
+retry true
+judge_paths . '{{}}' tree.txt paths.txt
+"""
 
 PROBE_GAP_SHAPES = (
     "command -p cd $R/tree; ./configure",
@@ -398,3 +457,90 @@ class RawConfigureShapeTest(RawConfigureGuardBase):
                     result = self.run_guard(client, self.payload(client, cmd, self.other))
                     self.assertEqual(result.returncode, 2, result.stderr)
                     self.assertIn("scripts/ffmpeg_configure.py", result.stderr)
+
+    def test_allows_fd_herestring_g1_script(self) -> None:
+        """Allow a script combining an arithmetic shift, an fd here-string, and a heredoc."""
+        script = self.root / "g1.sh"
+        script.write_text(FD_HERESTRING_G1, encoding="utf-8")
+        self._assert_allowed(((f"bash {script}", self.root),))
+
+    def test_allows_fd_herestring_g6_script(self) -> None:
+        """Allow the squash-merge helper shape feeding Python on fd 3 alongside a heredoc."""
+        script = self.root / "g6.sh"
+        script.write_text(FD_HERESTRING_G6, encoding="utf-8")
+        self._assert_allowed(((f"bash {script}", self.root),))
+
+    def test_fd_herestring_parses_without_error_node(self) -> None:
+        """Parse a numbered-descriptor here-string with zero ERROR nodes after blanking."""
+        parser = raw_configure_body.bash_parser()
+        self.assertFalse(isinstance(parser, str))
+        blanked = raw_configure_lex.blank_herestring_fds(b'cat 3<<< "$d"\n')
+        root = parser.parse(blanked).root_node
+        self.assertFalse(root.has_error)
+        stack = [root]
+        errors: list[str] = []
+        for _ in range(64):
+            if not stack:
+                break
+            node = stack.pop()
+            if node.type == "ERROR" or node.is_missing:
+                errors.append(node.type)
+            stack.extend(node.children)
+        self.assertEqual(errors, [])
+
+    def test_refuses_fd_herestring_configure_forms(self) -> None:
+        """Keep configure invocations paired with numbered here-string redirects refused."""
+        case_b = 'sh -s 0<<< "./configure --prefix=/x"'
+        case_c = FD_HERESTRING_G6.replace("python3 -", "bash -s").replace(
+            FD_HERESTRING_G6_PY, "./configure --enable-gpl"
+        )
+        case_d = "timeout 60 ./configure 3<<< x"
+        case_e = FD_HERESTRING_G6.replace(
+            'timeout 60 git -C "$clone_dir" ls-tree -rz --name-only HEAD',
+            'timeout 60 "$clone_dir"/configure --enable-gpl',
+        )
+        bodies = [("b", case_b + "\n"), ("c", case_c), ("d", case_d + "\n"), ("e", case_e)]
+        for _ in range(len(bodies)):
+            if not bodies:
+                break
+            label, text = bodies.pop(0)
+            script = self.root / f"t2_{label}.sh"
+            script.write_text(text, encoding="utf-8")
+            self._assert_refused(((f"bash {script}", self.root),))
+        self._assert_refused(((case_b, self.root), (case_d, self.tree)))
+
+    def test_blank_herestring_fds_word_start_and_multi_digit_boundaries(self) -> None:
+        """Preserve mid-word and brace forms while blanking single and multi-digit fds."""
+        cases = [
+            (b"echo a3<<< x", b"echo a3<<< x"),
+            (b"cat 12<<< x", b"cat   <<< x"),
+            (b"cat 3<<< x; cat 4<<< y", b"cat  <<< x; cat  <<< y"),
+            (b"cat {fd}<<< x", b"cat {fd}<<< x"),
+        ]
+        for _ in range(len(cases)):
+            if not cases:
+                break
+            raw, expected = cases.pop(0)
+            actual = raw_configure_lex.blank_herestring_fds(raw)
+            self.assertEqual(actual, expected)
+            self.assertEqual(len(actual), len(raw))
+        parser = raw_configure_body.bash_parser()
+        self.assertFalse(parser.parse(b"cat {fd}<<< x\n").root_node.has_error)
+
+    def test_blank_herestring_fds_quotes_comments_and_heredocs(self) -> None:
+        """Leave digits before <<< untouched inside quotes, comments and heredoc bodies."""
+        unchanged = [
+            b"echo '3<<< x'",
+            b'echo "3<<< x"',
+            b"echo 'cat 3<<< x'",
+            b'echo "cat 3<<< x"',
+            b"cat <<'EOF'\n3<<< x\nEOF\n",
+            b"# 3<<< x\n",
+        ]
+        for _ in range(len(unchanged)):
+            if not unchanged:
+                break
+            raw = unchanged.pop(0)
+            actual = raw_configure_lex.blank_herestring_fds(raw)
+            self.assertEqual(actual, raw)
+            self.assertEqual(len(actual), len(raw))

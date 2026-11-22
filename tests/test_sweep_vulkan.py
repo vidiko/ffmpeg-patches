@@ -1164,6 +1164,20 @@ class VulkanSweepTest(unittest.TestCase):
         self.assertEqual(storage, (True, False))
         self.assertEqual(buffer, (False, False))
 
+    def test_cr11_h1_skip_space_leading_whitespace_and_empty_tail(self) -> None:
+        """CR11 H1: _skip_space skips leading whitespace and stops at end-of-text."""
+        text = "  \t\n\rident"
+        limit = len(text)
+        self.assertEqual(sweep_port_parity._skip_space(text, 0, limit), 5)
+        self.assertEqual(sweep_port_parity._skip_space("  \t\n\r", 0, 5), 5)
+
+    def test_cr11_h1_feature_read_receiver_root_identifier_to_tail(self) -> None:
+        """CR11 H1: feature_read_receiver_root scans identifier tails or returns None."""
+        masked = "receiver.feats"
+        dot = masked.index(".")
+        self.assertEqual(sweep_vulkan_features.feature_read_receiver_root(masked, dot), "receiver")
+        self.assertIsNone(sweep_vulkan_features.feature_read_receiver_root("   ", 3))
+
     def test_cr10_4658985427_shift_not_mask_from_separate_arg(self) -> None:
         """CR10-5427: mask on a later call argument does not override shift on the sample."""
         source = "unsigned v = use(src[0] >> 4, flags & 0xff);\n"
@@ -1219,6 +1233,57 @@ class VulkanSweepTest(unittest.TestCase):
             deadline,
         )
         self.assertNotIn("libavfilter/vf_ghost_vulkan.c", owners)
+
+    def test_cr11_h3_owners_for_shaders_one_git_show_per_owner_path(self) -> None:
+        """CR11 H3: two changed shaders on one owner C file trigger one git show per path."""
+        c_vulkan = (
+            "extern const unsigned char ff_one_comp_spv_data[];\n"
+            "extern const unsigned char ff_two_comp_spv_data[];\n"
+            "int f(void){return 0;}\n"
+        )
+        (self.repo / "libavfilter" / "vf_dual_vulkan.c").write_text(c_vulkan, encoding="utf-8")
+        (self.repo / "libavfilter" / "vulkan" / "one.comp.glsl").write_text(
+            SIMPLE_SHADER, encoding="utf-8"
+        )
+        (self.repo / "libavfilter" / "vulkan" / "two.comp.glsl").write_text(
+            SIMPLE_SHADER, encoding="utf-8"
+        )
+        run_git(self.repo, "add", ".")
+        run_git(self.repo, "commit", "-qm", "mid")
+        (self.repo / "libavfilter" / "vulkan" / "one.comp.glsl").write_text(
+            SIMPLE_SHADER + "\n", encoding="utf-8"
+        )
+        (self.repo / "libavfilter" / "vulkan" / "two.comp.glsl").write_text(
+            SIMPLE_SHADER + "\n", encoding="utf-8"
+        )
+        run_git(self.repo, "add", "libavfilter/vulkan")
+        run_git(self.repo, "commit", "-qm", "head")
+        head = run_git(self.repo, "rev-parse", "HEAD")
+        deadline = time.monotonic() + 120
+        shows: list[str] = []
+        real_git = sweep_vulkan_features.git
+
+        def counting_git(directory: str, *args: object, **kwargs: object) -> str:
+            if args and args[0] == "show":
+                shows.append(str(args[1]))
+            return real_git(directory, *args, **kwargs)
+
+        with unittest.mock.patch.object(
+            sweep_vulkan_features, "git", wraps=real_git
+        ) as tracked_git:
+            tracked_git.side_effect = counting_git
+            owners = sweep_vulkan_features.owners_for_shaders(
+                str(self.repo),
+                head,
+                {
+                    "libavfilter/vulkan/one.comp.glsl",
+                    "libavfilter/vulkan/two.comp.glsl",
+                },
+                deadline,
+            )
+        self.assertEqual(owners, {"libavfilter/vf_dual_vulkan.c"})
+        owner_shows = [path for path in shows if path.endswith(":libavfilter/vf_dual_vulkan.c")]
+        self.assertEqual(len(owner_shows), 1)
 
     def test_cr10_4658985437_nonuniform_index_without_dynamic(self) -> None:
         """CR10-5437: NonUniform storage-image indexing does not imply dynamic uniform indexing."""

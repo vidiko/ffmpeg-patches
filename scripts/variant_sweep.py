@@ -59,6 +59,12 @@ MAX_SOURCE_COUNT = 4096
 MAX_TARGET_COUNT = 512
 MAX_SWEEP_SECONDS = 120
 MAX_GIT_BYTES = 32 * 1024 * 1024
+
+
+class SweepPrerequisiteError(RuntimeError):
+    """Raised when a sweep class cannot run because a required tool or input is missing."""
+
+
 GIT_LOCATION_NAMES = frozenset(
     {
         "GIT_ALTERNATE_OBJECT_DIRECTORIES",
@@ -835,8 +841,8 @@ def sweep_all(directory: str, base: str, head: str) -> str:
     for name in ("state_advance", "doc_claims", "vulkan_features", "port_parity"):
         try:
             report += "\n" + sweep_class(name, directory, base, head, deadline)
-        except RuntimeError as error:
-            if name != "vulkan_features" or type(error).__name__ != "VulkanFeatureSweepError":
+        except SweepPrerequisiteError as error:
+            if name != "vulkan_features":
                 raise
             section = name.replace("_", "-")
             table = REPORT_TABLES["vulkan-features"]

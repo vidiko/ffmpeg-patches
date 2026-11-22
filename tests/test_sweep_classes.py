@@ -570,6 +570,36 @@ class SweepRegressionTest(unittest.TestCase):
             ],
         )
 
+    def test_cr11_h2_sweep_all_catches_prerequisite_subclass_by_type(self) -> None:
+        """CR11 H2: sweep_all absorbs a renamed Vulkan prerequisite by type and runs siblings."""
+        sha = "0" * 40
+        order: list[str] = []
+
+        class RenamedVulkanPrerequisite(sweep_vulkan_features.VulkanFeatureSweepError):
+            """Vulkan prerequisite with a non-default class name."""
+
+        def unchecked(directory, base, head, deadline=None):
+            """Return unchecked-return metadata and record invocation order."""
+            order.append("unchecked-return")
+            return f"class: unchecked-return\nbase: {sha}\nhead: {sha}\n"
+
+        def extra(name, directory, base, head, deadline):
+            """Record sibling order or raise a renamed Vulkan prerequisite error."""
+            if name == "vulkan_features":
+                order.append(name)
+                raise RenamedVulkanPrerequisite("missing tool: /no/spirv-dis")
+            order.append(name)
+            return f"class: {name.replace('_', '-')}\nhead: {head}\nno hits\n"
+
+        with (
+            unittest.mock.patch.object(variant_sweep, "sweep", side_effect=unchecked),
+            unittest.mock.patch.object(variant_sweep, "sweep_class", side_effect=extra),
+        ):
+            report = variant_sweep.sweep_all("unused", sha, sha)
+        self.assertIn("prerequisite: missing tool: /no/spirv-dis", report)
+        self.assertIn("class: port-parity", report)
+        self.assertEqual(order[-1], "port_parity")
+
     def test_all_classes_share_deadline(self) -> None:
         """Every sibling sweep receives one aggregate deadline from sweep_all."""
         deadlines = []

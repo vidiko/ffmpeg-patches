@@ -20,6 +20,7 @@ if str(ROOT) not in sys.path:
 from scripts.variant_sweep import (  # noqa: E402
     MAX_REPORT_BYTES,
     REPORT_TABLES,
+    SweepPrerequisiteError,
     check_deadline,
     check_limit,
     git,
@@ -60,7 +61,7 @@ class VulkanMapState:
 MAP_STATE = VulkanMapState()
 
 
-class VulkanFeatureSweepError(RuntimeError):
+class VulkanFeatureSweepError(SweepPrerequisiteError):
     """Raised when Vulkan sweep prerequisites or shader compilation fail."""
 
 
@@ -240,6 +241,7 @@ def shader_stem(path: str) -> str | None:
 def owners_for_shaders(directory: str, head: str, shaders: set[str], deadline: float) -> set[str]:
     """Locate Vulkan C files that link changed shaders at head."""
     owners: set[str] = set()
+    linked_by_path: dict[str, list[str]] = {}
     for shader in sorted(shaders):
         stem = shader_stem(shader)
         if stem is None:
@@ -261,15 +263,17 @@ def owners_for_shaders(directory: str, head: str, shaders: set[str], deadline: f
             path = line[len(prefix) :] if line.startswith(prefix) else line
             if not VULKAN_C.fullmatch(path):
                 continue
-            source = git(
-                directory,
-                "show",
-                f"{head}:{path}",
-                deadline=deadline,
-                maximum=MAX_TOOL_BYTES,
-                limit_name="source size",
-            )
-            if shader_path in linked_shaders(source):
+            if path not in linked_by_path:
+                source = git(
+                    directory,
+                    "show",
+                    f"{head}:{path}",
+                    deadline=deadline,
+                    maximum=MAX_TOOL_BYTES,
+                    limit_name="source size",
+                )
+                linked_by_path[path] = linked_shaders(source)
+            if shader_path in linked_by_path[path]:
                 owners.add(path)
     return owners
 
@@ -473,10 +477,14 @@ def c_feature_var_types(masked: str) -> dict[str, str | None]:
 def feature_read_receiver_root(masked: str, member_access_start: int) -> str | None:
     """Return the root identifier for the receiver of one feature member access."""
     token_start = access_expr_first_token_start(masked, member_access_start)
-    end = token_start
     limit = len(masked)
-    while end < limit and masked[end] in _IDENT_TAIL:
-        end += 1
+    end = token_start
+    for index in range(token_start, limit):
+        if masked[index] not in _IDENT_TAIL:
+            end = index
+            break
+    else:
+        end = limit
     if end == token_start:
         return None
     return masked[token_start:end]

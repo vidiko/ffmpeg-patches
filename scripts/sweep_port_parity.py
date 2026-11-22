@@ -157,9 +157,10 @@ def loop_header_bounds(statement: str) -> tuple[int, int] | None:
 
 def _skip_space(text: str, position: int, limit: int) -> int:
     """Advance past ASCII whitespace."""
-    while position < limit and text[position] in " \t\n\r":
-        position += 1
-    return position
+    for index in range(position, limit):
+        if text[index] not in " \t\n\r":
+            return index
+    return limit
 
 
 def _extend_shift_tail(text: str, position: int, limit: int) -> int:

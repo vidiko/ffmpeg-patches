@@ -70,6 +70,44 @@ retry true
 judge_paths . '{{}}' tree.txt paths.txt
 """
 
+FD_HERESTRING_F1 = (
+    "echo \"$(cat <<'3<<<' # \"\n"
+    "3<<<\n"
+    "./configure --prefix=/x\n"
+    "cat <<true >/dev/null\n"
+    "3<<<\n"
+    "true\n"
+    ')" >/dev/null\n'
+)
+
+FD_HERESTRING_F2 = (
+    "echo $(true)#; cat <<'3<<<' >/dev/null\n"
+    "3<<<\n"
+    "./configure --prefix=/x\n"
+    "cat <<true >/dev/null\n"
+    "3<<<\n"
+    "true\n"
+)
+
+FD_HERESTRING_F3 = (
+    "echo $(( $(cat <<'3<<<' >/dev/null\n"
+    "3<<<\n"
+    "./configure --prefix=/x >&2\n"
+    "case x in x) case x in x) case x in x) :;; esac;; esac;; esac\n"
+    "cat <<true >/dev/null\n"
+    "3<<<\n"
+    "true\n"
+    "echo 0) )) >/dev/null\n"
+)
+
+OWN_DIR_HEADER = '#!/bin/bash\nHERE=$(dirname "$(readlink -f "$0")")\n'
+
+
+def _desync_first_herestring_delim(data: bytes) -> bytes:
+    """Simulate a desynchronized lexer blanking the first 3<<< heredoc delimiter line."""
+    return data.replace(b"\n3<<<\n", b"\n <<<\n", 1)
+
+
 PROBE_GAP_SHAPES = (
     "command -p cd $R/tree; ./configure",
     "command -- cd $R/tree; ./configure",
@@ -544,3 +582,138 @@ class RawConfigureShapeTest(RawConfigureGuardBase):
             actual = raw_configure_lex.blank_herestring_fds(raw)
             self.assertEqual(actual, raw)
             self.assertEqual(len(actual), len(raw))
+
+    def test_refuses_heredoc_delimiter_herestring_desync_scripts(self) -> None:
+        """Refuse scripts whose 3<<< heredoc delimiter could hide raw configure calls."""
+        bodies = [("f1", FD_HERESTRING_F1), ("f2", FD_HERESTRING_F2), ("f3", FD_HERESTRING_F3)]
+        for _ in range(len(bodies)):
+            if not bodies:
+                break
+            label, text = bodies.pop(0)
+            script = self.root / f"t4_{label}.sh"
+            script.write_text(text, encoding="utf-8")
+            self._assert_refused(((f"bash {script}", self.tree),))
+
+    def _collect_tree_errors(self, root: object) -> list[str]:
+        """Collect ERROR and missing node types from a syntax tree with a bounded stack."""
+        stack = [root]
+        errors: list[str] = []
+        for _ in range(512):
+            if not stack:
+                break
+            node = stack.pop()
+            if node.type == "ERROR" or node.is_missing:
+                errors.append(node.type)
+            stack.extend(node.children)
+        return errors
+
+    def test_parse_bash_verifies_blanked_runs_or_falls_back(self) -> None:
+        """Fall back to raw parse on desynced blanking and keep valid blanked trees."""
+        parser = raw_configure_body.bash_parser()
+        items = [FD_HERESTRING_F1, FD_HERESTRING_F2, FD_HERESTRING_F3]
+        for _ in range(len(items)):
+            if not items:
+                break
+            raw = items.pop(0).encode("utf-8")
+            orig_sexp = str(parser.parse(raw).root_node)
+            bad_sexp = str(parser.parse(_desync_first_herestring_delim(raw)).root_node)
+            self.assertNotEqual(orig_sexp, bad_sexp)
+            self.assertEqual(str(raw_configure_body.parse_bash(raw).root_node), orig_sexp)
+            with unittest.mock.patch.object(
+                raw_configure_body,
+                "blank_herestring_fds",
+                side_effect=_desync_first_herestring_delim,
+            ):
+                fallback = raw_configure_body.parse_bash(raw)
+            self.assertEqual(str(fallback.root_node), orig_sexp)
+        g6_raw = FD_HERESTRING_G6.encode("utf-8")
+        g6_blank_sexp = str(parser.parse(raw_configure_lex.blank_herestring_fds(g6_raw)).root_node)
+        g6_tree = raw_configure_body.parse_bash(g6_raw)
+        self.assertFalse(g6_tree.root_node.has_error)
+        self.assertEqual(self._collect_tree_errors(g6_tree.root_node), [])
+        self.assertEqual(str(g6_tree.root_node), g6_blank_sexp)
+
+    def test_blank_herestring_fds_vertical_tab_comment(self) -> None:
+        """Keep a comment containing a vertical tab before 3<<< intact on one LF line."""
+        raw = b"# c\x0b 3<<< x\n"
+        actual = raw_configure_lex.blank_herestring_fds(raw)
+        self.assertEqual(actual, raw)
+        self.assertEqual(len(actual), len(raw))
+
+    def test_blank_herestring_fds_lexer_sync_and_quote_removal(self) -> None:
+        """Sync nested substitutions, )#, and delimiter quote removal before real fd<<<."""
+        cases = [
+            (FD_HERESTRING_F1.encode("utf-8"), FD_HERESTRING_F1.encode("utf-8")),
+            (FD_HERESTRING_F2.encode("utf-8"), FD_HERESTRING_F2.encode("utf-8")),
+            (FD_HERESTRING_F3.encode("utf-8"), FD_HERESTRING_F3.encode("utf-8")),
+            (
+                b'echo "$(cat <<\'EOF\' # "\n3<<<\nEOF\n)"; cat 3<<< x\n',
+                b'echo "$(cat <<\'EOF\' # "\n3<<<\nEOF\n)"; cat  <<< x\n',
+            ),
+            (
+                b'echo "`cat <<\'EOF\' # "\n3<<<\nEOF\n`"; cat 3<<< x\n',
+                b'echo "`cat <<\'EOF\' # "\n3<<<\nEOF\n`"; cat  <<< x\n',
+            ),
+            (
+                b"echo $(true)#; cat <<'EOF'\n3<<<\nEOF\ncat 3<<< x\n",
+                b"echo $(true)#; cat <<'EOF'\n3<<<\nEOF\ncat  <<< x\n",
+            ),
+            (b"echo $((1))#; cat 3<<< x\n", b"echo $((1))#; cat  <<< x\n"),
+            (
+                b"echo $(( $(cat <<'EOF'\n3<<<\nEOF\necho 1) )); cat 3<<< x\n",
+                b"echo $(( $(cat <<'EOF'\n3<<<\nEOF\necho 1) )); cat  <<< x\n",
+            ),
+            (
+                b"(( $(cat <<'EOF'\n3<<<\nEOF\necho 1) )); cat 3<<< x\n",
+                b"(( $(cat <<'EOF'\n3<<<\nEOF\necho 1) )); cat  <<< x\n",
+            ),
+            (
+                b"cat <<E\\OF\n3<<<\nEOF\ncat 3<<< x\n",
+                b"cat <<E\\OF\n3<<<\nEOF\ncat  <<< x\n",
+            ),
+            (
+                b"cat <<'E'OF\nE\n3<<<\nEOF\ncat 3<<< x\n",
+                b"cat <<'E'OF\nE\n3<<<\nEOF\ncat  <<< x\n",
+            ),
+            (
+                b"cat <<''EOF\n3<<<\nEOF\ncat 3<<< x\n",
+                b"cat <<''EOF\n3<<<\nEOF\ncat  <<< x\n",
+            ),
+        ]
+        for _ in range(len(cases)):
+            if not cases:
+                break
+            raw, expected = cases.pop(0)
+            actual = raw_configure_lex.blank_herestring_fds(raw)
+            self.assertEqual(actual, expected)
+            self.assertEqual(len(actual), len(raw))
+
+    def test_secondary_site_queue_inline_fd_herestring(self) -> None:
+        """Allow sourced script bodies using numbered fd here-strings via _queue_inline."""
+        sub = self.root / "sub_fd.sh"
+        sub.write_text(FD_HERESTRING_G1, encoding="utf-8")
+        caller = self.root / "caller_queue_inline.sh"
+        caller.write_text(f'. "{sub}"\n', encoding="utf-8")
+        self._assert_allowed(((f"bash {caller}", self.root),))
+
+    def test_secondary_site_arithmetic_writes_fd_herestring(self) -> None:
+        """Allow static arithmetic writes whose RHS runs a numbered fd here-string."""
+        (self.root / "clean_arith.sh").write_text("echo ok\n", encoding="utf-8")
+        caller = self.root / "caller_arith.sh"
+        caller.write_text(
+            OWN_DIR_HEADER + ': $(( x = $(cat 3<<< "$d") ))\nbash "$HERE/clean_arith.sh"\n',
+            encoding="utf-8",
+        )
+        self._assert_allowed(((f"bash {caller}", self.root),))
+
+    def test_secondary_site_inline_roots_fd_herestring(self) -> None:
+        """Refuse dynamic printf -v writers inside eval with a numbered fd here-string."""
+        (self.root / "clean_inline.sh").write_text("echo ok\n", encoding="utf-8")
+        caller = self.root / "caller_inline_roots.sh"
+        caller.write_text(
+            OWN_DIR_HEADER
+            + 'n=HE\nm=RE\neval \'printf 3<<< "$d" -v "$n$m" /tmp\'\n'
+            + 'bash "$HERE/clean_inline.sh"\n',
+            encoding="utf-8",
+        )
+        self._assert_refused(((f"bash {caller}", self.root),))

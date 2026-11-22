@@ -25,16 +25,63 @@ from scripts.raw_configure_words import (  # noqa: E402
 )
 
 HERESTRING_WORD_STARTS = frozenset(" \t\n;&|()")
+_DELIM_BREAKS = frozenset(" \t;&|<>()\n\r")
+_DQ_ESCAPABLE = frozenset('$`"\\\n')
+_CASE_CMD_WORDS = frozenset(
+    ["if", "then", "elif", "else", "do", "while", "until", "time", "!", "{"]
+)
+_WORD_TOKEN_CHARS = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_!{}")
+_WORD_DELIMS = frozenset(" \t\r\n;&|()<>")
+_ANSI_SIMPLE = {
+    "a": "\a",
+    "b": "\b",
+    "e": "\x1b",
+    "E": "\x1b",
+    "f": "\f",
+    "n": "\n",
+    "r": "\r",
+    "t": "\t",
+    "v": "\v",
+    "\\": "\\",
+    "'": "'",
+    '"': '"',
+    "?": "?",
+}
+_ANSI_RE = re.compile(
+    r"\\(?:([0-7]{1,3})|x([0-9A-Fa-f]{1,2})|u([0-9A-Fa-f]{1,4})|U([0-9A-Fa-f]{1,8})|c(.)|(.))",
+    re.S,
+)
+
+
+@dataclass
+class _LexFrame:
+    """Saved outer quote, arithmetic and substitution state for nested lexing."""
+
+    quote: str | None
+    arith_depth: int
+    arith_word: bool
+    sub_kind: str | None
+    paren_depth: int
+    cases: list[str]
+    case_parens: list[int]
+    cmd_pos: bool
 
 
 @dataclass
 class _LexState:
-    """Track active quote, word-boundary, continuation and arithmetic state across lines."""
+    """Track active quote, word-boundary, continuation and nested shell state across lines."""
 
     quote: str | None = None
     word_start: bool = True
     continued: bool = False
     arith_depth: int = 0
+    arith_word: bool = False
+    sub_kind: str | None = None
+    paren_depth: int = 0
+    cases: list[str] = field(default_factory=list)
+    case_parens: list[int] = field(default_factory=list)
+    cmd_pos: bool = True
+    stack: list[_LexFrame] = field(default_factory=list)
     heredocs: list[tuple[str, bool]] = field(default_factory=list)
 
 
@@ -200,30 +247,94 @@ def _restore_tokens(tokens: list[str], replacements: list[tuple[str, str]]) -> l
     return restored
 
 
-def _read_delim(line: str, pos: int, line_len: int) -> tuple[str, int, str | None]:
-    """Read a heredoc delimiter token starting at the given position."""
-    if pos < line_len and line[pos] in ("'", '"'):
-        q_char = line[pos]
-        pos += 1
-        start_q = pos
-        for _ in range(line_len - pos + 1):
-            if pos >= line_len or line[pos] == q_char:
-                break
-            pos += 1
-        delim = line[start_q:pos]
-        return delim, (pos + 1 if pos < line_len else pos), q_char
-    quoted: str | None = None
-    if pos < line_len and line[pos] == "\\":
-        quoted = "\\"
-        pos += 1
-    start_d = pos
+def _decode_ansi_escape(match: re.Match[str]) -> str:
+    """Decode one ANSI-C backslash escape inside a $'...' delimiter segment."""
+    octal, hex2, hex4, hex8, ctrl, other = match.groups()
+    if octal is not None:
+        return chr(int(octal, 8) & 0xFF)
+    if hex2 is not None:
+        return chr(int(hex2, 16))
+    digits = hex4 or hex8
+    if digits is not None:
+        code = int(digits, 16)
+        return chr(code) if code <= 0x10FFFF and not (0xD800 <= code <= 0xDFFF) else ""
+    if ctrl is not None:
+        return chr(ord(ctrl) & 0x1F)
+    return _ANSI_SIMPLE.get(other, "\\" + other)
+
+
+def _read_single_quoted(line: str, pos: int, line_len: int) -> tuple[str, int]:
+    """Read a single-quoted segment starting at the opening apostrophe."""
+    pos += 1
+    start = pos
     for _ in range(line_len - pos + 1):
-        if pos >= line_len or line[pos] in " \t;&|<>()\n\r":
+        if pos >= line_len or line[pos] == "'":
             break
-        if line[pos] in ("\\", "'", '"'):
-            quoted = "\\"
         pos += 1
-    return line[start_d:pos], pos, quoted
+    return line[start:pos], (pos + 1 if pos < line_len else pos)
+
+
+def _read_ansi_quoted(line: str, pos: int, line_len: int) -> tuple[str, int]:
+    """Read and decode an ANSI-C $'...' segment starting at the leading $."""
+    pos += 2
+    start = pos
+    for _ in range(line_len - pos + 1):
+        if pos >= line_len or line[pos] == "'":
+            break
+        pos += 2 if line[pos] == "\\" and pos + 1 < line_len else 1
+    body = _ANSI_RE.sub(_decode_ansi_escape, line[start:pos]).split("\x00", 1)[0]
+    return body, (pos + 1 if pos < line_len else pos)
+
+
+def _read_double_quoted(line: str, pos: int, line_len: int) -> tuple[str, int]:
+    """Read a double-quoted or $"..." segment with Bash double-quote escapes."""
+    pos += 2 if line[pos : pos + 2] == '$"' else 1
+    chars: list[str] = []
+    for _ in range(line_len - pos + 1):
+        if pos >= line_len or line[pos] == '"':
+            break
+        if line[pos] == "\\" and pos + 1 < line_len and line[pos + 1] in _DQ_ESCAPABLE:
+            if line[pos + 1] != "\n":
+                chars.append(line[pos + 1])
+            pos += 2
+        else:
+            chars.append(line[pos])
+            pos += 1
+    return "".join(chars), (pos + 1 if pos < line_len else pos)
+
+
+def _read_delim_step(line: str, pos: int, line_len: int) -> tuple[str, int, str]:
+    """Read one quoted, escaped or plain piece of a delimiter token."""
+    if line[pos] == "'":
+        piece, nxt = _read_single_quoted(line, pos, line_len)
+        return piece, nxt, "'"
+    if line[pos : pos + 2] == "$'":
+        piece, nxt = _read_ansi_quoted(line, pos, line_len)
+        return piece, nxt, '"'
+    if line[pos] == '"' or line[pos : pos + 2] == '$"':
+        piece, nxt = _read_double_quoted(line, pos, line_len)
+        return piece, nxt, '"'
+    if line[pos] == "\\":
+        nxt_ch = line[pos + 1 : pos + 2]
+        kept = "" if nxt_ch in ("", "\n", "\r") else nxt_ch
+        return kept, min(pos + 2, line_len), '"'
+    return line[pos], pos + 1, ""
+
+
+def _read_delim(line: str, pos: int, line_len: int) -> tuple[str, int, str | None]:
+    """Read a heredoc or here-string word and apply quote removal across all parts."""
+    parts: list[str] = []
+    kinds: list[str] = []
+    for _ in range(line_len - pos + 1):
+        if pos >= line_len or line[pos] in _DELIM_BREAKS:
+            break
+        piece, pos, kind = _read_delim_step(line, pos, line_len)
+        parts.append(piece)
+        kinds.append(kind)
+    if not any(kinds):
+        return "".join(parts), pos, None
+    q_char = "'" if set(kinds) == {"'"} else '"'
+    return "".join(parts), pos, q_char
 
 
 def _skip_blanks(text: str, pos: int, limit: int) -> int:
@@ -240,7 +351,7 @@ def _parse_heredoc_at(line: str, pos: int, line_len: int) -> tuple[int, str, boo
     tab_strip = pos < line_len and line[pos] == "-"
     pos = _skip_blanks(line, pos + (1 if tab_strip else 0), line_len)
     delim, pos, q_delim = _read_delim(line, pos, line_len)
-    if delim:
+    if delim or q_delim is not None:
         return pos, delim, tab_strip, q_delim is not None
     return None
 
@@ -328,52 +439,301 @@ def _herestring_fd_end(line: str, pos: int, line_len: int) -> int | None:
     return end if end > pos and line[end : end + 3] == "<<<" else None
 
 
-def _step_quoted(line: str, pos: int, quote: str) -> tuple[int, str | None]:
-    """Advance past one character or backslash escape inside an active quote."""
+def _note_non_keyword(state: _LexState) -> None:
+    """Advance active case-header state on a quoted, expansion or non-keyword word."""
+    if state.cases:
+        if state.cases[-1] == "word":
+            state.cases[-1] = "in"
+        elif state.cases[-1] == "pat":
+            state.cases[-1] = "pat_seen"
+    state.cmd_pos = False
+
+
+def _push_sub(state: _LexState, sub_kind: str, arith_depth: int = 0) -> None:
+    """Push current lexing context and enter a nested command or arithmetic substitution."""
+    if state.quote is None and state.arith_depth == 0:
+        _note_non_keyword(state)
+    state.stack.append(
+        _LexFrame(
+            state.quote,
+            state.arith_depth,
+            state.arith_word,
+            state.sub_kind,
+            state.paren_depth,
+            state.cases,
+            state.case_parens,
+            state.cmd_pos,
+        )
+    )
+    state.quote = None
+    state.arith_depth = arith_depth
+    state.arith_word = arith_depth > 0
+    state.sub_kind = sub_kind
+    state.paren_depth = 1 if sub_kind == "$(" else 0
+    state.cases = []
+    state.case_parens = []
+    state.cmd_pos = True
+    state.word_start = True
+
+
+def _pop_sub(state: _LexState) -> None:
+    """Restore the enclosing lexing context when a nested substitution closes."""
+    frame = state.stack.pop()
+    state.quote = frame.quote
+    state.arith_depth = frame.arith_depth
+    state.arith_word = frame.arith_word
+    state.sub_kind = frame.sub_kind
+    state.paren_depth = frame.paren_depth
+    state.cases = frame.cases
+    state.case_parens = frame.case_parens
+    state.cmd_pos = False
+    state.word_start = frame.arith_depth > 0
+
+
+def _step_double_quoted(line: str, pos: int, state: _LexState) -> int:
+    """Advance one character, escape or nested substitution inside double quotes."""
     ch = line[pos]
-    if quote != "'" and ch == "\\":
-        return min(pos + 2, len(line)), quote
-    if quote == "$'":
-        return pos + 1, (None if ch == "'" else quote)
-    return pos + 1, _update_quote(ch, quote)
+    if ch == "\\":
+        step = 3 if line[pos + 1 : pos + 3] == "\r\n" else 2
+        return min(pos + step, len(line))
+    if line[pos : pos + 3] == "$((":
+        _push_sub(state, "$((", arith_depth=2)
+        return pos + 3
+    if line[pos : pos + 2] == "$(":
+        _push_sub(state, "$(")
+        return pos + 2
+    if ch == "`":
+        _push_sub(state, "`")
+        return pos + 1
+    if ch == '"':
+        state.word_start = False
+        state.quote = None
+    return pos + 1
+
+
+def _step_quoted(line: str, pos: int, state: _LexState) -> int:
+    """Advance past one token inside an active single, ANSI-C or double quote."""
+    if state.quote == '"':
+        return _step_double_quoted(line, pos, state)
+    ch = line[pos]
+    if state.quote == "$'" and ch == "\\":
+        return min(pos + 2, len(line))
+    if ch == "'":
+        state.word_start = False
+        state.quote = None
+    return pos + 1
+
+
+def _comment_end(line: str, pos: int, state: _LexState) -> int:
+    """Return the end of a # comment, stopping before an unescaped closing backtick."""
+    line_len = len(line)
+    if state.sub_kind == "`":
+        idx = pos + 1
+        for _ in range(line_len - idx):
+            if idx >= line_len:
+                break
+            if line[idx] == "\\":
+                idx += 2
+                continue
+            if line[idx] == "`":
+                state.word_start = False
+                return idx
+            idx += 1
+    state.word_start = line.endswith("\n")
+    if line.endswith("\n") and (not state.cases or state.cases[-1] == "body"):
+        state.cmd_pos = True
+    return line_len
+
+
+def _step_backslash(line: str, pos: int, state: _LexState) -> int:
+    """Advance past a backslash line continuation or escaped unquoted character."""
+    if line[pos + 1 : pos + 3] == "\r\n":
+        state.continued = True
+        return pos + 3
+    if line[pos + 1 : pos + 2] == "\n":
+        state.continued = True
+        return pos + 2
+    if state.arith_depth == 0:
+        _note_non_keyword(state)
+    state.word_start = False
+    return min(pos + 2, len(line))
+
+
+def _enter_quote(line: str, pos: int, state: _LexState) -> int:
+    """Enter single, double, locale or ANSI-C quote mode from unquoted text."""
+    if state.arith_depth == 0:
+        _note_non_keyword(state)
+    state.word_start = False
+    two = line[pos : pos + 2]
+    if two == "$'":
+        state.quote = "$'"
+        return pos + 2
+    if two == '$"':
+        state.quote = '"'
+        return pos + 2
+    state.quote = line[pos]
+    return pos + 1
 
 
 def _step_escape_or_quote(line: str, pos: int, state: _LexState) -> int | None:
     """Handle backslash escapes, comments and quote starts in unquoted shell text."""
     ch = line[pos]
     if ch == "\\":
-        crlf = line[pos + 1 : pos + 3] == "\r\n"
-        if crlf or line[pos + 1 : pos + 2] == "\n":
-            state.continued = True
-            return pos + (3 if crlf else 2)
-        state.word_start = False
-        return min(pos + 2, len(line))
-    if ch == "#" and state.word_start:
-        state.word_start = line.endswith("\n")
-        return len(line)
-    if line[pos : pos + 2] == "$'" or ch in ("'", '"'):
-        ansi = line[pos : pos + 2] == "$'"
-        state.quote = "$'" if ansi else _update_quote(ch, state.quote)
-        state.word_start = False
-        return pos + (2 if ansi else 1)
+        return _step_backslash(line, pos, state)
+    if ch == "#" and state.word_start and state.arith_depth == 0:
+        return _comment_end(line, pos, state)
+    if line[pos : pos + 2] in ("$'", '$"') or ch in ("'", '"'):
+        return _enter_quote(line, pos, state)
+    return None
+
+
+def _step_sub(line: str, pos: int, state: _LexState) -> int | None:
+    """Open or close command substitutions at $( and unescaped backticks."""
+    if line[pos] == "`":
+        if state.sub_kind == "`":
+            _pop_sub(state)
+        else:
+            _push_sub(state, "`")
+        return pos + 1
+    if line[pos : pos + 2] == "$(" and line[pos : pos + 3] != "$((":
+        _push_sub(state, "$(")
+        return pos + 2
+    return None
+
+
+def _close_arith_paren(state: _LexState) -> None:
+    """Decrement arithmetic parenthesis depth and restore word boundary on closure."""
+    state.arith_depth -= 1
+    if state.arith_depth > 0:
+        state.word_start = True
+    elif state.sub_kind == "$((":
+        _pop_sub(state)
+    else:
+        state.word_start = not state.arith_word
+        state.arith_word = False
+
+
+def _enter_arith(line: str, pos: int, state: _LexState) -> int | None:
+    """Enter $(( or (( arithmetic mode from unquoted non-arithmetic text."""
+    if line[pos : pos + 3] == "$((":
+        _note_non_keyword(state)
+        state.arith_depth = 2
+        state.arith_word = True
+        state.word_start = True
+        return pos + 3
+    in_pat = bool(state.cases and state.cases[-1] in ("pat", "pat_seen"))
+    if line[pos : pos + 2] == "((" and not in_pat:
+        state.arith_depth = 2
+        state.arith_word = False
+        state.word_start = True
+        return pos + 2
     return None
 
 
 def _step_arith(line: str, pos: int, state: _LexState) -> int | None:
     """Track $(( and (( arithmetic parenthesis depth at one unquoted position."""
     if state.arith_depth == 0:
-        if line[pos : pos + 3] == "$((":
-            state.arith_depth = 2
-            state.word_start = True
-            return pos + 3
-        if line[pos : pos + 2] == "((":
-            state.arith_depth = 2
-            state.word_start = True
-            return pos + 2
-        return None
-    if line[pos] in "()":
-        state.arith_depth += 1 if line[pos] == "(" else -1
+        return _enter_arith(line, pos, state)
+    if line[pos : pos + 3] == "$((":
+        state.arith_depth += 2
         state.word_start = True
+        return pos + 3
+    if line[pos] == "(":
+        state.arith_depth += 1
+        state.word_start = True
+        return pos + 1
+    if line[pos] == ")":
+        _close_arith_paren(state)
+        return pos + 1
+    return None
+
+
+def _step_open_case(tok: str, state: _LexState) -> bool:
+    """Advance an already-open case frame if tok belongs to its header or close."""
+    top = state.cases[-1]
+    if top == "word":
+        state.cases[-1] = "in"
+        return True
+    if top == "in":
+        if tok == "in":
+            state.cases[-1] = "pat"
+        else:
+            state.cases.pop()
+        return True
+    if top in ("pat", "pat_seen", "pat_paren"):
+        if top == "pat":
+            if tok == "esac":
+                state.cases.pop()
+            else:
+                state.cases[-1] = "pat_seen"
+        return True
+    if state.cmd_pos and tok == "esac":
+        state.cases.pop()
+        return True
+    return False
+
+
+def _step_case_word(tok: str, state: _LexState) -> None:
+    """Update case/esac and command-position state inside $(...) for one plain word."""
+    if state.cases and _step_open_case(tok, state):
+        state.cmd_pos = False
+        return
+    if state.cmd_pos:
+        if tok == "case":
+            state.cases.append("word")
+            state.cmd_pos = False
+        elif tok not in _CASE_CMD_WORDS:
+            state.cmd_pos = False
+
+
+def _open_cmdsub_paren(state: _LexState) -> None:
+    """Record an opening parenthesis inside $(...) and mark paren-prefixed case patterns."""
+    if state.cases and state.cases[-1] == "pat":
+        state.cases[-1] = "pat_paren"
+        state.case_parens.append(state.paren_depth)
+    state.paren_depth += 1
+    state.word_start = True
+    state.cmd_pos = True
+
+
+def _close_cmdsub_paren(state: _LexState) -> None:
+    """Handle ) inside $(...) across case patterns, subshells and command-sub closure."""
+    if state.cases and state.cases[-1] in ("pat", "pat_seen"):
+        state.cases[-1] = "body"
+        state.word_start = True
+        state.cmd_pos = True
+        return
+    state.paren_depth -= 1
+    if state.paren_depth == 0:
+        _pop_sub(state)
+        return
+    if (
+        state.cases
+        and state.cases[-1] == "pat_paren"
+        and state.paren_depth == state.case_parens[-1]
+    ):
+        state.cases[-1] = "body"
+        state.case_parens.pop()
+    state.word_start = True
+    state.cmd_pos = True
+
+
+def _step_cmdsub_punct(line: str, pos: int, state: _LexState) -> int | None:
+    """Track case terminators and parentheses inside an active $(...) substitution."""
+    if state.sub_kind != "$(" or state.arith_depth > 0:
+        return None
+    semi3 = line[pos : pos + 3] == ";;&"
+    if semi3 or line[pos : pos + 2] in (";;", ";&"):
+        if state.cases and state.cases[-1] == "body":
+            state.cases[-1] = "pat"
+        state.word_start = True
+        state.cmd_pos = False
+        return pos + 2 + int(semi3)
+    if line[pos] == "(":
+        _open_cmdsub_paren(state)
+        return pos + 1
+    if line[pos] == ")":
+        _close_cmdsub_paren(state)
         return pos + 1
     return None
 
@@ -392,6 +752,36 @@ def _step_heredoc_op(line: str, pos: int, state: _LexState) -> int | None:
     return parsed[0]
 
 
+def _step_plain_word(line: str, pos: int, state: _LexState) -> int:
+    """Advance past an unquoted plain word token and update $(...) case state."""
+    line_len = len(line)
+    end = pos
+    for _ in range(line_len - pos):
+        if end >= line_len or line[end] not in _WORD_TOKEN_CHARS:
+            break
+        end += 1
+    if end == line_len or line[end] in _WORD_DELIMS:
+        _step_case_word(line[pos:end], state)
+    else:
+        _note_non_keyword(state)
+    state.word_start = False
+    return end
+
+
+def _step_word_or_sep(line: str, pos: int, state: _LexState) -> int:
+    """Update word-start and $(...) case state across one unquoted word or delimiter."""
+    ch = line[pos]
+    if state.sub_kind == "$(" and state.arith_depth == 0:
+        if state.word_start and ch in _WORD_TOKEN_CHARS:
+            return _step_plain_word(line, pos, state)
+        if ch in "\n;&|" and (not state.cases or state.cases[-1] == "body"):
+            state.cmd_pos = True
+        elif ch not in " \t\r\n;&|":
+            _note_non_keyword(state)
+    state.word_start = ch in HERESTRING_WORD_STARTS
+    return pos + 1
+
+
 def _step_herestring_or_char(line: str, pos: int, chars: list[str], state: _LexState) -> int:
     """Blank word-initial fd digits before <<< or advance one unquoted token."""
     line_len = len(line)
@@ -408,8 +798,7 @@ def _step_herestring_or_char(line: str, pos: int, chars: list[str], state: _LexS
     hd_next = _step_heredoc_op(line, pos, state)
     if hd_next is not None:
         return hd_next
-    state.word_start = ch in HERESTRING_WORD_STARTS
-    return pos + 1
+    return _step_word_or_sep(line, pos, state)
 
 
 def _blank_line(line: str, state: _LexState) -> str:
@@ -422,11 +811,15 @@ def _blank_line(line: str, state: _LexState) -> str:
         if pos >= line_len:
             break
         if state.quote is not None:
-            pos, state.quote = _step_quoted(line, pos, state.quote)
+            pos = _step_quoted(line, pos, state)
             continue
         nxt = _step_escape_or_quote(line, pos, state)
         if nxt is None:
+            nxt = _step_sub(line, pos, state)
+        if nxt is None:
             nxt = _step_arith(line, pos, state)
+        if nxt is None:
+            nxt = _step_cmdsub_punct(line, pos, state)
         if nxt is not None:
             pos = nxt
             continue
@@ -434,11 +827,27 @@ def _blank_line(line: str, state: _LexState) -> str:
     return "".join(chars)
 
 
+def _split_lines_lf(text: str) -> list[str]:
+    """Split shell text on LF only while preserving each terminating LF."""
+    if not text:
+        return []
+    parts = text.split("\n")
+    pending = list(reversed(parts[:-1]))
+    lines: list[str] = []
+    for _ in range(len(pending)):
+        if not pending:
+            break
+        lines.append(pending.pop() + "\n")
+    if parts[-1]:
+        lines.append(parts[-1])
+    return lines
+
+
 def blank_herestring_fds(raw: bytes) -> bytes:
     """Return equal-length shell bytes with word-initial fd digits before <<< made spaces."""
     if b"<<<" not in raw:
         return bytes(raw)
-    lines = raw.decode("utf-8", "surrogateescape").splitlines(keepends=True)
+    lines = _split_lines_lf(raw.decode("utf-8", "surrogateescape"))
     out_lines: list[str] = []
     state = _LexState()
     idx = 0

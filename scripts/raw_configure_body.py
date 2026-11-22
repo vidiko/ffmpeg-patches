@@ -461,6 +461,9 @@ ERROR_COMMANDS = SHELLS | frozenset(
         "sudo",
     )
 )
+FORBIDDEN_BLANK_NODES = frozenset(
+    ["heredoc_body", "heredoc_end", "string", "raw_string", "ansi_c_string", "comment"]
+)
 _PARSERS: list[Any] = []
 
 
@@ -605,6 +608,73 @@ def bash_parser() -> Any | str:
     return parser
 
 
+def _diff_runs(raw: bytes, blanked: bytes) -> list[tuple[int, int]]:
+    """Collect maximal half-open byte intervals where blanked differs from raw."""
+    runs: list[tuple[int, int]] = []
+    limit = len(raw)
+    idx = 0
+    for _ in range(limit):
+        if idx >= limit:
+            break
+        if raw[idx] == blanked[idx]:
+            idx += 1
+            continue
+        start = idx
+        for _ in range(limit - idx):
+            if idx >= limit or raw[idx] == blanked[idx]:
+                break
+            idx += 1
+        runs.append((start, idx))
+    return runs
+
+
+def _herestring_starts_at(root: Any, offset: int, limit: int) -> bool:
+    """Check whether byte offset is the start byte of a herestring_redirect node."""
+    if offset >= limit:
+        return False
+    cur = root.descendant_for_byte_range(offset, offset + 1)
+    for _ in range(MAX_BODY_NODES):
+        if cur is None or cur.start_byte < offset:
+            break
+        if cur.type == "herestring_redirect" and cur.start_byte == offset:
+            return True
+        cur = cur.parent
+    return False
+
+
+def _blank_run_valid(root: Any, start: int, end: int, limit: int) -> bool:
+    """Verify one blanked byte run precedes herestring_redirect outside literal/comment spans."""
+    if not _herestring_starts_at(root, end, limit):
+        return False
+    cur = root.descendant_for_byte_range(start, end)
+    for _ in range(MAX_BODY_NODES):
+        if cur is None:
+            return True
+        if cur.type in FORBIDDEN_BLANK_NODES:
+            return False
+        cur = cur.parent
+    return False
+
+
+def parse_bash(raw: bytes) -> Any:
+    """Parse blanked fd here-strings when verified, or fall back to parsing raw bytes."""
+    parser = bash_parser()
+    blanked = blank_herestring_fds(raw)
+    if len(blanked) != len(raw):
+        return parser.parse(raw)
+    tree = parser.parse(blanked)
+    if blanked == raw:
+        return tree
+    runs = _diff_runs(raw, blanked)
+    for _ in range(len(runs)):
+        if not runs:
+            break
+        start, end = runs.pop(0)
+        if not _blank_run_valid(tree.root_node, start, end, len(raw)):
+            return parser.parse(raw)
+    return tree
+
+
 def _text(node: Any, raw: bytes) -> str:
     """Decode a node's exact byte span without losing undecodable bytes."""
     return raw[node.start_byte : node.end_byte].decode("utf-8", "surrogateescape")
@@ -747,7 +817,7 @@ def _queue_inline(body: str, scan: _Scan, *, source: bool = False) -> None:
     raw = body.encode("utf-8", "surrogateescape")
     if scan.span_held:
         scan.prefix_spans.append((raw, 0, len(raw) + 1, scan.span_held))
-    root = bash_parser().parse(blank_herestring_fds(raw)).root_node
+    root = parse_bash(raw).root_node
     if source:
         watched = set(scan.literals) | {o for o in scan.script_dirs.values() if o is not None}
         names = _assignment_texts(root, raw, scan.budget, scan.var_scope)
@@ -2952,7 +3022,7 @@ def _arithmetic_writes(text: str) -> bool:
     if not any(mark in text for mark in ("$", "`")) or not ARITHMETIC_WRITE.search(text):
         return False
     raw = (": $((" + text + "))").encode("utf-8", "surrogateescape")
-    root = bash_parser().parse(blank_herestring_fds(raw)).root_node
+    root = parse_bash(raw).root_node
     if root.has_error:
         return True
     stack = [root]
@@ -3035,7 +3105,7 @@ def _inline_roots(
             continue
         names.parsed += 1
         data = body.encode("utf-8", "surrogateescape")
-        root = bash_parser().parse(blank_herestring_fds(data)).root_node
+        root = parse_bash(data).root_node
         roots.append((root, data, owners, True))
     names.inline.clear()
     return roots
@@ -3278,7 +3348,7 @@ def scan_body(
         return parser, [], [], []
     raw = body.encode("utf-8", "surrogateescape")
     scan = _Scan(context, budget, dir_changed=context.directory_changed)
-    root = parser.parse(blank_herestring_fds(raw)).root_node
+    root = parse_bash(raw).root_node
     _prime_names(scan, _assignment_texts(root, raw, budget), raw)
     if context.script_dir is not None:
         scan.rebound = _environment_rebinds(context, budget)

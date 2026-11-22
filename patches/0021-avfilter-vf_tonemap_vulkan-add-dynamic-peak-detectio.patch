@@ -17,19 +17,19 @@ The default output with peak_detect=0 is unchanged.
 
 Signed-off-by: lusoris <lusoris@proton.me>
 ---
- doc/filters.texi                          |  16 ++
+ doc/filters.texi                          |  23 ++
  libavfilter/Makefile                      |   2 +-
  libavfilter/vf_tonemap_vulkan.c           | 283 +++++++++++++++++++++-
  libavfilter/vulkan/Makefile               |   3 +-
  libavfilter/vulkan/tonemap_peak.comp.glsl | 149 ++++++++++++
- 5 files changed, 448 insertions(+), 5 deletions(-)
+ 5 files changed, 455 insertions(+), 5 deletions(-)
  create mode 100644 libavfilter/vulkan/tonemap_peak.comp.glsl
 
 diff --git a/doc/filters.texi b/doc/filters.texi
-index 0f8ed156bbc8b1a91ed0e6c3cd6cb300e3d63509..5dcee2e40e205aad7526c74409e8f71fc9aa913f 100644
+index f973a62860ac6c57be5783499be9445a40fba990..5bb5c9e9d490f3919ad474861132d03b17910436 100644
 --- a/doc/filters.texi
 +++ b/doc/filters.texi
-@@ -29602,6 +29602,22 @@ ITU-R BT.2408 tone mapping with Hable curve on IPT intensity.
+@@ -29609,6 +29609,29 @@ ITU-R BT.2408 tone mapping with Hable curve on IPT intensity.
  Signal peak override, in units of 100 cd/m^2 (nits / 100). Default is @code{0},
  which means the peak is determined from frame metadata.
  
@@ -43,11 +43,18 @@ index 0f8ed156bbc8b1a91ed0e6c3cd6cb300e3d63509..5dcee2e40e205aad7526c74409e8f71f
 +Default is 0 (disabled).
 +
 +@item threshold
-+Set the scene change window of @option{peak_detect}. A change of the
-+frame's average PQ level below @code{5 * threshold} percent is smoothed, a
-+change above @code{15 * threshold} percent resets the smoothing to the new
-+frame, and a change in between blends the two. 0 disables scene change detection.
-+Default is 0.2, a window of 1 to 3 percent.
++Set the scene change window of @option{peak_detect}. The window applies to
++the distance between the frame's average PQ level and the running average
++after the running average has taken its per-frame step toward the frame
++(about 5 percent). The frame's average PQ level is the mean of the per-tile
++averages of non-black pixels, over 16x16 tiles that contain at least one
++non-black pixel, with each such tile weighted equally. That distance is
++multiplied by the share of the frame's 16x16 tiles that contain at least
++one non-black pixel. When that weighted distance is below @code{5 *
++threshold} percent the change is smoothed, above @code{15 * threshold}
++percent the smoothing is reset to the new frame, and in between the two are
++blended. 0 disables scene change detection.
++Default is 0.2, a window of 1 to 3 percent on that weighted distance.
 +
  @item format
  Output software pixel format of the hardware frames. Can be @code{nv12} or

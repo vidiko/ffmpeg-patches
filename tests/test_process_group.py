@@ -7,6 +7,7 @@ from __future__ import annotations
 import contextlib
 import io
 import os
+import selectors
 import signal
 import subprocess  # nosec B404 - test subprocesses run fixed commands with deadlines.
 import sys
@@ -19,6 +20,7 @@ from scripts.process_group import (
     TASKKILL_TIMEOUT_S,
     kill_process_group,
     kill_process_tree,
+    read_bounded,
 )
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -70,6 +72,41 @@ class ProcessGroupTest(unittest.TestCase):
             kill_process_group(fake_own)
         mock_killpg.assert_not_called()
         fake_own.kill.assert_called_once_with()
+
+    def test_read_bounded_timeout_raises_timeout_expired(self) -> None:
+        """Verify read_bounded raises TimeoutExpired on elapsed deadlines and empty select."""
+        argv = [sys.executable, "-I", "-c", "pass"]
+        timeout = 1.5
+        now = 100.0
+        fake_process = SimpleNamespace(args=argv)
+        cases = (
+            ("elapsed_deadline", 99.0, False),
+            ("empty_select", 101.0, True),
+        )
+        read_fd, write_fd = os.pipe()
+        with os.fdopen(read_fd, "rb") as reader, os.fdopen(write_fd, "wb"):
+            for case, deadline, expects_select in cases:
+                with self.subTest(case=case):
+                    mock_select = Mock(return_value=[])
+                    with (
+                        patch("scripts.process_group.time.monotonic", return_value=now),
+                        patch.object(selectors.DefaultSelector, "select", mock_select),
+                        self.assertRaises(subprocess.TimeoutExpired) as caught,
+                    ):
+                        read_bounded(
+                            fake_process,
+                            (reader,),
+                            deadline,
+                            limit=64,
+                            timeout=timeout,
+                        )
+                    self.assertIs(type(caught.exception), subprocess.TimeoutExpired)
+                    self.assertEqual(caught.exception.cmd, argv)
+                    self.assertEqual(caught.exception.timeout, timeout)
+                    if expects_select:
+                        mock_select.assert_called_once_with(deadline - now)
+                    else:
+                        mock_select.assert_not_called()
 
 
 class ProcessTreeTest(unittest.TestCase):

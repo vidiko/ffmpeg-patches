@@ -1155,6 +1155,51 @@ class VulkanSweepTest(unittest.TestCase):
         self.assertEqual(rows[0][1], "shaderInt64")
         self.assertEqual(rows[0][3], "used-unchecked")
 
+    def test_r12_g3_feature_reads_macro_whitespace_before_open_paren(self) -> None:
+        """G3: macro call with whitespace before '(' keeps the parenthesized feature read."""
+        self.addCleanup(reset_vulkan_maps)
+        ensure_maps_fixture()
+        read_sources = (
+            "SLOT (feats->shaderInt64) = 1;\n",
+            "SLOT\t(feats->shaderInt64) = 1;\n",
+            "SLOT\n(feats->shaderInt64) = 1;\n",
+            "SLOT  (feats->shaderInt64) = 1;\n",
+        )
+        for source in read_sources:
+            with self.subTest(source=source):
+                sites = sweep_vulkan_features.c_feature_reads(source)
+                self.assertEqual(len(sites), 1)
+                self.assertEqual(sites[0].feature, "shaderInt64")
+
+    def test_r12_g3_feature_reads_keyword_paren_wrapped_plain_writes(self) -> None:
+        """G3: keyword-prefixed parenthesized plain '=' targets are not feature reads."""
+        self.addCleanup(reset_vulkan_maps)
+        ensure_maps_fixture()
+        write_sources = (
+            "return (feats->shaderInt64) = 1;\n",
+            "else (feats->shaderInt64) = 1;\n",
+            " (feats->shaderInt64) = VK_TRUE;\n",
+        )
+        for source in write_sources:
+            with self.subTest(source=source):
+                self.assertEqual(sweep_vulkan_features.c_feature_reads(source), [])
+
+    def test_r12_g3_compare_gates_macro_whitespace_before_open_paren(self) -> None:
+        """G3: macro whitespace before '(' is a read, not compare_gates used-unchecked."""
+        self.addCleanup(reset_vulkan_maps)
+        ensure_maps_fixture()
+        source = "#define SLOT(i) slots[(i)]\nSLOT (feats->shaderInt64) = 1;\n"
+        checked = sweep_vulkan_features.c_feature_reads(source)
+        needs = [
+            sweep_vulkan_features.ShaderNeeds(
+                "libavfilter/vulkan/b.comp.glsl",
+                {"shaderInt64"},
+                {"shaderInt64": "capability:Int64"},
+            )
+        ]
+        rows = sweep_vulkan_features.compare_gates("libavfilter/vf_test_vulkan.c", checked, needs)
+        self.assertEqual(rows, [])
+
     def test_r7_g4_dynamic_storage_index_disasm_cases(self) -> None:
         """G4: dynamic_storage_index counts storage-image arrays only, not sampled or buffers."""
         sampled = sweep_vulkan_features.dynamic_storage_index(R7_SAMPLED_DISASM)

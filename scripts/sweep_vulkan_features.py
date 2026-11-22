@@ -297,14 +297,51 @@ def collect_targets(
 
 _IDENT_TAIL = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_")
 PLAIN_ASSIGN_WINDOW = 256
+WRAPPER_PRED_KEYWORDS = frozenset({"return", "else", "do", "case"})
+
+
+def _non_ws_before(text: str, open_index: int, floor: int) -> int:
+    """Return the index of the last non-whitespace character before open_index."""
+    index = open_index - 1
+    for _ in range(PLAIN_ASSIGN_WINDOW):
+        if index < floor:
+            return -1
+        if text[index] not in " \t\n\r":
+            return index
+        index -= 1
+    return -1
+
+
+def _identifier_ending_at(text: str, end_index: int, floor: int) -> str | None:
+    """Return the identifier ending at end_index, or None when not an identifier tail."""
+    if end_index < floor or text[end_index] not in _IDENT_TAIL:
+        return None
+    start = end_index
+    for _ in range(PLAIN_ASSIGN_WINDOW):
+        if start < floor or text[start] not in _IDENT_TAIL:
+            break
+        start -= 1
+    start += 1
+    if start > end_index:
+        return None
+    return text[start : end_index + 1]
 
 
 def _member_pred_ok(text: str, index: int) -> bool:
-    """Return True when '(' at index is not directly after an identifier, ']' or ')'."""
+    """Return True when '(' at index is not opened by a call, subscript, or index expression."""
     if index <= 0:
         return True
-    previous = text[index - 1]
-    return previous not in _IDENT_TAIL and previous not in "])"
+    floor = max(0, index - PLAIN_ASSIGN_WINDOW)
+    back = _non_ws_before(text, index, floor)
+    if back < floor:
+        return True
+    previous = text[back]
+    if previous in "])":
+        return False
+    if previous in _IDENT_TAIL:
+        ident = _identifier_ending_at(text, back, floor)
+        return ident is not None and ident in WRAPPER_PRED_KEYWORDS
+    return True
 
 
 def _skip_ws_back(text: str, index: int, floor: int) -> int:

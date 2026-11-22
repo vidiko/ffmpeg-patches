@@ -869,6 +869,56 @@ class LaneBriefTest(unittest.TestCase):
                 self.assertEqual(rc, 1, error)
                 self.assertIn("conflict:", error)
 
+    def test_conflict_whole_file_lane_owned_awk_passes(self) -> None:
+        """Pass awk length without parentheses over a commit message draft under .lane/."""
+        rc, error = self.check_snippet("- `awk 'length > 72' .lane/evidence/x/msg-new.txt`\n")
+        self.assertEqual(rc, 0, error)
+
+    def test_conflict_whole_file_lane_owned_grep_passes(self) -> None:
+        """Pass grep with a three-digit counted dot over a lane-owned file."""
+        rc, error = self.check_snippet(r"- `grep -n '.\{101\}' .lane/evidence/foo/body.txt`" + "\n")
+        self.assertEqual(rc, 0, error)
+
+    def test_conflict_whole_file_lane_owned_wc_passes(self) -> None:
+        """Pass wc max-line-length over a file under .lane/tmp/."""
+        rc, error = self.check_snippet("- `wc --max-line-length .lane/tmp/wrap-check.txt`\n")
+        self.assertEqual(rc, 0, error)
+
+    def test_conflict_whole_file_lane_owned_absolute_passes(self) -> None:
+        """Pass when an absolute path operand contains a /.lane/ segment."""
+        rc, error = self.check_snippet(
+            "- `awk 'length > 72' "
+            "/home/example/dev/worktrees/ffmpeg-patches/.lane/evidence/x/msg.txt`\n"
+        )
+        self.assertEqual(rc, 0, error)
+
+    def test_conflict_whole_file_repository_awk_refused(self) -> None:
+        """Refuse bare awk length over a repository file under scripts/."""
+        rc, error = self.check_snippet("- `awk 'length > 72' scripts/lane_brief.py`\n")
+        self.assertEqual(rc, 1, error)
+        self.assertIn("conflict:", error)
+        self.assertIn("lane_brief.py", error)
+
+    def test_conflict_whole_file_mixed_lane_repo_operands_refused(self) -> None:
+        """Refuse when one operand is lane-owned and another is a repository file."""
+        rc, error = self.check_snippet(
+            "- `awk 'length > 72' .lane/tmp/a.txt scripts/lane_brief.py`\n"
+        )
+        self.assertEqual(rc, 1, error)
+        self.assertIn("conflict:", error)
+
+    def test_conflict_whole_file_lane_dotdot_operand_refused(self) -> None:
+        """Refuse a .lane path that escapes through a parent .. segment."""
+        rc, error = self.check_snippet("- `awk 'length > 72' .lane/tmp/../scripts/x.py`\n")
+        self.assertEqual(rc, 1, error)
+        self.assertIn("conflict:", error)
+
+    def test_conflict_whole_file_bare_filename_refused(self) -> None:
+        """Refuse a whole-file length check on a bare worktree-root filename."""
+        rc, error = self.check_snippet("- `awk 'length > 72' Makefile`\n")
+        self.assertEqual(rc, 1, error)
+        self.assertIn("conflict:", error)
+
     def test_conflict_nested_repository_passes(self) -> None:
         """Accept a 40-hex commit held by a nested repository named with git -C."""
         worktree, _, nested_commit = self.nested_commit_fixture()

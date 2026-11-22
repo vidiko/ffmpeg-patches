@@ -399,6 +399,21 @@ def conflict_join_under_column_limit(content: str) -> str:
     return f'"{join_text}" under "{limit_text}": give the exact wrapped form instead of a join'
 
 
+def span_lane_owned_file_operands(span: str) -> bool:
+    """Return whether every slash path operand in a command span lies under .lane/."""
+    stripped = re.sub(r"'[^']*'", " ", span)
+    stripped = re.sub(r'"[^"]*"', " ", stripped)
+    operands = [token for token in stripped.split() if "/" in token and not token.startswith("-")]
+    if not operands:
+        return False
+    for token in operands:
+        if ".." in token.split("/"):
+            return False
+        if not (token.startswith(".lane/") or "/.lane/" in token):
+            return False
+    return True
+
+
 def conflict_whole_file_length_check(content: str) -> str:
     """Report a backtick line-length command that does not read a git diff."""
     for match in non_clause_spans(content):
@@ -406,6 +421,8 @@ def conflict_whole_file_length_check(content: str) -> str:
             continue
         span = match.group(1)
         if WHOLE_FILE_LENGTH.search(span) and not GIT_DIFF_COMMAND.search(span):
+            if span_lane_owned_file_operands(span):
+                continue
             span_text = " ".join(span.split())
             return f"`{span_text}`: check only added lines of a git diff"
     return ""

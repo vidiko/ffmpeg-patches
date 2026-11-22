@@ -5,7 +5,13 @@
 from __future__ import annotations
 
 from scripts import raw_configure_inspect, raw_configure_unwrap, raw_configure_words
-from tests.raw_configure_support import GUARD_MOD, RawConfigureGuardBase
+from tests import (
+    raw_configure_support,
+    test_raw_configure_files,
+    test_raw_configure_guard,
+    test_raw_configure_shapes,
+)
+from tests.raw_configure_support import CLIENTS, GUARD_MOD, RawConfigureGuardBase
 
 
 class RawConfigureHelperTest(RawConfigureGuardBase):
@@ -223,3 +229,37 @@ class RawConfigureHelperTest(RawConfigureGuardBase):
         self.assertTrue(raw_configure_inspect._assignment_blocked("GIT_PAGER=./configure", {}))
         self.assertFalse(raw_configure_inspect._assignment_blocked("CFLAGS=-O2", {}))
         self.assertFalse(raw_configure_inspect._assignment_blocked("not_an_assignment", {}))
+
+    def test_all_clients_switch_helper(self) -> None:
+        """Verify all_clients client selection, suite switches, and parser reason checks."""
+        seen: list[str] = []
+        drop_reason_client: str | None = None
+
+        def stub(
+            client: str, payload: object, env: dict[str, str] | None = None
+        ) -> raw_configure_support.subprocess.CompletedProcess[str]:
+            """Record each client and return a stubbed refusal process."""
+            del payload, env
+            seen.append(client)
+            extra = "" if client == drop_reason_client else " body-reason"
+            stderr = f"raw configure refused{extra}: python3 scripts/ffmpeg_configure.py"
+            return raw_configure_support.subprocess.CompletedProcess(
+                args=[], returncode=2, stdout="", stderr=stderr
+            )
+
+        self.run_guard = stub
+        cases = (("./configure", self.tree), ("sh configure", self.tree))
+        self.assertIs(self.all_clients, False)
+        self._assert_refused(cases)
+        self.assertEqual(seen, list(CLIENTS[:2]))
+        seen.clear()
+        self.all_clients = True
+        self._assert_refused(cases)
+        self.assertEqual(seen, [*CLIENTS, *CLIENTS])
+        self.assertIs(test_raw_configure_guard.RawConfigureGuardTest.all_clients, True)
+        self.assertIs(test_raw_configure_guard.ReviewRoundGuardTest.all_clients, True)
+        self.assertIs(test_raw_configure_files.RawConfigureFilesTest.all_clients, False)
+        self.assertIs(test_raw_configure_shapes.RawConfigureShapeTest.all_clients, False)
+        drop_reason_client = CLIENTS[-1]
+        with self.assertRaises(AssertionError):
+            self._check_parser_body("echo x\n", refused=True, reason="body-reason")

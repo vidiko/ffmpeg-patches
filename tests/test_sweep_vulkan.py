@@ -24,8 +24,23 @@ SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "variant_sweep.py"
 GLSLANG = Path("/usr/bin/glslangValidator")
 SPIRV_DIS = Path("/usr/bin/spirv-dis")
 SPIRV_VAL = Path("/usr/bin/spirv-val")
-SKIP_VULKAN = not all(tool.is_file() for tool in (GLSLANG, SPIRV_DIS, SPIRV_VAL))
-SKIP_REASON = "Vulkan toolchain binaries missing under /usr/bin"
+SYSTEM_VK_XML = Path("/usr/share/vulkan/registry/vk.xml")
+_VULKAN_TOOLS_PRESENT = all(tool.is_file() for tool in (GLSLANG, SPIRV_DIS, SPIRV_VAL))
+_SYSTEM_VKXML_PRESENT = SYSTEM_VK_XML.is_file()
+SKIP_VULKAN = not _VULKAN_TOOLS_PRESENT or not _SYSTEM_VKXML_PRESENT
+
+
+def vulkan_skip_reason() -> str:
+    """Return the skip reason when the Vulkan toolchain or system vk.xml is absent."""
+    reasons: list[str] = []
+    if not _VULKAN_TOOLS_PRESENT:
+        reasons.append("Vulkan toolchain binaries missing under /usr/bin")
+    if not _SYSTEM_VKXML_PRESENT:
+        reasons.append(f"system vk.xml missing: {SYSTEM_VK_XML}")
+    return "; ".join(reasons)
+
+
+SKIP_REASON = vulkan_skip_reason()
 
 SIMPLE_SHADER = """\
 #version 460
@@ -251,6 +266,12 @@ def ensure_maps_fixture() -> None:
     state.feature_allowlist = feature_allow
     state.feature_struct_names = struct_names
     state.derivable = sweep_vulkan_features.derivable_features(cap_map)
+
+
+def bind_g3_maps_fixture(test: unittest.TestCase) -> None:
+    """Reset MAP_STATE after the test and preload maps from the G3 vk.xml fixture."""
+    test.addCleanup(reset_vulkan_maps)
+    ensure_maps_fixture()
 
 
 R7_NONUNIFORM_ONLY_DISASM = "\n".join(
@@ -875,6 +896,7 @@ class VulkanSweepTest(unittest.TestCase):
         run_git(self.repo, "add", "libavfilter/vulkan")
         run_git(self.repo, "commit", "-qm", "head")
         head = run_git(self.repo, "rev-parse", "HEAD")
+        bind_g3_maps_fixture(self)
         with (
             unittest.mock.patch.object(sweep_vulkan_features, "MAX_VULKAN_FILES", 1),
             unittest.mock.patch(
@@ -1834,6 +1856,7 @@ class PortParityWithoutToolsTest(VulkanMutantHarness):
             shader_name="test.comp.glsl",
             shader=SIMPLE_SHADER,
         )
+        bind_g3_maps_fixture(self)
         with (
             unittest.mock.patch.object(sweep_vulkan_features, "GLSLANG", missing),
             unittest.mock.patch.object(sweep_vulkan_features, "SPIRV_DIS", missing),

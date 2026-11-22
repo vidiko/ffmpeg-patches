@@ -833,7 +833,18 @@ def sweep_all(directory: str, base: str, head: str) -> str:
     base = metadata[1].removeprefix("base: ")
     head = metadata[2].removeprefix("head: ")
     for name in ("state_advance", "doc_claims", "vulkan_features", "port_parity"):
-        report += "\n" + sweep_class(name, directory, base, head, deadline)
+        try:
+            report += "\n" + sweep_class(name, directory, base, head, deadline)
+        except RuntimeError as error:
+            if name != "vulkan_features" or type(error).__name__ != "VulkanFeatureSweepError":
+                raise
+            section = name.replace("_", "-")
+            table = REPORT_TABLES["vulkan-features"]
+            report += (
+                f"\nclass: {section}\nhead: {head}\n\n"
+                f"{table}\n| --- | --- | --- | --- | --- |\n"
+                f"prerequisite: {error}\n"
+            )
         check_limit("report size", len(report.encode("utf-8")), MAX_REPORT_BYTES)
     report += "\n" + render_review_classes(head)
     check_deadline(deadline)

@@ -38,6 +38,10 @@ MAX_SHADERS = 64
 MAX_TOOL_BYTES = 8 * 1024 * 1024
 SHADER_SYMBOL = re.compile(r"ff_(\w+)_comp_spv_data", re.ASCII)
 FEATURE_READ = re.compile(r"(?:\.\s*|\s*->\s*)([A-Za-z]\w*)", re.ASCII)
+FEATURE_STRUCT_DECL = re.compile(
+    r"\b(VkPhysicalDevice\w+)\s*(\*+\s*|\s+)(\w+)\s*(?=[,;=)])",
+    re.ASCII,
+)
 VULKAN_C = re.compile(r"libavfilter/vf_.+_vulkan\.c\Z")
 SHADER_PATH = re.compile(r"libavfilter/vulkan/.+\.comp\.glsl\Z")
 
@@ -49,6 +53,7 @@ class VulkanMapState:
     allowlist: frozenset[str] = frozenset()
     capability_map: dict[str, CapabilityEnables] = {}
     feature_allowlist: frozenset[str] = frozenset()
+    feature_struct_names: frozenset[str] = frozenset()
     derivable: frozenset[str] = frozenset()
 
 
@@ -99,6 +104,21 @@ def feature_allowlist_from_xml(root: ET.Element) -> frozenset[str]:
     return frozenset(allow)
 
 
+def feature_struct_names_from_xml(root: ET.Element) -> frozenset[str]:
+    """Collect Vk feature struct names that may hold VkPhysicalDeviceFeatures gates."""
+    names: set[str] = {"VkPhysicalDeviceFeatures"}
+    for struct in root.iter("type"):
+        if struct.get("category") != "struct":
+            continue
+        name = struct.get("name", "")
+        extends = struct.get("structextends", "")
+        if name == "VkPhysicalDeviceFeatures":
+            continue
+        if "VkPhysicalDeviceFeatures2" in extends:
+            names.add(name)
+    return frozenset(names)
+
+
 def derivable_features(cap_map: dict[str, CapabilityEnables]) -> frozenset[str]:
     """Return feature names derivable from SPIR-V capabilities, indexing, or scalar layout."""
     features: set[str] = {
@@ -113,7 +133,7 @@ def derivable_features(cap_map: dict[str, CapabilityEnables]) -> frozenset[str]:
 
 def load_maps(
     xml_path: Path,
-) -> tuple[frozenset[str], dict[str, CapabilityEnables], frozenset[str]]:
+) -> tuple[frozenset[str], dict[str, CapabilityEnables], frozenset[str], frozenset[str]]:
     """Build SPIR-V capability map and Vk feature allow-lists from vk.xml."""
     root = ET.parse(xml_path).getroot()
     allow: set[str] = set()
@@ -134,7 +154,8 @@ def load_maps(
         if features or non_feature:
             cap_map[name] = CapabilityEnables(frozenset(features), non_feature)
     feature_allow = feature_allowlist_from_xml(root)
-    return frozenset(allow), cap_map, feature_allow
+    struct_names = feature_struct_names_from_xml(root)
+    return frozenset(allow), cap_map, feature_allow, struct_names
 
 
 def ensure_maps() -> None:
@@ -143,10 +164,11 @@ def ensure_maps() -> None:
         return
     if not VK_XML.is_file():
         raise VulkanFeatureSweepError(f"missing vk.xml: {VK_XML}")
-    allowlist, capability_map, feature_allowlist = load_maps(VK_XML)
+    allowlist, capability_map, feature_allowlist, struct_names = load_maps(VK_XML)
     MAP_STATE.allowlist = allowlist
     MAP_STATE.capability_map = capability_map
     MAP_STATE.feature_allowlist = feature_allowlist
+    MAP_STATE.feature_struct_names = struct_names
     MAP_STATE.derivable = derivable_features(capability_map)
     MAP_STATE.loaded = True
 
@@ -178,9 +200,13 @@ def run_tool(argv: list[str], deadline: float, maximum: int, label: str) -> str:
 
 def linked_shaders(c_source: str) -> list[str]:
     """Return head-commit shader paths referenced by ff_*_comp_spv_data symbols."""
-    paths = []
+    paths: list[str] = []
+    seen: set[str] = set()
     for match in SHADER_SYMBOL.finditer(mask_literals(c_source)):
-        paths.append(f"libavfilter/vulkan/{match[1]}.comp.glsl")
+        path = f"libavfilter/vulkan/{match[1]}.comp.glsl"
+        if path not in seen:
+            seen.add(path)
+            paths.append(path)
     return paths
 
 
@@ -229,10 +255,21 @@ def owners_for_shaders(directory: str, head: str, shaders: set[str], deadline: f
             deadline=deadline,
             missing_ok=True,
         )
+        shader_path = f"libavfilter/vulkan/{stem}.comp.glsl"
         prefix = f"{head}:"
         for line in listing.splitlines():
             path = line[len(prefix) :] if line.startswith(prefix) else line
-            if VULKAN_C.fullmatch(path):
+            if not VULKAN_C.fullmatch(path):
+                continue
+            source = git(
+                directory,
+                "show",
+                f"{head}:{path}",
+                deadline=deadline,
+                maximum=MAX_TOOL_BYTES,
+                limit_name="source size",
+            )
+            if shader_path in linked_shaders(source):
                 owners.add(path)
     return owners
 
@@ -408,13 +445,66 @@ def plain_assignment_after(text: str, member_end: int, member_access_start: int)
     return False
 
 
+def c_feature_var_types(masked: str) -> dict[str, str | None]:
+    """Map identifiers to eligible Vk feature struct types, or None when ineligible."""
+    types: dict[str, str | None] = {}
+    allowed = MAP_STATE.feature_struct_names
+    for match in FEATURE_STRUCT_DECL.finditer(masked):
+        struct = match[1]
+        types[match[3]] = struct if struct in allowed else None
+    for match in re.finditer(
+        r"\b(?!VkPhysicalDevice|struct|if|for|while|return|sizeof|switch)"
+        r"([A-Za-z_]\w*)\s+(\*+\s*|\s+)(\w+)\s*(?=[,;=)])",
+        masked,
+    ):
+        struct = match[1]
+        if struct == "void":
+            continue
+        var = match[3]
+        if var not in types:
+            types[var] = None
+    for match in re.finditer(r"\}\s*(\w+)\s*;", masked):
+        var = match[1]
+        if var not in types:
+            types[var] = None
+    return types
+
+
+def feature_read_receiver_root(masked: str, member_access_start: int) -> str | None:
+    """Return the root identifier for the receiver of one feature member access."""
+    token_start = access_expr_first_token_start(masked, member_access_start)
+    end = token_start
+    limit = len(masked)
+    while end < limit and masked[end] in _IDENT_TAIL:
+        end += 1
+    if end == token_start:
+        return None
+    return masked[token_start:end]
+
+
+def feature_read_from_eligible_struct(
+    masked: str, match: re.Match[str], var_types: dict[str, str | None]
+) -> bool:
+    """Return True when a feature member read uses an eligible Vk feature struct."""
+    root = feature_read_receiver_root(masked, match.start())
+    if root is None:
+        return True
+    if root not in var_types:
+        return True
+    struct = var_types[root]
+    return struct is not None and struct in MAP_STATE.feature_struct_names
+
+
 def c_feature_reads(source: str) -> list[FeatureSite]:
     """Collect VkPhysicalDeviceFeatures gate reads from masked C source."""
     masked = mask_literals(source)
+    var_types = c_feature_var_types(masked)
     sites: list[FeatureSite] = []
     for match in FEATURE_READ.finditer(masked):
         feature = match[1]
         if feature not in MAP_STATE.feature_allowlist:
+            continue
+        if not feature_read_from_eligible_struct(masked, match, var_types):
             continue
         if plain_assignment_after(masked, match.end(), match.start()):
             continue
@@ -524,10 +614,11 @@ def dynamic_storage_index(disasm: str) -> tuple[bool, bool]:
         index = chain[3]
         if index is None or base not in array_vars:
             continue
-        if index not in constants and not index.startswith("%int_"):
-            dynamic = True
-        if index in nonuniform_ids:
+        indexed_nonuniform = index in nonuniform_ids or base in nonuniform_ids
+        if indexed_nonuniform:
             nonuniform = True
+        elif index not in constants and not index.startswith("%int_"):
+            dynamic = True
     return dynamic, nonuniform
 
 

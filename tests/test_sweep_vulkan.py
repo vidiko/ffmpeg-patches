@@ -194,7 +194,7 @@ def r6_t3_capability_map(scratch: Path) -> dict[str, sweep_vulkan_features.Capab
     """Load the r6 T3 vk.xml fixture into a capability map."""
     xml_path = scratch / "vk.xml"
     xml_path.write_text(R6_T3_VKXML, encoding="utf-8")
-    _, cap_map, _ = sweep_vulkan_features.load_maps(xml_path)
+    _, cap_map, _, _ = sweep_vulkan_features.load_maps(xml_path)
     return cap_map
 
 
@@ -211,7 +211,63 @@ def reset_vulkan_maps() -> None:
     state.allowlist = frozenset()
     state.capability_map = {}
     state.feature_allowlist = frozenset()
+    state.feature_struct_names = frozenset()
     state.derivable = frozenset()
+
+
+def install_g3_registry(scratch: Path) -> Path:
+    """Write a minimal vk.xml with one Vk feature member for parser-only tests."""
+    xml = scratch / "vk-g3.xml"
+    xml.write_text(
+        "\n".join(
+            (
+                "<registry>",
+                '  <types><type category="struct" name="VkPhysicalDeviceFeatures">',
+                "    <member><type>VkBool32</type><name>shaderInt64</name></member>",
+                "  </type></types>",
+                "  <spirvcapabilities>",
+                '    <spirvcapability name="Int64">',
+                '      <enable feature="shaderInt64"/>',
+                "    </spirvcapability>",
+                "  </spirvcapabilities>",
+                "</registry>",
+            )
+        ),
+        encoding="utf-8",
+    )
+    return xml
+
+
+def ensure_maps_fixture() -> None:
+    """Load MAP_STATE from the minimal G3 vk.xml fixture."""
+    reset_vulkan_maps()
+    with tempfile.TemporaryDirectory() as scratch:
+        xml = install_g3_registry(Path(scratch))
+        allow, cap_map, feature_allow, struct_names = sweep_vulkan_features.load_maps(xml)
+    state = sweep_vulkan_features.MAP_STATE
+    state.loaded = True
+    state.allowlist = allow
+    state.capability_map = cap_map
+    state.feature_allowlist = feature_allow
+    state.feature_struct_names = struct_names
+    state.derivable = sweep_vulkan_features.derivable_features(cap_map)
+
+
+R7_NONUNIFORM_ONLY_DISASM = "\n".join(
+    (
+        "%float = OpTypeFloat 32",
+        "%uint = OpTypeInt 32 0",
+        "%uint_4 = OpConstant %uint 4",
+        "%7 = OpTypeImage %float 2D 0 0 0 2 Rgba8",
+        "%_arr_7_uint_4 = OpTypeArray %7 %uint_4",
+        "%_ptr_UniformConstant__arr_7_uint_4 = OpTypePointer UniformConstant %_arr_7_uint_4",
+        "%imgs = OpVariable %_ptr_UniformConstant__arr_7_uint_4 UniformConstant",
+        "%_ptr_UniformConstant_7 = OpTypePointer UniformConstant %7",
+        "%idx = OpLoad %uint %pc_idx",
+        "OpDecorate %idx NonUniform",
+        "%21 = OpAccessChain %_ptr_UniformConstant_7 %imgs %idx",
+    )
+)
 
 
 def load_mutant_module(rel_path: str, old: str, new: str, tmp: Path) -> ModuleType:
@@ -1004,11 +1060,19 @@ class VulkanSweepTest(unittest.TestCase):
             ["libavfilter/vulkan/new.comp.glsl"],
         )
 
+    def test_cr10_4658985440_g3_fixture_registry(self) -> None:
+        """CR10-5440: G3 parser tests load vk.xml maps from the minimal fixture registry."""
+        missing = Path("/nonexistent/vk-cr10-5440/vk.xml")
+        self.addCleanup(reset_vulkan_maps)
+        with unittest.mock.patch.object(sweep_vulkan_features, "VK_XML", missing):
+            ensure_maps_fixture()
+            sites = sweep_vulkan_features.c_feature_reads("if (feats->shaderInt64 == VK_TRUE) {}\n")
+            self.assertEqual([site.feature for site in sites], ["shaderInt64"])
+
     def test_r7_g3_feature_reads_skip_plain_writes(self) -> None:
         """G3: c_feature_reads ignores plain assignments but keeps genuine feature reads."""
-        reset_vulkan_maps()
         self.addCleanup(reset_vulkan_maps)
-        sweep_vulkan_features.ensure_maps()
+        ensure_maps_fixture()
         write_only = "feats->shaderInt64 = VK_TRUE;\n"
         self.assertEqual(sweep_vulkan_features.c_feature_reads(write_only), [])
         wrapped = "feats->shaderInt64\n    = VK_TRUE;\n"
@@ -1026,9 +1090,8 @@ class VulkanSweepTest(unittest.TestCase):
 
     def test_r7_g3_compare_gates_write_only_feature(self) -> None:
         """G3: compare_gates reports used-unchecked when C only writes an unchecked feature."""
-        reset_vulkan_maps()
         self.addCleanup(reset_vulkan_maps)
-        sweep_vulkan_features.ensure_maps()
+        ensure_maps_fixture()
         source = "feats->shaderInt64 = VK_TRUE;\n"
         checked = sweep_vulkan_features.c_feature_reads(source)
         needs = [
@@ -1045,9 +1108,8 @@ class VulkanSweepTest(unittest.TestCase):
 
     def test_r7_g3_feature_reads_skip_paren_wrapped_writes(self) -> None:
         """G3: c_feature_reads skips parenthesized plain '=' assignment targets."""
-        reset_vulkan_maps()
         self.addCleanup(reset_vulkan_maps)
-        sweep_vulkan_features.ensure_maps()
+        ensure_maps_fixture()
         write_sources = (
             "(feats->shaderInt64) = VK_TRUE;\n",
             "((feats->shaderInt64)) = VK_TRUE;\n",
@@ -1060,9 +1122,8 @@ class VulkanSweepTest(unittest.TestCase):
 
     def test_r7_g3_feature_reads_keep_paren_non_writes(self) -> None:
         """G3: parenthesized forms that are not plain writes remain feature reads."""
-        reset_vulkan_maps()
         self.addCleanup(reset_vulkan_maps)
-        sweep_vulkan_features.ensure_maps()
+        ensure_maps_fixture()
         read_sources = (
             "if ((feats->shaderInt64) == VK_TRUE) {}\n",
             "ok = (feats->shaderInt64);\n",
@@ -1078,9 +1139,8 @@ class VulkanSweepTest(unittest.TestCase):
 
     def test_r7_g3_compare_gates_paren_wrapped_write_only_feature(self) -> None:
         """G3: compare_gates treats parenthesized plain writes as used-unchecked."""
-        reset_vulkan_maps()
         self.addCleanup(reset_vulkan_maps)
-        sweep_vulkan_features.ensure_maps()
+        ensure_maps_fixture()
         source = "(feats->shaderInt64) = VK_TRUE;\n"
         checked = sweep_vulkan_features.c_feature_reads(source)
         needs = [
@@ -1103,6 +1163,122 @@ class VulkanSweepTest(unittest.TestCase):
         self.assertEqual(sampled, (False, False))
         self.assertEqual(storage, (True, False))
         self.assertEqual(buffer, (False, False))
+
+    def test_cr10_4658985427_shift_not_mask_from_separate_arg(self) -> None:
+        """CR10-5427: mask on a later call argument does not override shift on the sample."""
+        source = "unsigned v = use(src[0] >> 4, flags & 0xff);\n"
+        self.assertEqual(sweep_port_parity.cpu_sites(source), [(1, "shift")])
+
+    def test_cr10_4658985429_linked_shaders_dedupes_repeated_symbols(self) -> None:
+        """CR10-5429: repeated extern and use symbols link one shader path in first-seen order."""
+        c_source = (
+            "extern const unsigned char ff_dup_comp_spv_data[];\n"
+            "const unsigned char *p = ff_dup_comp_spv_data;\n"
+        )
+        self.assertEqual(
+            sweep_vulkan_features.linked_shaders(c_source),
+            ["libavfilter/vulkan/dup.comp.glsl"],
+        )
+
+    def test_cr10_4658985429_sixty_five_distinct_shaders_exceed_limit(self) -> None:
+        """CR10-5429: 65 distinct linked shaders still fail the shader count cap."""
+        symbols = "".join(
+            f"extern const unsigned char ff_n{i}_comp_spv_data[];\n" for i in range(65)
+        )
+        (self.repo / "libavfilter" / "vf_big_vulkan.c").write_text(symbols, encoding="utf-8")
+        (self.repo / "libavfilter" / "fix.c").write_text(
+            (self.repo / "libavfilter" / "fix.c").read_text(encoding="utf-8") + "\n",
+            encoding="utf-8",
+        )
+        run_git(self.repo, "add", ".")
+        run_git(self.repo, "commit", "-qm", "head")
+        head = run_git(self.repo, "rev-parse", "HEAD")
+        deadline = time.monotonic() + 120
+        names = sweep_vulkan_features.diff_names(str(self.repo), self.base, head, deadline)
+        with self.assertRaisesRegex(RuntimeError, "shader count"):
+            sweep_vulkan_features.collect_targets(str(self.repo), head, names, deadline)
+
+    def test_cr10_4658985432_owner_requires_active_shader_link(self) -> None:
+        """CR10-5432: owners_for_shaders ignores C files that only mention a shader in comments."""
+        (self.repo / "libavfilter" / "vf_ghost_vulkan.c").write_text(
+            "/* ff_ghost_comp_spv_data */\nint f(void){return 0;}\n",
+            encoding="utf-8",
+        )
+        (self.repo / "libavfilter" / "vulkan" / "ghost.comp.glsl").write_text(
+            SIMPLE_SHADER + "\n",
+            encoding="utf-8",
+        )
+        run_git(self.repo, "add", ".")
+        run_git(self.repo, "commit", "-qm", "head")
+        head = run_git(self.repo, "rev-parse", "HEAD")
+        deadline = time.monotonic() + 120
+        owners = sweep_vulkan_features.owners_for_shaders(
+            str(self.repo),
+            head,
+            {"libavfilter/vulkan/ghost.comp.glsl"},
+            deadline,
+        )
+        self.assertNotIn("libavfilter/vf_ghost_vulkan.c", owners)
+
+    def test_cr10_4658985437_nonuniform_index_without_dynamic(self) -> None:
+        """CR10-5437: NonUniform storage-image indexing does not imply dynamic uniform indexing."""
+        self.assertEqual(
+            sweep_vulkan_features.dynamic_storage_index(R7_NONUNIFORM_ONLY_DISASM),
+            (False, True),
+        )
+
+    def test_cr10_b_minor_ineligible_struct_feature_read(self) -> None:
+        """CR10 minor: allowlisted members read from unrelated structs do not satisfy gates."""
+        self.addCleanup(reset_vulkan_maps)
+        ensure_maps_fixture()
+        source = (
+            "struct Other { VkBool32 shaderInt64; } other;\n"
+            "VkPhysicalDeviceFeatures *feats;\n"
+            "if (feats->shaderInt64 && other.shaderInt64) {}\n"
+        )
+        sites = sweep_vulkan_features.c_feature_reads(source)
+        self.assertEqual(len(sites), 1)
+        self.assertEqual(sites[0].feature, "shaderInt64")
+        needs = [
+            sweep_vulkan_features.ShaderNeeds(
+                "libavfilter/vulkan/b.comp.glsl",
+                {"shaderInt64"},
+                {"shaderInt64": "capability:Int64"},
+            )
+        ]
+        rows = sweep_vulkan_features.compare_gates("libavfilter/vf_test_vulkan.c", sites, needs)
+        self.assertEqual(rows, [])
+
+    def test_cr10_b_nitpick_first_shader_match_cached_per_kind(self) -> None:
+        """CR10 nitpick: repeated CPU mask sites reuse one first_shader_match lookup per kind."""
+        calls: list[tuple[object, ...]] = []
+        real = sweep_port_parity.first_shader_match
+
+        def recorder(*args, **kwargs):
+            calls.append(args)
+            return real(*args, **kwargs)
+
+        cpu = (
+            "void f(const uint16_t *src, uint16_t *dst) {\n"
+            "    dst[0] = src[0] & 0xFF00u;\n"
+            "    dst[1] = src[1] & 0xFF00u;\n"
+            "}\n"
+        )
+        c_vulkan = (
+            "extern const unsigned char ff_test_comp_spv_data[];\nint f(void) { return 0; }\n"
+        )
+        head = self.commit_filter(
+            c_vulkan=c_vulkan,
+            shader_name="test.comp.glsl",
+            shader=MASKED_SHADER,
+            cpu=cpu,
+        )
+        match_patch = unittest.mock.patch.object(
+            sweep_port_parity, "first_shader_match", side_effect=recorder
+        )
+        with match_patch:
+            self.parity_report(head)
+        self.assertEqual(len(calls), 1)
 
     @unittest.skipIf(SKIP_VULKAN, SKIP_REASON)
     def test_r7_g4_sampled_array_no_storage_dynamic_row(self) -> None:
@@ -1552,9 +1728,12 @@ class PortParityWithoutToolsTest(VulkanMutantHarness):
             unittest.mock.patch.object(sweep_vulkan_features, "GLSLANG", missing),
             unittest.mock.patch.object(sweep_vulkan_features, "SPIRV_DIS", missing),
             unittest.mock.patch.object(sweep_vulkan_features, "SPIRV_VAL", missing),
-            self.assertRaises(sweep_vulkan_features.VulkanFeatureSweepError),
+            self.assertRaises(sweep_vulkan_features.VulkanFeatureSweepError) as caught,
         ):
             self.vk_report(head)
+        message = str(caught.exception)
+        self.assertIn("missing tool:", message)
+        self.assertIn(str(missing), message)
 
 
 if __name__ == "__main__":

@@ -17,7 +17,13 @@ from collections.abc import Callable
 from pathlib import Path
 from types import ModuleType
 
-from scripts import review_classes, sweep_doc_claims, sweep_state_advance, variant_sweep
+from scripts import (
+    review_classes,
+    sweep_doc_claims,
+    sweep_state_advance,
+    sweep_vulkan_features,
+    variant_sweep,
+)
 from tests import test_variant_sweep as fixtures
 from tests.helpers import full_sweep_report
 
@@ -527,6 +533,42 @@ class SweepRegressionTest(unittest.TestCase):
         ):
             with self.subTest(values=values, end=end):
                 self.assertEqual(sweep_state_advance.member_end(values, start, end), expected)
+
+    def test_cr10_b_outside_sweep_all_keeps_siblings_after_vulkan_prerequisite(self) -> None:
+        """CR10 outside: a Vulkan prerequisite error is reported while later sweeps still run."""
+        sha = "0" * 40
+        order: list[str] = []
+
+        def unchecked(directory, base, head, deadline=None):
+            """Return unchecked-return metadata and record invocation order."""
+            order.append("unchecked-return")
+            return f"class: unchecked-return\nbase: {sha}\nhead: {sha}\n"
+
+        def extra(name, directory, base, head, deadline):
+            """Record sibling order or raise for the Vulkan features sweep."""
+            if name == "vulkan_features":
+                order.append(name)
+                raise sweep_vulkan_features.VulkanFeatureSweepError("missing tool: /no/glslang")
+            order.append(name)
+            return f"class: {name.replace('_', '-')}\nhead: {head}\nno hits\n"
+
+        with (
+            unittest.mock.patch.object(variant_sweep, "sweep", side_effect=unchecked),
+            unittest.mock.patch.object(variant_sweep, "sweep_class", side_effect=extra),
+        ):
+            report = variant_sweep.sweep_all("unused", sha, sha)
+        self.assertIn("prerequisite: missing tool: /no/glslang", report)
+        self.assertIn("class: port-parity", report)
+        self.assertEqual(
+            order,
+            [
+                "unchecked-return",
+                "state_advance",
+                "doc_claims",
+                "vulkan_features",
+                "port_parity",
+            ],
+        )
 
     def test_all_classes_share_deadline(self) -> None:
         """Every sibling sweep receives one aggregate deadline from sweep_all."""

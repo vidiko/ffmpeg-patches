@@ -42,6 +42,8 @@ SHIFT = re.compile(r">>\s*(?:\([^)]+\)|\w+)", re.ASCII)
 CLIP = re.compile(r"\b(?:av_clip|CLIP)\w*\s*\(", re.ASCII)
 CLAMP = re.compile(r"\bclamp\s*\(", re.ASCII)
 SHADER_LOAD = re.compile(r"\b(?:imageLoad|texelFetch)\s*\(", re.ASCII)
+_LOOP_HEADER = re.compile(r"^\s*(?:for|while)\s*\(", re.ASCII)
+_OPERAND_OPS = 64
 
 
 def pair_name(path: str) -> str | None:
@@ -124,15 +126,108 @@ def statement_spans(masked: str) -> list[tuple[int, int]]:
     return spans
 
 
-def normalization_kind(statement: str) -> str | None:
-    """Classify one statement as mask, shift, clip, or clamp normalization."""
-    if CLIP.search(statement):
+def matching_close_paren(text: str, open_index: int) -> int | None:
+    """Return the index of ')' that balances '(' at open_index."""
+    depth = 0
+    limit = len(text)
+    for index in range(open_index, limit):
+        ch = text[index]
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return index
+    return None
+
+
+def loop_header_bounds(statement: str) -> tuple[int, int] | None:
+    """Return the inclusive header bounds for a leading for/while statement."""
+    trimmed = statement.lstrip()
+    lead = len(statement) - len(trimmed)
+    match = _LOOP_HEADER.match(trimmed)
+    if match is None:
+        return None
+    open_index = lead + match.end() - 1
+    close_index = matching_close_paren(statement, open_index)
+    if close_index is None:
+        return None
+    return open_index + 1, close_index
+
+
+def _skip_space(text: str, position: int, limit: int) -> int:
+    """Advance past ASCII whitespace."""
+    while position < limit and text[position] in " \t\n\r":
+        position += 1
+    return position
+
+
+def _extend_shift_tail(text: str, position: int, limit: int) -> int:
+    """Advance past the rhs of one '>>' shift attached to a sample operand."""
+    for _ in range(16):
+        if position >= limit:
+            break
+        ch = text[position]
+        if ch.isdigit() or ch in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz_":
+            position += 1
+            continue
+        if ch == "(":
+            close = matching_close_paren(text, position)
+            if close is not None:
+                position = close + 1
+            break
+        break
+    return position
+
+
+def _extend_mask_tail(text: str, position: int, limit: int) -> int:
+    """Advance past the rhs of one '&' mask attached to a sample operand."""
+    for _ in range(32):
+        if position >= limit or text[position] not in "0123456789xXaAbBcCdDeEfFuUlL":
+            break
+        position += 1
+    return position
+
+
+def sample_operand_text(statement: str, read_start: int, read_end: int) -> str:
+    """Extend one sample read through attached mask, shift, clip, or clamp operators."""
+    limit = len(statement)
+    depth = statement[:read_start].count("(") - statement[:read_start].count(")")
+    position = read_end
+    for _ in range(_OPERAND_OPS):
+        position = _skip_space(statement, position, limit)
+        if position >= limit or (statement[position] == "," and depth == 0):
+            break
+        if statement.startswith(">>", position):
+            after = _skip_space(statement, position + 2, limit)
+            position = _extend_shift_tail(statement, after, limit)
+            continue
+        if statement[position] == "&" and position + 1 < limit and statement[position + 1] != "&":
+            position = _extend_mask_tail(
+                statement, _skip_space(statement, position + 1, limit), limit
+            )
+            continue
+        break
+    return statement[read_start:position]
+
+
+def normalization_focus(statement: str, read_start: int, read_end: int) -> str:
+    """Return the statement slice searched for normalization on one sample read."""
+    bounds = loop_header_bounds(statement)
+    if bounds is not None and read_start <= bounds[1]:
+        return statement[bounds[0] : bounds[1]]
+    return sample_operand_text(statement, read_start, read_end)
+
+
+def normalization_kind(text: str) -> str | None:
+    """Classify one sample expression slice as mask, shift, clip, or clamp."""
+    if CLIP.search(text):
         return "clip"
-    if CLAMP.search(statement):
+    if CLAMP.search(text):
         return "clamp"
-    if MASK.search(statement):
+    if MASK.search(text):
         return "mask"
-    if SHIFT.search(statement):
+    if SHIFT.search(text):
         return "shift"
     return None
 
@@ -146,7 +241,8 @@ def cpu_sites(source: str) -> list[tuple[int, str]]:
         read_match = SAMPLE_READ.search(statement)
         if read_match is None:
             continue
-        kind = normalization_kind(statement)
+        focus = normalization_focus(statement, read_match.start(), read_match.end())
+        kind = normalization_kind(focus)
         if kind is None:
             continue
         offset = start + read_match.start()
@@ -226,8 +322,15 @@ def sweep(directory: str, base: str, head: str, deadline: float) -> str:
         if cpu_path not in sources or vk_path not in sources:
             continue
         shaders = linked_shaders(sources[vk_path])
+        shader_key = tuple(sorted(shaders))
+        match_cache: dict[tuple[tuple[str, ...], str], str | None] = {}
         for line_number, kind in cpu_sites(sources[cpu_path]):
-            site = first_shader_match(directory, head, shaders, kind, deadline)
+            cache_key = (shader_key, kind)
+            if cache_key not in match_cache:
+                match_cache[cache_key] = first_shader_match(
+                    directory, head, shaders, kind, deadline
+                )
+            site = match_cache[cache_key]
             shader_col = site if site is not None else "none"
             row = f"| {cpu_path}:{line_number} | {kind} | {shader_col} | TODO |"
             size += len((row + "\n").encode())

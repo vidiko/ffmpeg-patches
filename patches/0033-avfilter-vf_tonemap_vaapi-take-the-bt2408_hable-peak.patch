@@ -17,10 +17,10 @@ Signed-off-by: lusoris <lusoris@proton.me>
  3 files changed, 23 insertions(+), 3 deletions(-)
 
 diff --git a/doc/filters.texi b/doc/filters.texi
-index 936173d2dc09e50d8f02e8a43afdd2a252b6fd6a..5d899ff10a2a602345e0135f416ab04985397830 100644
+index 63c3e578315b3af61d252c11148abfda4356fadf..3a15a100cf2db612cf40bb07762e17e82a2d56b7 100644
 --- a/doc/filters.texi
 +++ b/doc/filters.texi
-@@ -29085,7 +29085,9 @@ and @option{matrix} say; @option{format} must be an 8-bit RGB format such as
+@@ -29095,7 +29095,9 @@ and @option{matrix} say; @option{format} must be an 8-bit RGB format such as
  
  @item peak
  Override the signal peak for @code{tonemap=bt2408_hable}, in units of

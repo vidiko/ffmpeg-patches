@@ -290,6 +290,44 @@ class RedirectTest(unittest.TestCase):
                 )
             self.assertTrue(answer.closed)
 
+    def test_redirect_bounded_read_failure_closes_answer(self) -> None:
+        """Close the redirect body and re-raise when the bounded read raises DriftError."""
+        planted = upstream_drift.DriftError("bounded read failed")
+
+        class FailingBody:
+            """Fake redirect response whose read raises a planted DriftError."""
+
+            def __init__(self) -> None:
+                """Start unclosed with empty headers like a minimal HTTP answer."""
+                self.closed = False
+                self.headers: dict[str, str] = {}
+
+            def read(self, size: int = -1) -> bytes:
+                """Raise the planted error to simulate a stalled redirect body."""
+                raise planted
+
+            def close(self) -> None:
+                """Record that the handler closed this redirect body."""
+                self.closed = True
+
+        body = FailingBody()
+        request = urllib.request.Request(f"{API}1")
+        with self.assertRaises(upstream_drift.DriftError) as caught:
+            upstream_drift.HttpsRedirectHandler().redirect_request(
+                request, body, 302, "Found", email.message.Message(), f"{API}2"
+            )
+        self.assertIs(caught.exception, planted)
+        self.assertTrue(body.closed)
+
+    def test_redirect_bounded_read_success_leaves_answer_open(self) -> None:
+        """Leave a short valid redirect body open when the bounded read succeeds."""
+        body = io.BytesIO(b"{}")
+        request = urllib.request.Request(f"{API}1")
+        upstream_drift.HttpsRedirectHandler().redirect_request(
+            request, body, 302, "Found", email.message.Message(), f"{API}2"
+        )
+        self.assertFalse(body.closed)
+
     def test_module_opener_carries_no_plain_transport(self) -> None:
         """The module opener has the https rule and no HTTP, FTP, file or data transport."""
         kinds = [type(handler) for handler in upstream_drift.OPENER.handlers]

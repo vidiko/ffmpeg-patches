@@ -478,6 +478,8 @@ rules:
       include:
         - scripts/
         - tests/
+      exclude:
+        - "**/tests/test_semgrep_rules.py"
     patterns:
       - pattern-either:
           - pattern-regex: >-
@@ -488,6 +490,10 @@ rules:
               except:\s*\n\s*\w+ =
       - pattern-not-regex: >-
           except BaseException[^:]*:\s*\n\s*raise\s*$
+      - pattern-not-regex: >-
+          except BaseException as \w+:\s*\n\s*\w+ = \w+\s*\n\s*raise\s*$
+      - pattern-not-regex: >-
+          except BaseException as \w+:\s*\n\s*\w+\.append\([^)]*\)\s*\n\s*raise\s*$
 
   # PR 390 CodeQL alerts 58 to 60, 2026-11-22
   - id: assert-raises-body-bare-raise

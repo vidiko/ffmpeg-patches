@@ -563,8 +563,8 @@ to preview without writing) to populate both fields for open and merged
 manifest records from the forge. Fill and check send GET requests only, post
 nothing and need no credentials. Live matching checks shared files and subjects;
 same-patch-id is not checked live, and forge-supplied patch IDs are ignored.
-The schema retains that reason for separately supplied evidence. Repeat
-`--pull N` to fill only named open or merged manifest rows, for example
+The schema retains that reason for separately supplied evidence. Repeat `fill --pull N` to narrow a fill to named open or merged manifest rows
+(`_fill_targets` in `scripts/upstream_links_manifest.py`), for example
 `python3 scripts/upstream_links.py fill --dry-run --pull 24970 --pull 24973`.
 Candidate pulls are scanned once per run from the later of the earliest scoped
 opening and UTC midnight 14 days before the run date
@@ -580,8 +580,9 @@ empty page, no `Link` header with relations but no `next`, no reached
 `X-Total-Count` and no update older than the window (`read_candidate_pulls` in
 `scripts/upstream_links_forge.py`, `_listing_complete` in
 `scripts/upstream_links_parse.py`); shorten the window to retry. Run
-`python3 scripts/upstream_links.py check` (adding `--pull N` for any open pull
-not yet in the manifest) to list newly discovered potential overlaps;
+`python3 scripts/upstream_links.py check` (each `check --pull N` adds targets via
+`_check_targets` in `scripts/upstream_links.py` for any open pull not yet in
+the manifest) to list newly discovered potential overlaps;
 it exits 1 when at least one unrecorded related pull by another author is open
 or merged after the own pull was opened, and the daily `upstream.yml` job runs
 this check alongside `upstream_drift.py`. By default, `check` scans updates
@@ -625,8 +626,11 @@ only while more than `REQUEST_TIMEOUT` plus the 0.5-second pause (30.5 seconds)
 of the scan budget remains. Before request 519 the scan has paused 518 times
 (259 seconds), so less than 10.5 seconds remain for the network and local work
 of the 518 earlier requests. At 25 ms per request, request 514 is the last one
-admitted and the scan exits 2 when request 515 is refused; narrow such a scan
-with `--pull N` or `check --since YYYY-MM-DD`.
+admitted and the scan exits 2 when request 515 is refused; narrow a fill with
+`fill --pull N` (`_fill_targets` in `scripts/upstream_links_manifest.py`), or
+narrow a check's candidate window with `check --since YYYY-MM-DD`
+(`check_window` in `scripts/upstream_links.py`), or add check targets with
+`check --pull N` (`_check_targets` in `scripts/upstream_links.py`).
 Both commands derive their request cap as
 `N + 20 + (N + 1000) * 20` from the own-pull count, 20 list pages, 1000
 candidate rows and 20 file pages per pull. Before reading files, a progress
@@ -694,9 +698,13 @@ Only whole `#N` items and exact configured repository issue URLs are local.
 Repository-prefixed hashes (including the configured repository) and foreign
 issue URLs are ignored and counted in one line per pull. Prose, unhashed
 numbers, versions and hashes glued to words end the list.
-Shorten a fill with `fill --max-age-days N`, select a
-later-opening `fill --pull N`, or narrow a check
-with `check --since YYYY-MM-DD`. The week-long margin revisits recent updates
+Shorten a fill with `fill --max-age-days N` (`fill_window` in
+`scripts/upstream_links_manifest.py`), select rows with `fill --pull N`
+(`_fill_targets` in `scripts/upstream_links_manifest.py`), narrow a check's
+candidate window with `check --since YYYY-MM-DD` (`check_window` in
+`scripts/upstream_links.py`), or add check targets with `check --pull N`
+(`_check_targets` in `scripts/upstream_links.py`). The week-long margin revisits
+recent updates
 around the drift snapshot, which can advance independently of the link scan;
 fill preserves that snapshot date. The fill age limit does not apply to check;
 its effective window remains the later of the earliest scoped opening and

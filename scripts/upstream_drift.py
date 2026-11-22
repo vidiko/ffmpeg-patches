@@ -206,7 +206,11 @@ class HttpsRedirectHandler(urllib.request.HTTPRedirectHandler):
                 fp.close()
             raise DriftError(f"{req.full_url}: redirect to {newurl} refused; scheme must be https")
         if fp is not None:
-            read_response(fp, req.full_url)
+            try:
+                read_response(fp, req.full_url)
+            except BaseException:
+                fp.close()
+                raise
         request = super().redirect_request(req, fp, code, msg, headers, newurl)
         if request is not None:
             request.remove_header("Proxy-authorization")

@@ -457,6 +457,46 @@ def case_flagged_base_exception_swallow():
         failure = exc
 
 
+def case_flagged_base_exception_record_return():
+    \"\"\"Flagged: except BaseException records then returns instead of re-raising.\"\"\"
+    global failure
+    try:
+        raise RuntimeError("boom")
+    except BaseException as exc:
+        failure = exc
+        return
+
+
+def case_flagged_base_exception_record_nested_raise():
+    \"\"\"Flagged: except BaseException records then raises only under a nested block.\"\"\"
+    try:
+        raise RuntimeError("boom")
+    except BaseException as exc:
+        failure = exc
+        if True:
+            raise
+
+
+def case_ok_base_exception_record_raise():
+    \"\"\"OK: except BaseException records the exception then re-raises at the same indent.\"\"\"
+    global failure
+    try:
+        raise RuntimeError("boom")
+    except BaseException as exc:
+        failure = exc
+        raise
+
+
+def case_ok_base_exception_append_raise():
+    \"\"\"OK: except BaseException appends the exception then re-raises at the same indent.\"\"\"
+    recorded: list[object] = []
+    try:
+        raise RuntimeError("boom")
+    except BaseException as exc:
+        recorded.append(exc)
+        raise
+
+
 def case_flagged_bare_except_swallow():
     \"\"\"Flagged: bare except assigns without re-raise.\"\"\"
     global failure
@@ -830,6 +870,19 @@ class SemgrepRulesTest(unittest.TestCase):
             ),
             _expected_flagged(BASE_EXCEPTION_HANDLER_FIXTURE),
         )
+
+    def test_base_exception_handler_rule_ignores_self_module(self) -> None:
+        """Explicit scan of this module must not hit the fixture strings embedded here."""
+        with tempfile.TemporaryDirectory() as scratch_name:
+            scratch_path = Path(scratch_name)
+            target = ROOT / "tests" / "test_semgrep_rules.py"
+            data = _run_semgrep(target, scratch_path)
+            hits = [
+                item
+                for item in data.get("results", [])
+                if item.get("check_id", "").endswith("base-exception-handler-without-reraise")
+            ]
+            self.assertEqual(hits, [])
 
     def test_assert_raises_body_bare_raise_rule(self) -> None:
         """Rule assert-raises-body-bare-raise flags a with body that is only raise."""

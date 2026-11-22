@@ -10,6 +10,7 @@ import http.client
 import io
 import json
 import os
+import queue
 import re
 import subprocess  # nosec B404 - fixed child interpreter and fixture-controlled Python source.
 import sys
@@ -1251,14 +1252,14 @@ class RequestCostTest(unittest.TestCase):
         """A worker redirect hop after reader timeout still runs the issuing budget's admit."""
         drift = upstream_links.upstream_drift
         entered = threading.Event()
-        timed_out = threading.Event()
+        release_worker = threading.Event()
         finished = threading.Event()
         outcomes: list[object] = []
 
         def late_redirect(url: str) -> dict:
-            """Wait for the reader timeout, then run the real redirect handler in the worker."""
+            """Wait for release, then run the real redirect handler in the worker."""
             entered.set()
-            if not timed_out.wait(0.5):
+            if not release_worker.wait(10):
                 return {}
             try:
                 request = urllib.request.Request(url)
@@ -1271,25 +1272,24 @@ class RequestCostTest(unittest.TestCase):
                 finished.set()
             return {}
 
+        self.addCleanup(release_worker.set)
         with (
-            unittest.mock.patch.object(upstream_forge, "SCAN_BUDGET_SECONDS", 0.05),
             unittest.mock.patch.object(upstream_forge, "REQUEST_TIMEOUT", 0),
             unittest.mock.patch.object(upstream_forge, "REQUEST_PAUSE_SECONDS", 0),
         ):
             budget = upstream_forge.RequestBudget(late_redirect, 1, lambda _: None)
             self.addCleanup(budget.reader.close)
-            get = budget.reader.answers.get
 
             def get_after_entry(block: bool = True, timeout: float | None = None) -> object:
-                """Wait for worker entry before letting the short answer wait time out."""
-                self.assertTrue(entered.wait(0.5))
-                return get(block, timeout)
+                """Wait for worker entry, then raise queue.Empty like a stalled answer."""
+                self.assertTrue(entered.wait(10))
+                raise queue.Empty
 
             budget.reader.answers.get = get_after_entry
             with self.assertRaisesRegex(upstream_parse.DriftError, "incomplete scan"):
                 budget(f"{API}/pulls/10")
-            timed_out.set()
-            self.assertTrue(finished.wait(0.5))
+            release_worker.set()
+            self.assertTrue(finished.wait(10))
         self.assertEqual(len(outcomes), 1)
         self.assertIsInstance(outcomes[0], upstream_parse.DriftError)
         self.assertIn("count 2, cap 1", str(outcomes[0]))
@@ -1802,6 +1802,28 @@ class ForgeFileCountTest(unittest.TestCase):
         self.assertEqual((rc, err), (1, ""))
         self.assertEqual(out.strip(), "10 25879 owner same-files open")
         self.assertEqual(forge.read.count(f"{API}/pulls/25879/files?limit=50&page=1"), 1)
+
+    def test_own_pull_reads_files_for_zero_changed_files(self) -> None:
+        """Own-pull scans still fetch the files endpoint when changed_files is zero or larger."""
+        url = f"{API}/pulls/25879/files?limit=50&page=1"
+        for count in (0, 16):
+            with self.subTest(changed_files=count):
+                answers = dict(self.answers)
+                answers[f"{API}/pulls/25879"] = COUNT_PULL | {"changed_files": count}
+                forge = FakeForge(answers)
+                self.assertEqual(run_cli(self.root, forge, "check"), (0, "", ""))
+                self.assertEqual(forge.read.count(url), 1)
+
+    def test_shared_endpoint_name_reports_candidate_overlap(self) -> None:
+        """A candidate whose file list shares an endpoint name must print an overlap line."""
+        answers = self.candidate_answers(changed_files=1)
+        answers[f"{API}/pulls/25879/files?limit=50&page=1"] = [{"filename": "file-3.c"}]
+        answers[f"{API}/pulls/10/files?limit=50&page=1"] = [{"filename": "file-3.c"}]
+        forge = FakeForge(answers)
+        rc, out, err = run_cli(self.root, forge, "check")
+        self.assertEqual((rc, err), (1, ""))
+        self.assertIn("10 25879", out)
+        self.assertIn("same-files", out)
 
     def test_complete_count_disagreement_finishes(self) -> None:
         """Accept zero and differing counts beside nonempty own and candidate listings."""

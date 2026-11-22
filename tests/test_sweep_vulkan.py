@@ -1359,6 +1359,365 @@ class VulkanSweepTest(unittest.TestCase):
             (False, True),
         )
 
+    def test_cr13_f2_scoped_params_both_orders(self) -> None:
+        """Scoped params keep the VkPhysicalDeviceFeatures gate read in either declaration order."""
+        self.addCleanup(reset_vulkan_maps)
+        ensure_maps_fixture()
+        first = (
+            "int gate(VkPhysicalDeviceFeatures *p) {\n"
+            "    if (p->shaderInt64) return 0;\n"
+            "    return -1;\n"
+            "}\n"
+            "void other(VkPhysicalDeviceProperties *p) { (void)p; }\n"
+        )
+        second = (
+            "void other(VkPhysicalDeviceProperties *p) { (void)p; }\n"
+            "int gate(VkPhysicalDeviceFeatures *p) {\n"
+            "    if (p->shaderInt64) return 0;\n"
+            "    return -1;\n"
+            "}\n"
+        )
+        for source, line in ((first, 2), (second, 3)):
+            with self.subTest(line=line):
+                sites = sweep_vulkan_features.c_feature_reads(source)
+                self.assertEqual(len(sites), 1)
+                self.assertEqual(sites[0].feature, "shaderInt64")
+                self.assertEqual(sites[0].line, line)
+
+    def test_cr13_f2_single_eligible_and_file_scope(self) -> None:
+        """One eligible declaration and file-scope variables still yield their feature sites."""
+        self.addCleanup(reset_vulkan_maps)
+        ensure_maps_fixture()
+        single = "VkPhysicalDeviceFeatures *feats;\nif (feats->shaderInt64) {}\n"
+        sites = sweep_vulkan_features.c_feature_reads(single)
+        self.assertEqual(len(sites), 1)
+        file_scope = (
+            "VkPhysicalDeviceFeatures feats;\n"
+            "void gate(VkPhysicalDeviceFeatures *p) { (void)p; }\n"
+            "void later(void) {\n"
+            "    if (feats.shaderInt64) {}\n"
+            "}\n"
+        )
+        sites = sweep_vulkan_features.c_feature_reads(file_scope)
+        self.assertEqual(len(sites), 1)
+        self.assertIn("feats.shaderInt64", file_scope.splitlines()[sites[0].line - 1])
+
+    def test_cr13_f2_unrelated_param_stays_excluded(self) -> None:
+        """A feature read through a known unrelated Vk struct parameter remains excluded."""
+        self.addCleanup(reset_vulkan_maps)
+        ensure_maps_fixture()
+        source = (
+            "int bad(VkPhysicalDeviceProperties *p) {\n"
+            "    if (p->shaderInt64) return 0;\n"
+            "    return -1;\n"
+            "}\n"
+        )
+        self.assertEqual(sweep_vulkan_features.c_feature_reads(source), [])
+
+    def test_cr13_f3_wrapper_member_chain(self) -> None:
+        """A wrapped VkPhysicalDeviceFeatures member yields the chained feature read site."""
+        self.addCleanup(reset_vulkan_maps)
+        ensure_maps_fixture()
+        source = (
+            "struct Wrapper { VkPhysicalDeviceFeatures features; };\n"
+            "int gate(struct Wrapper *ctx) {\n"
+            "    if (ctx->features.shaderInt64) return 0;\n"
+            "    return -1;\n"
+            "}\n"
+        )
+        sites = sweep_vulkan_features.c_feature_reads(source)
+        self.assertEqual(len(sites), 1)
+        self.assertEqual(sites[0].feature, "shaderInt64")
+
+    def test_cr13_f3_wrong_member_type_excluded(self) -> None:
+        """A chained read through VkPhysicalDeviceProperties does not satisfy the gate."""
+        self.addCleanup(reset_vulkan_maps)
+        ensure_maps_fixture()
+        source = (
+            "struct Wrapper { VkPhysicalDeviceProperties features; };\n"
+            "int gate(struct Wrapper *ctx) {\n"
+            "    if (ctx->features.shaderInt64) return 0;\n"
+            "    return -1;\n"
+            "}\n"
+        )
+        self.assertEqual(sweep_vulkan_features.c_feature_reads(source), [])
+
+    def test_cr13_f3_unknown_member_chain_accepted(self) -> None:
+        """A member chain with no declaration keeps the unknown-type accept fallback."""
+        self.addCleanup(reset_vulkan_maps)
+        ensure_maps_fixture()
+        source = (
+            "struct Wrapper { Mystery features; };\n"
+            "int gate(struct Wrapper *ctx) {\n"
+            "    if (ctx->features.shaderInt64) return 0;\n"
+            "    return -1;\n"
+            "}\n"
+        )
+        sites = sweep_vulkan_features.c_feature_reads(source)
+        self.assertEqual(len(sites), 1)
+
+    def test_cr14_f3_typedef_wrapper_name_member_chain(self) -> None:
+        """A typedef-named wrapper accepting ctx->features.shaderInt64 yields one feature site."""
+        self.addCleanup(reset_vulkan_maps)
+        ensure_maps_fixture()
+        source = (
+            "typedef struct Wrapper { VkPhysicalDeviceFeatures features; } Wrapper;\n"
+            "int gate(Wrapper *ctx) {\n"
+            "    if (ctx->features.shaderInt64) return 0;\n"
+            "    return -1;\n"
+            "}\n"
+        )
+        sites = sweep_vulkan_features.c_feature_reads(source)
+        self.assertEqual(len(sites), 1)
+        self.assertEqual(sites[0].feature, "shaderInt64")
+
+    def test_cr14_f3_unresolvable_header_chain_accepted(self) -> None:
+        """A chain through a header-only typedef member keeps the unknown fallback and one site."""
+        self.addCleanup(reset_vulkan_maps)
+        ensure_maps_fixture()
+        source = (
+            "typedef struct GateCtx { FFVulkanContext vkctx; } GateCtx;\n"
+            "int gate(GateCtx *s) {\n"
+            "    if (s->vkctx.feats.features.shaderInt64) return 0;\n"
+            "    return -1;\n"
+            "}\n"
+        )
+        sites = sweep_vulkan_features.c_feature_reads(source)
+        self.assertEqual(len(sites), 1)
+        self.assertEqual(sites[0].feature, "shaderInt64")
+
+    def test_cr15c_f3_unresolved_member_step_accepted(self) -> None:
+        """A missing member step on a file-defined struct keeps unknown-type accept and one site."""
+        self.addCleanup(reset_vulkan_maps)
+        ensure_maps_fixture()
+        source = (
+            "typedef struct Wrapper { int x; } Wrapper;\n"
+            "int gate(Wrapper *ctx) {\n"
+            "    if (ctx->missing.shaderInt64) return 0;\n"
+            "    return -1;\n"
+            "}\n"
+        )
+        sites = sweep_vulkan_features.c_feature_reads(source)
+        self.assertEqual(len(sites), 1)
+        self.assertEqual(sites[0].feature, "shaderInt64")
+
+    def test_cr14_f3_pointer_member_arrow_feature_read(self) -> None:
+        """A pointer-typed features member read through arrow yields one shaderInt64 site."""
+        self.addCleanup(reset_vulkan_maps)
+        ensure_maps_fixture()
+        source = (
+            "struct Wrapper { VkPhysicalDeviceFeatures *features; };\n"
+            "int gate(struct Wrapper *ctx) {\n"
+            "    if (ctx->features->shaderInt64) return 0;\n"
+            "    return -1;\n"
+            "}\n"
+        )
+        sites = sweep_vulkan_features.c_feature_reads(source)
+        self.assertEqual(len(sites), 1)
+        self.assertEqual(sites[0].feature, "shaderInt64")
+
+    def test_cr14_f3_typedef_unrelated_member_excluded(self) -> None:
+        """A typedef wrapper with VkPhysicalDeviceProperties features yields no feature site."""
+        self.addCleanup(reset_vulkan_maps)
+        ensure_maps_fixture()
+        source = (
+            "typedef struct Wrapper { VkPhysicalDeviceProperties features; } Wrapper;\n"
+            "int gate(Wrapper *ctx) {\n"
+            "    if (ctx->features.shaderInt64) return 0;\n"
+            "    return -1;\n"
+            "}\n"
+        )
+        self.assertEqual(sweep_vulkan_features.c_feature_reads(source), [])
+
+    def test_cr14_f3_direct_typedef_wrapper_excluded(self) -> None:
+        """A direct feature read on a typedef wrapper pointer stays excluded."""
+        self.addCleanup(reset_vulkan_maps)
+        ensure_maps_fixture()
+        source = (
+            "typedef struct Wrapper { VkPhysicalDeviceFeatures features; } Wrapper;\n"
+            "int gate(Wrapper *ctx) {\n"
+            "    if (ctx->shaderInt64) return 0;\n"
+            "    return -1;\n"
+            "}\n"
+        )
+        self.assertEqual(sweep_vulkan_features.c_feature_reads(source), [])
+
+    def test_cr14_f3_pointer_inner_dot_after_arrow_chain(self) -> None:
+        """A chain through a pointer inner member and dot on features yields one site."""
+        self.addCleanup(reset_vulkan_maps)
+        ensure_maps_fixture()
+        source = (
+            "typedef struct Inner { VkPhysicalDeviceFeatures features; } Inner;\n"
+            "typedef struct Wrapper { Inner *inner; } Wrapper;\n"
+            "int gate(Wrapper *ctx) {\n"
+            "    if (ctx->inner->features.shaderInt64) return 0;\n"
+            "    return -1;\n"
+            "}\n"
+        )
+        sites = sweep_vulkan_features.c_feature_reads(source)
+        self.assertEqual(len(sites), 1)
+        self.assertEqual(sites[0].feature, "shaderInt64")
+
+    def test_cr14_f3_anonymous_typedef_feature_chain(self) -> None:
+        """An anonymous typedef struct read through its typedef name yields one feature site."""
+        self.addCleanup(reset_vulkan_maps)
+        ensure_maps_fixture()
+        source = (
+            "typedef struct { VkPhysicalDeviceFeatures features; } Shell;\n"
+            "int gate(Shell *ctx) {\n"
+            "    if (ctx->features.shaderInt64) return 0;\n"
+            "    return -1;\n"
+            "}\n"
+        )
+        sites = sweep_vulkan_features.c_feature_reads(source)
+        self.assertEqual(len(sites), 1)
+        self.assertEqual(sites[0].feature, "shaderInt64")
+
+    def test_cr14_f3_scoped_wrapper_chain_single_site(self) -> None:
+        """Scoped typedef params keep the eligible wrapper chain site only in the first function."""
+        self.addCleanup(reset_vulkan_maps)
+        ensure_maps_fixture()
+        source = (
+            "typedef struct Wrapper { VkPhysicalDeviceFeatures features; } Wrapper;\n"
+            "typedef struct Other { VkPhysicalDeviceProperties features; } Other;\n"
+            "int good(Wrapper *ctx) {\n"
+            "    if (ctx->features.shaderInt64) return 0;\n"
+            "    return -1;\n"
+            "}\n"
+            "void bad(Other *ctx) {\n"
+            "    if (ctx->features.shaderInt64) {}\n"
+            "}\n"
+        )
+        sites = sweep_vulkan_features.c_feature_reads(source)
+        self.assertEqual(len(sites), 1)
+        self.assertEqual(sites[0].feature, "shaderInt64")
+        self.assertEqual(sites[0].line, 4)
+
+    def test_cr15_forward_typedef_alias_member_chain(self) -> None:
+        """Forward typedef tag alias keeps the features member site when props is ineligible."""
+        self.addCleanup(reset_vulkan_maps)
+        ensure_maps_fixture()
+        source = (
+            "typedef struct HolderTag Holder;\n"
+            "struct HolderTag {\n"
+            "    VkPhysicalDeviceProperties props;\n"
+            "    VkPhysicalDeviceFeatures features;\n"
+            "};\n"
+            "int gate(Holder *ctx) {\n"
+            "    if (ctx->props.shaderInt64) {}\n"
+            "    if (ctx->features.shaderInt64) return 0;\n"
+            "    return -1;\n"
+            "}\n"
+        )
+        sites = sweep_vulkan_features.c_feature_reads(source)
+        self.assertEqual(len(sites), 1)
+        self.assertEqual(sites[0].feature, "shaderInt64")
+        self.assertIn("ctx->features.shaderInt64", source.splitlines()[sites[0].line - 1])
+
+    def test_cr15_forward_union_typedef_alias_member_chain(self) -> None:
+        """Forward union tag alias keeps the features member site when props is ineligible."""
+        self.addCleanup(reset_vulkan_maps)
+        ensure_maps_fixture()
+        source = (
+            "typedef union HolderTag Holder;\n"
+            "union HolderTag {\n"
+            "    VkPhysicalDeviceProperties props;\n"
+            "    VkPhysicalDeviceFeatures features;\n"
+            "};\n"
+            "int gate(Holder *ctx) {\n"
+            "    if (ctx->props.shaderInt64) {}\n"
+            "    if (ctx->features.shaderInt64) return 0;\n"
+            "    return -1;\n"
+            "}\n"
+        )
+        sites = sweep_vulkan_features.c_feature_reads(source)
+        self.assertEqual(len(sites), 1)
+        self.assertEqual(sites[0].feature, "shaderInt64")
+        self.assertIn("ctx->features.shaderInt64", source.splitlines()[sites[0].line - 1])
+
+    def test_cr15_cross_function_shadow_resolves_file_scope(self) -> None:
+        """Cross-function local shadow leaves file-scope feats visible in a later function."""
+        self.addCleanup(reset_vulkan_maps)
+        ensure_maps_fixture()
+        source = (
+            "static VkPhysicalDeviceFeatures feats;\n"
+            "void a(void) {\n"
+            "    VkPhysicalDeviceProperties feats;\n"
+            "    (void)feats;\n"
+            "}\n"
+            "void b(void) {\n"
+            "    if (feats.shaderInt64) {}\n"
+            "}\n"
+        )
+        sites = sweep_vulkan_features.c_feature_reads(source)
+        self.assertEqual(len(sites), 1)
+        self.assertEqual(sites[0].feature, "shaderInt64")
+        self.assertIn("feats.shaderInt64", source.splitlines()[sites[0].line - 1])
+
+    def test_cr15_nested_block_shadow_resolves_file_scope(self) -> None:
+        """Nested-block local feats shadow does not hide file-scope feats in a later function."""
+        self.addCleanup(reset_vulkan_maps)
+        ensure_maps_fixture()
+        source = (
+            "static VkPhysicalDeviceFeatures feats;\n"
+            "void a(void) {\n"
+            "    { { VkPhysicalDeviceProperties feats; } }\n"
+            "}\n"
+            "void b(void) {\n"
+            "    if (feats.shaderInt64) {}\n"
+            "}\n"
+        )
+        sites = sweep_vulkan_features.c_feature_reads(source)
+        self.assertEqual(len(sites), 1)
+        self.assertEqual(sites[0].feature, "shaderInt64")
+        self.assertIn("feats.shaderInt64", source.splitlines()[sites[0].line - 1])
+
+    def test_cr15b_inner_arrow_ineligible_properties_excluded(self) -> None:
+        """An inner-arrow chain ending at VkPhysicalDeviceProperties yields no feature site."""
+        self.addCleanup(reset_vulkan_maps)
+        ensure_maps_fixture()
+        source = (
+            "typedef struct Inner { VkPhysicalDeviceProperties features; } Inner;\n"
+            "typedef struct Wrapper { Inner *inner; } Wrapper;\n"
+            "int gate(Wrapper *ctx) {\n"
+            "    if (ctx->inner->features.shaderInt64) return 0;\n"
+            "    return -1;\n"
+            "}\n"
+        )
+        self.assertEqual(sweep_vulkan_features.c_feature_reads(source), [])
+
+    def test_cr15b_mixed_dot_inner_arrow_ineligible_excluded(self) -> None:
+        """A dot-then-inner-arrow chain ending at VkPhysicalDeviceProperties yields no site."""
+        self.addCleanup(reset_vulkan_maps)
+        ensure_maps_fixture()
+        source = (
+            "typedef struct Inner { VkPhysicalDeviceProperties features; } Inner;\n"
+            "typedef struct Holder { Inner *inner; } Holder;\n"
+            "typedef struct Wrapper { Holder holder; } Wrapper;\n"
+            "int gate(Wrapper *ctx) {\n"
+            "    if (ctx->holder.inner->features.shaderInt64) return 0;\n"
+            "    return -1;\n"
+            "}\n"
+        )
+        self.assertEqual(sweep_vulkan_features.c_feature_reads(source), [])
+
+    def test_cr15b_mixed_dot_inner_arrow_eligible_single_site(self) -> None:
+        """A dot-then-inner-arrow chain through VkPhysicalDeviceFeatures yields one site."""
+        self.addCleanup(reset_vulkan_maps)
+        ensure_maps_fixture()
+        source = (
+            "typedef struct Inner { VkPhysicalDeviceFeatures features; } Inner;\n"
+            "typedef struct Holder { Inner *inner; } Holder;\n"
+            "typedef struct Wrapper { Holder holder; } Wrapper;\n"
+            "int gate(Wrapper *ctx) {\n"
+            "    if (ctx->holder.inner->features.shaderInt64) return 0;\n"
+            "    return -1;\n"
+            "}\n"
+        )
+        sites = sweep_vulkan_features.c_feature_reads(source)
+        self.assertEqual(len(sites), 1)
+        self.assertEqual(sites[0].feature, "shaderInt64")
+
     def test_cr10_b_minor_ineligible_struct_feature_read(self) -> None:
         """CR10 minor: allowlisted members read from unrelated structs do not satisfy gates."""
         self.addCleanup(reset_vulkan_maps)

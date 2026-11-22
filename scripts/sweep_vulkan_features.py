@@ -72,6 +72,16 @@ class FeatureSite(NamedTuple):
     feature: str
 
 
+class FeatureScopeContext(NamedTuple):
+    """Hold scoped declaration maps for resolving one feature read receiver."""
+
+    bounds: list[tuple[int, int]]
+    region_decls: list[list[tuple[int, str, str | None]]]
+    file_decls: list[tuple[int, str, str | None]]
+    member_types: dict[str, dict[str, tuple[str, bool]]]
+    typedef_aliases: dict[str, str]
+
+
 class ShaderNeeds(NamedTuple):
     """Hold derived shader feature requirements for one linked shader."""
 
@@ -486,36 +496,289 @@ def plain_assignment_after(text: str, member_end: int, member_access_start: int)
     return False
 
 
-def c_feature_var_types(masked: str) -> dict[str, str | None]:
-    """Map identifiers to eligible Vk feature struct types, or None when ineligible."""
-    types: dict[str, str | None] = {}
+MAX_MASK_BYTES = 1_048_576
+STRUCT_TAG_DECL = re.compile(
+    r"\bstruct\s+(\w+)\s*(\*+\s*|\s+)(\w+)\s*(?=[,;=)])",
+    re.ASCII,
+)
+GENERIC_DECL = re.compile(
+    r"\b(?!VkPhysicalDevice|struct|if|for|while|return|sizeof|switch)"
+    r"([A-Za-z_]\w*)\s+(\*+\s*|\s+)(\w+)\s*(?=[,;=)])",
+    re.ASCII,
+)
+MEMBER_FIELD_DECL = re.compile(
+    r"\b(?!if|for|while|return|sizeof|switch|struct|union)"
+    r"([A-Za-z_]\w*)\s+(\*+\s*)?(\w+)\s*;",
+    re.ASCII,
+)
+TYPEDEF_STRUCT_BODY = re.compile(r"\btypedef\s+struct\s+(\w+)\s*\{", re.ASCII)
+TYPEDEF_ANON_STRUCT = re.compile(r"\btypedef\s+struct\s*\{", re.ASCII)
+TYPEDEF_STRUCT_ALIAS = re.compile(
+    r"\btypedef\s+(?:struct|union)\s+(\w+)\s+(\w+)\s*;",
+    re.ASCII,
+)
+
+
+def c_top_level_region_bounds(masked: str) -> list[tuple[int, int]]:
+    """Return half-open spans between brace-depth-0 terminators."""
+    limit = min(len(masked), MAX_MASK_BYTES)
+    bounds: list[tuple[int, int]] = []
+    start = 0
+    brace = 0
+    for index in range(limit):
+        ch = masked[index]
+        if ch == "{":
+            brace += 1
+        elif ch == "}":
+            brace -= 1
+            if brace == 0:
+                bounds.append((start, index + 1))
+                start = index + 1
+        elif ch == ";" and brace == 0:
+            bounds.append((start, index + 1))
+            start = index + 1
+    if start < limit:
+        bounds.append((start, limit))
+    if not bounds:
+        bounds.append((0, limit))
+    return bounds
+
+
+def c_brace_paren_depth(masked: str, position: int) -> tuple[int, int]:
+    """Return brace and parenthesis nesting depths just before position."""
+    brace = 0
+    paren = 0
+    limit = min(position, len(masked), MAX_MASK_BYTES)
+    for index in range(limit):
+        ch = masked[index]
+        if ch == "{":
+            brace += 1
+        elif ch == "}":
+            brace -= 1
+        elif ch == "(":
+            paren += 1
+        elif ch == ")":
+            paren -= 1
+    return brace, paren
+
+
+def c_depths_before_positions(masked: str, positions: list[int]) -> dict[int, tuple[int, int]]:
+    """Return brace and parenthesis depths just before each sorted position."""
+    limit = min(len(masked), MAX_MASK_BYTES)
+    next_pos = sorted(set(positions))
+    depths: dict[int, tuple[int, int]] = {}
+    if not next_pos:
+        return depths
+    brace = 0
+    paren = 0
+    pi = 0
+    for index in range(limit + 1):
+        for _ in range(32):
+            if pi >= len(next_pos) or next_pos[pi] != index:
+                break
+            depths[next_pos[pi]] = (brace, paren)
+            pi += 1
+        if index >= limit:
+            break
+        ch = masked[index]
+        if ch == "{":
+            brace += 1
+        elif ch == "}":
+            brace -= 1
+        elif ch == "(":
+            paren += 1
+        elif ch == ")":
+            paren -= 1
+    return depths
+
+
+def _region_index_for(bounds: list[tuple[int, int]], position: int) -> int:
+    """Return the region index containing position."""
+    for index, (start, end) in enumerate(bounds):
+        if start <= position < end:
+            return index
+    return max(0, len(bounds) - 1)
+
+
+def _vk_decl_kind(struct: str, allowed: frozenset[str]) -> str | None:
+    """Return an eligible Vk feature struct tag or None when the type is ineligible."""
+    return struct if struct in allowed else None
+
+
+def c_collect_scoped_var_decls(
+    masked: str,
+) -> tuple[
+    list[tuple[int, int]],
+    list[list[tuple[int, str, str | None]]],
+    list[tuple[int, str, str | None]],
+]:
+    """Collect per-region and file-scope identifier declarations for feature reads."""
     allowed = MAP_STATE.feature_struct_names
+    bounds = c_top_level_region_bounds(masked)
+    region_decls: list[list[tuple[int, str, str | None]]] = [[] for _ in bounds]
+    file_decls: list[tuple[int, str, str | None]] = []
+    events: list[tuple[int, str, str | None]] = []
     for match in FEATURE_STRUCT_DECL.finditer(masked):
-        struct = match[1]
-        types[match[3]] = struct if struct in allowed else None
-    for match in re.finditer(
-        r"\b(?!VkPhysicalDevice|struct|if|for|while|return|sizeof|switch)"
-        r"([A-Za-z_]\w*)\s+(\*+\s*|\s+)(\w+)\s*(?=[,;=)])",
-        masked,
-    ):
-        struct = match[1]
-        if struct == "void":
+        events.append((match.start(3), match.group(3), _vk_decl_kind(match.group(1), allowed)))
+    struct_vars = {match.start(3) for match in STRUCT_TAG_DECL.finditer(masked)}
+    for match in STRUCT_TAG_DECL.finditer(masked):
+        events.append((match.start(3), match.group(3), match.group(1)))
+    for match in GENERIC_DECL.finditer(masked):
+        if match.group(1) == "void":
             continue
-        var = match[3]
-        if var not in types:
-            types[var] = None
+        if match.start(3) in struct_vars:
+            continue
+        events.append((match.start(3), match.group(3), match.group(1)))
     for match in re.finditer(r"\}\s*(\w+)\s*;", masked):
-        var = match[1]
-        if var not in types:
-            types[var] = None
-    return types
+        events.append((match.start(1), match.group(1), match.group(1)))
+    events.sort(key=lambda item: item[0])
+    depth_map = c_depths_before_positions(masked, [item[0] for item in events])
+    for position, name, kind in events:
+        region = _region_index_for(bounds, position)
+        region_decls[region].append((position, name, kind))
+        brace, paren = depth_map.get(position, (0, 0))
+        if brace == 0 and paren == 0:
+            file_decls.append((position, name, kind))
+    return bounds, region_decls, file_decls
+
+
+def _struct_body_span(masked: str, open_brace: int) -> tuple[int, int] | None:
+    """Return the half-open body span for a struct whose opening brace is at open_brace."""
+    if open_brace >= len(masked) or masked[open_brace] != "{":
+        return None
+    depth = 1
+    limit = min(len(masked), open_brace + MAX_MASK_BYTES)
+    for index in range(open_brace + 1, limit):
+        ch = masked[index]
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return open_brace + 1, index
+    return None
+
+
+def _member_decl_types(body: str) -> dict[str, tuple[str, bool]]:
+    """Collect member field names and type names from one struct body."""
+    tag_members: dict[str, tuple[str, bool]] = {}
+    for inner in FEATURE_STRUCT_DECL.finditer(body):
+        is_ptr = "*" in inner.group(2)
+        tag_members[inner.group(3)] = (inner.group(1), is_ptr)
+    for inner in MEMBER_FIELD_DECL.finditer(body):
+        field = inner.group(3)
+        if field in tag_members:
+            continue
+        ptr = inner.group(2)
+        is_ptr = ptr is not None and "*" in ptr
+        tag_members[field] = (inner.group(1), is_ptr)
+    return tag_members
+
+
+def _typedef_alias_after_body(masked: str, body_end: int) -> str | None:
+    """Return the typedef name after a struct body closes at body_end."""
+    limit = min(len(masked), body_end + 64)
+    tail = masked[body_end:limit]
+    match = re.match(r"\}\s*(\w+)\s*;", tail)
+    if match is None:
+        return None
+    return match.group(1)
+
+
+def c_typedef_alias_map(masked: str) -> dict[str, str]:
+    """Map typedef names to struct or union tags declared in masked source."""
+    aliases: dict[str, str] = {}
+    for match in TYPEDEF_STRUCT_ALIAS.finditer(masked):
+        aliases[match.group(2)] = match.group(1)
+    for match in TYPEDEF_STRUCT_BODY.finditer(masked):
+        tag = match.group(1)
+        span = _struct_body_span(masked, match.end() - 1)
+        if span is None:
+            continue
+        alias = _typedef_alias_after_body(masked, span[1])
+        if alias is not None and alias != tag:
+            aliases[alias] = tag
+        aliases[tag] = tag
+    for match in TYPEDEF_ANON_STRUCT.finditer(masked):
+        span = _struct_body_span(masked, match.end() - 1)
+        if span is None:
+            continue
+        alias = _typedef_alias_after_body(masked, span[1])
+        if alias is not None:
+            aliases[alias] = alias
+    for match in re.finditer(r"\b(?:struct|union)\s+(\w+)\s*\{", masked):
+        aliases.setdefault(match.group(1), match.group(1))
+    return aliases
+
+
+def c_struct_member_types(masked: str) -> dict[str, dict[str, tuple[str, bool]]]:
+    """Map struct tags and typedef names to member field type names."""
+    members: dict[str, dict[str, tuple[str, bool]]] = {}
+
+    def record(tag: str, span: tuple[int, int]) -> None:
+        """Store member types for one struct body under tag and optional typedef alias."""
+        body = masked[span[0] : span[1]]
+        tag_members = _member_decl_types(body)
+        members[tag] = tag_members
+        alias = _typedef_alias_after_body(masked, span[1])
+        if alias is not None:
+            members[alias] = tag_members
+
+    for match in re.finditer(r"\b(?:struct|union)\s+(\w+)\s*\{", masked):
+        span = _struct_body_span(masked, match.end() - 1)
+        if span is not None:
+            record(match.group(1), span)
+    for match in TYPEDEF_STRUCT_BODY.finditer(masked):
+        span = _struct_body_span(masked, match.end() - 1)
+        if span is not None:
+            record(match.group(1), span)
+    for match in TYPEDEF_ANON_STRUCT.finditer(masked):
+        span = _struct_body_span(masked, match.end() - 1)
+        if span is None:
+            continue
+        alias = _typedef_alias_after_body(masked, span[1])
+        if alias is None:
+            continue
+        body = masked[span[0] : span[1]]
+        members[alias] = _member_decl_types(body)
+    return members
+
+
+def _last_decl_before(
+    declarations: list[tuple[int, str, str | None]], position: int, name: str
+) -> tuple[int, str, str | None] | None:
+    """Return the last declaration of name strictly before position."""
+    found: tuple[int, str, str | None] | None = None
+    for item in declarations:
+        if item[0] >= position:
+            break
+        if item[1] == name:
+            found = item
+    return found
+
+
+def resolve_var_kind(
+    position: int,
+    name: str,
+    bounds: list[tuple[int, int]],
+    region_decls: list[list[tuple[int, str, str | None]]],
+    file_decls: list[tuple[int, str, str | None]],
+) -> tuple[bool, str | None]:
+    """Return whether name is unknown at position and its resolved struct tag if known."""
+    region = _region_index_for(bounds, position)
+    local = _last_decl_before(region_decls[region], position, name)
+    if local is not None:
+        return False, local[2]
+    file_hit = _last_decl_before(file_decls, position, name)
+    if file_hit is not None:
+        return False, file_hit[2]
+    return True, None
 
 
 def feature_read_receiver_root(masked: str, member_access_start: int) -> str | None:
     """Return the root identifier for the receiver of one feature member access."""
     token_start = access_expr_first_token_start(masked, member_access_start)
     limit = len(masked)
-    end = token_start
     for index in range(token_start, limit):
         if masked[index] not in _IDENT_TAIL:
             end = index
@@ -527,29 +790,167 @@ def feature_read_receiver_root(masked: str, member_access_start: int) -> str | N
     return masked[token_start:end]
 
 
+def _align_chain_cursor(masked: str, start: int) -> int:
+    """Advance start through whitespace to '.' or the '-' of an arrow."""
+    limit = len(masked)
+    index = start
+    for _ in range(PLAIN_ASSIGN_WINDOW):
+        if index >= limit:
+            return start
+        ch = masked[index]
+        if ch in " \t\n\r":
+            index += 1
+            continue
+        if ch in {".", "-"}:
+            return index
+        break
+    return start
+
+
+def _access_op_at(masked: str, cursor: int) -> str | None:
+    """Return '.' or '>' for the member access operator at cursor."""
+    limit = len(masked)
+    index = cursor
+    for _ in range(8):
+        if index >= limit:
+            return None
+        if masked[index] in " \t\n\r":
+            index += 1
+            continue
+        if masked[index] == ".":
+            return "."
+        if masked[index] == "-" and index + 1 < limit and masked[index + 1] == ">":
+            return ">"
+        break
+    return None
+
+
+def feature_receiver_member_chain(masked: str, member_access_start: int) -> list[str]:
+    """Return member names between the access root and the feature."""
+    root_start = access_expr_first_token_start(masked, member_access_start)
+    names: list[str] = []
+    floor = max(0, member_access_start - PLAIN_ASSIGN_WINDOW)
+    anchor = _align_chain_cursor(masked, member_access_start)
+    cursor = _skip_ws_back(masked, anchor - 1, floor)
+    for _ in range(32):
+        if cursor < floor or masked[cursor] not in _IDENT_TAIL:
+            break
+        end = cursor
+        start = _scan_ident_start(masked, end, floor)
+        if start <= root_start:
+            break
+        names.insert(0, masked[start : end + 1])
+        prev = _skip_ws_back(masked, start - 1, floor)
+        if prev >= floor and masked[prev] == ".":
+            cursor = _skip_ws_back(masked, prev - 1, floor)
+            continue
+        if prev > floor + 1 and masked[prev] == ">" and masked[prev - 1] == "-":
+            cursor = _skip_ws_back(masked, prev - 2, floor)
+            continue
+        break
+    return names
+
+
+def _eligible_from_kind(unknown: bool, kind: str | None) -> bool:
+    """Return whether unknown or eligible Vk feature struct kind satisfies a read."""
+    if unknown:
+        return True
+    return kind is not None and kind in MAP_STATE.feature_struct_names
+
+
+def _resolve_type_alias(type_name: str, aliases: dict[str, str]) -> str:
+    """Follow typedef aliases to a struct tag or typedef name."""
+    current = type_name
+    for _ in range(32):
+        nxt = aliases.get(current, current)
+        if nxt == current:
+            return current
+        current = nxt
+    return current
+
+
+def _other_vk_physical_type(type_name: str) -> bool:
+    """Return True for ineligible VkPhysicalDevice struct type names."""
+    return (
+        type_name.startswith("VkPhysicalDevice") and type_name not in MAP_STATE.feature_struct_names
+    )
+
+
+def _final_receiver_type_eligible(final_type: str, scope: FeatureScopeContext) -> bool:
+    """Return whether the chain end type may hold a Vk feature gate read."""
+    resolved = _resolve_type_alias(final_type, scope.typedef_aliases)
+    if resolved in MAP_STATE.feature_struct_names:
+        return True
+    if _other_vk_physical_type(resolved):
+        return False
+    return resolved not in scope.member_types
+
+
+def _walk_member_type(parent: str, member: str, scope: FeatureScopeContext) -> str | None:
+    """Return the next type name for one chain step, or None when unresolved."""
+    resolved = _resolve_type_alias(parent, scope.typedef_aliases)
+    table = scope.member_types.get(resolved)
+    if table is None or member not in table:
+        return None
+    type_name, _ = table[member]
+    return type_name
+
+
+def _chained_receiver_eligible(
+    scope: FeatureScopeContext,
+    position: int,
+    root: str,
+    members: list[str],
+) -> bool:
+    """Return whether a member chain resolves to an eligible Vk feature struct."""
+    unknown, kind = resolve_var_kind(
+        position, root, scope.bounds, scope.region_decls, scope.file_decls
+    )
+    if unknown:
+        return True
+    if kind is None:
+        return False
+    current = _resolve_type_alias(kind, scope.typedef_aliases)
+    for member in members:
+        step = _walk_member_type(current, member, scope)
+        if step is None:
+            return True
+        current = step
+    return _final_receiver_type_eligible(current, scope)
+
+
 def feature_read_from_eligible_struct(
-    masked: str, match: re.Match[str], var_types: dict[str, str | None]
+    masked: str, match: re.Match[str], scope: FeatureScopeContext
 ) -> bool:
     """Return True when a feature member read uses an eligible Vk feature struct."""
-    root = feature_read_receiver_root(masked, match.start())
+    position = match.start()
+    root = feature_read_receiver_root(masked, position)
+    members = feature_receiver_member_chain(masked, position)
+    if not members:
+        if root is None:
+            return True
+        unknown, kind = resolve_var_kind(
+            position, root, scope.bounds, scope.region_decls, scope.file_decls
+        )
+        return _eligible_from_kind(unknown, kind)
     if root is None:
         return True
-    if root not in var_types:
-        return True
-    struct = var_types[root]
-    return struct is not None and struct in MAP_STATE.feature_struct_names
+    return _chained_receiver_eligible(scope, position, root, members)
 
 
 def c_feature_reads(source: str) -> list[FeatureSite]:
     """Collect VkPhysicalDeviceFeatures gate reads from masked C source."""
     masked = mask_literals(source)
-    var_types = c_feature_var_types(masked)
+    bounds, region_decls, file_decls = c_collect_scoped_var_decls(masked)
+    member_types = c_struct_member_types(masked)
+    typedef_aliases = c_typedef_alias_map(masked)
+    scope = FeatureScopeContext(bounds, region_decls, file_decls, member_types, typedef_aliases)
     sites: list[FeatureSite] = []
     for match in FEATURE_READ.finditer(masked):
         feature = match[1]
         if feature not in MAP_STATE.feature_allowlist:
             continue
-        if not feature_read_from_eligible_struct(masked, match, var_types):
+        if not feature_read_from_eligible_struct(masked, match, scope):
             continue
         if plain_assignment_after(masked, match.end(), match.start()):
             continue

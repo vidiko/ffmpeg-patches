@@ -25,7 +25,7 @@ from scripts import (
     variant_sweep,
 )
 from tests import test_variant_sweep as fixtures
-from tests.helpers import full_sweep_report
+from tests.helpers import full_sweep_report, run_git
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "variant_sweep.py"
 VALIDATE_SECTIONS = (
@@ -86,6 +86,56 @@ class SweepClassesTest(unittest.TestCase):
         result = self.sweep(head, "all")
         self.assertEqual(result.returncode, 0, result.stderr)
         return self.output.read_text(encoding="utf-8")
+
+    def test_cr13_f4_cli_main_catches_sibling_prerequisite(self) -> None:
+        """F4: __main__ CLI records a Vulkan prerequisite from the real sibling loader."""
+        vulkan = self.repo / "libavfilter" / "vf_gate_vulkan.c"
+        vulkan.parent.mkdir(parents=True, exist_ok=True)
+        vulkan.write_text(
+            "extern const unsigned char ff_test_comp_spv_data[];\nint f(void) { return 0; }\n",
+            encoding="utf-8",
+        )
+        run_git(self.repo, "add", ".")
+        run_git(self.repo, "commit", "-qm", "head")
+        head = run_git(self.repo, "rev-parse", "HEAD")
+        output = self.repo / "all-sweep.md"
+        vk_xml = str(sweep_vulkan_features.VK_XML)
+        argv = [
+            str(SCRIPT),
+            "-C",
+            str(self.repo),
+            "--class",
+            "all",
+            self.base,
+            head,
+            "-o",
+            str(output),
+        ]
+        root = Path(__file__).resolve().parents[1]
+        child = (
+            "import pathlib, runpy, sys\n"
+            f"sys.path.insert(0, {str(root)!r})\n"
+            f"vk = pathlib.Path({vk_xml!r})\n"
+            "real = pathlib.Path.is_file\n"
+            "def fake(self):\n"
+            "    if self == vk:\n"
+            "        return False\n"
+            "    return real(self)\n"
+            "pathlib.Path.is_file = fake\n"
+            f"sys.argv = {argv!r}\n"
+            f"runpy.run_path({str(SCRIPT)!r}, run_name='__main__')\n"
+        )
+        result = subprocess.run(  # nosec B603 - fixed interpreter argv in a fixture repository.
+            [sys.executable, "-B", "-c", child],
+            text=True,
+            capture_output=True,
+            timeout=60,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = output.read_text(encoding="utf-8")
+        self.assertIn("prerequisite:", section(report, "vulkan-features"))
+        self.assertIn("class: port-parity", report)
 
     def test_state_after_error(self) -> None:
         """An increment after an earlier error return produces one state row."""

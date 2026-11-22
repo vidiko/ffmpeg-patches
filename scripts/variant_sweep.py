@@ -815,8 +815,21 @@ def validate_full_report(path: Path, sha: str, class_file: Path = CLASS_FILE) ->
     return validate_review_classes(sections["review-classes"], sha, classes)
 
 
+def _register_running_validator() -> None:
+    """Register the executing validator under scripts.variant_sweep when run as __main__."""
+    if "scripts.variant_sweep" in sys.modules:
+        return
+    target = Path(__file__).resolve()
+    for module in sys.modules.values():
+        path = getattr(module, "__file__", None)
+        if path is not None and Path(path).resolve() == target:
+            sys.modules["scripts.variant_sweep"] = module
+            return
+
+
 def sibling_module(name: str):
     """Load a helper only from the resolved directory containing this validator."""
+    _register_running_validator()
     path = Path(__file__).resolve().with_name(f"{name}.py")
     spec = importlib.util.spec_from_file_location(f"_ffmpeg_sweep_{name}", path)
     if spec is None or spec.loader is None:

@@ -2567,11 +2567,28 @@ def _c_rules_attr_token(token: str, attr_depth: int) -> tuple[int, bool]:
     return 0, token == ")"
 
 
+def _c_rules_init_token(
+    token: str, depth: int, attr_depth: int, in_init: bool, paren_depth: int
+) -> tuple[bool, int]:
+    """Advance file-scope initializer flag and plain-parenthesis depth for one token."""
+    if depth != 0:
+        return in_init, 0
+    if token == ";":
+        return False, 0
+    if token in {"{", "}"}:
+        return in_init, 0
+    if token == "(":
+        return in_init, paren_depth + 1
+    if token == ")":
+        return in_init, max(0, paren_depth - 1)
+    return in_init or (token == "=" and attr_depth == 0 and paren_depth == 0), paren_depth
+
+
 def _c_rules_scan_line(
-    clean: str, state: tuple[int, bool, bool, bool, int]
-) -> tuple[int, bool, bool, bool, int]:
-    """Advance brace depth, boundary state and function-header context across one code line."""
-    depth, _, in_function, after_rparen, attr_depth = state
+    clean: str, state: tuple[int, bool, bool, bool, int, bool, int]
+) -> tuple[int, bool, bool, bool, int, bool, int]:
+    """Advance brace depth, boundary state, header and initializer context across a line."""
+    depth, _, in_function, after_rparen, attr_depth, in_init, paren_depth = state
     tokens = re.findall(r"(?a)\w+|[^ \t\r\f\v]", clean)
     if not tokens:
         return state
@@ -2580,31 +2597,39 @@ def _c_rules_scan_line(
         token = tokens[index]
         closed_function = False
         if token == "{":
-            in_function = after_rparen if depth == 0 else in_function
+            if depth == 0:
+                in_function = after_rparen and not in_init
             depth += 1
         elif token == "}":
             depth -= 1
             closed_function = depth == 0 and in_function
             in_function = in_function and depth > 0
         attr_depth, after_rparen = _c_rules_attr_token(token, attr_depth)
+        in_init, paren_depth = _c_rules_init_token(token, depth, attr_depth, in_init, paren_depth)
     at_boundary = tokens[-1] == ";" or closed_function
-    return depth, at_boundary, in_function, after_rparen, attr_depth
+    return depth, at_boundary, in_function, after_rparen, attr_depth, in_init, paren_depth
 
 
 def _c_rules_arm_state(
     raw: bytes,
     clean: str,
-    state: tuple[int, bool, bool, bool, int],
-    stack: list[tuple[tuple[int, bool, bool, bool, int], tuple[bool, bool, bool, int], bool]],
+    state: tuple[int, bool, bool, bool, int, bool, int],
+    stack: list[
+        tuple[
+            tuple[int, bool, bool, bool, int, bool, int],
+            tuple[bool, bool, bool, int, bool, int],
+            bool,
+        ]
+    ],
     limit: int,
-) -> tuple[tuple[int, bool, bool, bool, int], bool]:
-    """Update per-arm boundary and header state across preprocessor conditional directives."""
+) -> tuple[tuple[int, bool, bool, bool, int, bool, int], bool]:
+    """Update per-arm boundary, header and initializer state across conditional directives."""
     match = re.match(rb"[ \t]*#[ \t]*([A-Za-z_]\w*)", raw)
     word = match[1] if not clean.strip() and match is not None else b""
     if word not in {b"if", b"ifdef", b"ifndef", b"elif", b"else", b"endif"}:
         return state, True
     if word in {b"if", b"ifdef", b"ifndef"} and len(stack) < limit:
-        stack.append((state, (True, True, True, 0), False))
+        stack.append((state, (True, True, True, 0, False, 0), False))
         return state, True
     if word in {b"elif", b"else"} and stack and not stack[-1][2]:
         entry, flags_ok, _ = stack[-1]
@@ -2613,6 +2638,8 @@ def _c_rules_arm_state(
             flags_ok[1] and state[2],
             flags_ok[2] and state[3],
             max(flags_ok[3], state[4]),
+            flags_ok[4] or state[5],
+            max(flags_ok[5], state[6]),
         )
         stack[-1] = (entry, combined, word == b"else")
         return entry, True
@@ -2624,8 +2651,29 @@ def _c_rules_arm_state(
             flags_ok[1] and state[2] and (has_else or entry[2]),
             flags_ok[2] and state[3] and (has_else or entry[3]),
             max(flags_ok[3], state[4], 0 if has_else else entry[4]),
+            flags_ok[4] or state[5] or (not has_else and entry[5]),
+            max(flags_ok[5], state[6], 0 if has_else else entry[6]),
         ), True
-    return (state[0], False, False, False, 0), False
+    return (state[0], False, False, False, 0, False, 0), False
+
+
+def _c_rules_blank_call(
+    raw: bytes, clean: str, names: set[str], code: list[str], next_line: int
+) -> bool:
+    """Decide whether one boundary line is a standalone macro call not opening a body."""
+    invocation = re.fullmatch(rb"[ \t]*([A-Za-z_]\w*)[ \t]*\(.*\)[ \t\r]*", raw)
+    if (
+        invocation is None
+        or invocation.start(1) != len(clean) - len(clean.lstrip(" \t\r\f\v"))
+        or not _c_rules_macro_call(clean, names)
+        or raw[clean.rfind(")") + 1 :].strip(b" \t\r")
+    ):
+        return False
+    for index in range(next_line, len(code)):
+        stripped = code[index].lstrip(" \t\r\f\v")
+        if stripped:
+            return not stripped.startswith("{")
+    return True
 
 
 def _c_rules_blank(source: bytes, attributes: set[bytes]) -> bytes:
@@ -2637,24 +2685,35 @@ def _c_rules_blank(source: bytes, attributes: set[bytes]) -> bytes:
     words = re.compile(rb"\b(?:" + b"|".join(sorted(attributes)) + rb")\b") if attributes else None
     lines = source.split(b"\n")
     depths = _c_rules_depths(lines, code, len(directives))
-    state = (0, True, False, False, 0)
-    stack: list[tuple[tuple[int, bool, bool, bool, int], tuple[bool, bool, bool, int], bool]] = []
+    state = (0, True, False, False, 0, False, 0)
+    stack: list[
+        tuple[
+            tuple[int, bool, bool, bool, int, bool, int],
+            tuple[bool, bool, bool, int, bool, int],
+            bool,
+        ]
+    ] = []
     valid = True
     for index in range(len(lines)):
         raw, clean = lines[index], code[index]
         state, ok = _c_rules_arm_state(raw, clean, state, stack, len(lines))
         valid = valid and ok
-        invocation = re.fullmatch(rb"[ \t]*[A-Za-z_]\w*[ \t]*\(.*\)[ \t\r]*", raw)
         if (
             valid
             and depths[index] == 0
             and state[1]
-            and invocation
-            and _c_rules_macro_call(clean, names)
-            and not raw[clean.rfind(")") + 1 :].strip(b" \t\r")
+            and _c_rules_blank_call(raw, clean, names, code, index + 1)
         ):
             lines[index] = re.sub(rb"[^\r]", b" ", raw)
-            state = (state[0] + clean.count("{") - clean.count("}"), True, False, False, 0)
+            state = (
+                state[0] + clean.count("{") - clean.count("}"),
+                True,
+                False,
+                False,
+                0,
+                False,
+                0,
+            )
         else:
             if words is not None:
                 lines[index] = _c_rules_blank_words(raw, clean, words)
@@ -2767,11 +2826,16 @@ def _c_rules(
                 2 if escaped else unused.rc,
                 "\n".join([*notices, unused.output]).rstrip("\n"),
             )
+        prepared_unread = list(unread_paths)
         result, parsed = _c_rules_scan(
             scan_root, paths, Path(directory) / "semgrep.json", unread_paths
         )
     if parsed is None:
         step = _c_rules_error(result)
+        unused = _unread_report(prepared_unread, unread_waivers)
+        if unused.output:
+            output = step.output.rstrip("\n")
+            step = Step(step.name, 2, f"{output}\n{unused.output}")
     else:
         step = _c_rules_report(
             parsed[0],

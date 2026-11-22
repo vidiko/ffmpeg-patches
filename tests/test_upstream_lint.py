@@ -3547,8 +3547,35 @@ class _CRulesBlankingMixin:
         )
 
 
+class _CRulesFixtureMixin:
+    """Shared fixture source and symlink helpers for tree-backed c-rules tests."""
+
+    def allocation_source(self) -> str:
+        """Return a one-line allocation finding that overlaps a committed symlink hunk."""
+        return (
+            "void fixture(void) { unsigned char *buffer = av_malloc(8); "
+            "unsigned char *dst = buffer ? buffer + 4 : NULL; "
+            "if (!buffer) { fail(); } }\n"
+        )
+
+    def commit_linked_source(self, internal: bool = False) -> Path:
+        """Commit a requested symlink with its target inside the disposable fixture parent."""
+        target = self.root / "fixtures/linked.c" if internal else self.root.parent / "outside.c"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(self.allocation_source(), encoding="utf-8")
+        source = self.root / "libavfilter/vf_x.c"
+        source.unlink()
+        source.symlink_to("before.c")
+        self.commit("avfilter/vf_x: establish linked source")
+        self.base = self.git("rev-parse", "HEAD").strip()
+        source.unlink()
+        source.symlink_to(target)
+        self.commit()
+        return target
+
+
 @unittest.skipUnless(shutil.which(os.environ.get("SEMGREP") or "semgrep"), "semgrep not installed")
-class CRulesScratchTest(_CRulesBlankingMixin, FixtureTest):
+class CRulesScratchTest(_CRulesBlankingMixin, _CRulesFixtureMixin, FixtureTest):
     """Exercise scratch preparation and real scanner results on synthetic sources."""
 
     def setUp(self) -> None:
@@ -3903,21 +3930,6 @@ class CRulesScratchTest(_CRulesBlankingMixin, FixtureTest):
         self.assertIn(f"no waiver: {name}:", step.output)
         self.assertIn(f"finding: {other}:1:", step.output)
 
-    def test_r3_requested_directories_are_unread(self) -> None:
-        """Requested root and subdirectories use the existing unread waiver rules."""
-        for name in (".", "libavfilter"):
-            waiver = upstream_lint.UnreadWaiver(name, "fixture", "B", date(2026, 11, 23), False)
-            for reason, unread, rc in (("", (), 1), ("fixture", (), 1), ("", (waiver,), 0)):
-                with self.subTest(name=name, reason=reason, unread=unread):
-                    with unittest.mock.patch.object(
-                        upstream_lint, "_c_rules_touched", return_value={name: {1}}
-                    ):
-                        step = upstream_lint._c_rules(self.root, self.base, "HEAD", reason, unread)
-                    self.assertIsInstance(step, upstream_lint.Step)
-                    self.assertEqual(step.rc, rc, step.output)
-                    self.assertIn(f"unread: {name}:", step.output)
-                    self.assertIn(f"{'waived' if unread else 'no waiver'}: {name}:", step.output)
-
     def test_r3_requested_directory_keeps_other_finding(self) -> None:
         """An unread directory does not suppress scanning an ordinary requested source."""
         self.write("libavfilter/vf_x.c", self.allocation_source())
@@ -3929,44 +3941,6 @@ class CRulesScratchTest(_CRulesBlankingMixin, FixtureTest):
         self.assertIn("unread: .:", step.output)
         self.assertIn("no waiver: .:", step.output)
         self.assertIn("finding: libavfilter/vf_x.c:1:", step.output)
-
-    def test_r3_requested_header_directory_is_unread(self) -> None:
-        """A requested attributes-header directory reaches the ordinary unread report."""
-        name = "libavutil/attributes.h"
-        header = self.root / name
-        header.unlink()
-        header.mkdir()
-        with unittest.mock.patch.object(
-            upstream_lint, "_c_rules_touched", return_value={name: {1}}
-        ):
-            step = upstream_lint._c_rules(self.root, self.base, "HEAD", "")
-        self.assertIsInstance(step, upstream_lint.Step)
-        self.assertEqual(step.rc, 1, step.output)
-        self.assertIn(f"unread: {name}:", step.output)
-        self.assertIn(f"no waiver: {name}:", step.output)
-
-    def allocation_source(self) -> str:
-        """Return a one-line allocation finding that overlaps a committed symlink hunk."""
-        return (
-            "void fixture(void) { unsigned char *buffer = av_malloc(8); "
-            "unsigned char *dst = buffer ? buffer + 4 : NULL; "
-            "if (!buffer) { fail(); } }\n"
-        )
-
-    def commit_linked_source(self, internal: bool = False) -> Path:
-        """Commit a requested symlink with its target inside the disposable fixture parent."""
-        target = self.root / "fixtures/linked.c" if internal else self.root.parent / "outside.c"
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(self.allocation_source(), encoding="utf-8")
-        source = self.root / "libavfilter/vf_x.c"
-        source.unlink()
-        source.symlink_to("before.c")
-        self.commit("avfilter/vf_x: establish linked source")
-        self.base = self.git("rev-parse", "HEAD").strip()
-        source.unlink()
-        source.symlink_to(target)
-        self.commit()
-        return target
 
     def test_d3_escaping_source_cannot_be_waived(self) -> None:
         """An escaping source is never read or scanned and neither waiver can excuse it."""
@@ -4001,27 +3975,6 @@ class CRulesScratchTest(_CRulesBlankingMixin, FixtureTest):
         self.assertIn("resolves outside the checked tree", step.output)
         self.assertIn("finding: libavfilter/vf_other.c:1:", step.output)
         self.assertNotIn("finding: libavfilter/vf_x.c:", step.output)
-
-    def test_d3_escaping_source_keeps_unread_status(self) -> None:
-        """Rejecting one source retains unread and waiver statuses for another source."""
-        self.commit_linked_source()
-        name = "libavfilter/vf_unread.c"
-        self.write(name, "int unread;\n")
-        self.commit()
-        self.c_rules_json = json.dumps(
-            {
-                "paths": {"scanned": [name]},
-                "results": [],
-                "errors": [{"type": "Syntax error", "path": name}],
-            }
-        )
-        with unittest.mock.patch.object(upstream_lint, "_run", side_effect=self.command):
-            step = upstream_lint._c_rules(self.root, self.base, "HEAD", "")
-        self.assertEqual(step.rc, 2, step.output)
-        self.assertEqual(step.output.count("libavfilter/vf_x.c"), 1, step.output)
-        self.assertIn("resolves outside the checked tree", step.output)
-        self.assertIn(f"unread: {name}:", step.output)
-        self.assertIn(f"no waiver: {name}:", step.output)
 
     def test_d3_internal_source_symlink_is_scanned(self) -> None:
         """A requested symlink resolving inside the tree retains normal finding status."""
@@ -4237,7 +4190,7 @@ class CRulesScratchTest(_CRulesBlankingMixin, FixtureTest):
         self.assertIn("finding: libavfilter/vf_x.c:1:", step.output)
 
 
-class CRulesTreeTest(_CRulesBlankingMixin, FixtureTest):
+class CRulesTreeTest(_CRulesBlankingMixin, _CRulesFixtureMixin, FixtureTest):
     """Exercise tree-backed c-rules discovery and containment without running Semgrep."""
 
     def setUp(self) -> None:
@@ -4296,6 +4249,88 @@ class CRulesTreeTest(_CRulesBlankingMixin, FixtureTest):
         self.assertEqual(len(prepared[1]), 1)
         self.assertIn(upstream_lint._waiver_text(name), prepared[1][0])
         self.assertIn("resolves outside the scratch root", prepared[1][0])
+
+    def test_r3_requested_directories_are_unread(self) -> None:
+        """Requested root and subdirectories use the existing unread waiver rules."""
+        for name in (".", "libavfilter"):
+            waiver = upstream_lint.UnreadWaiver(name, "fixture", "B", date(2026, 11, 23), False)
+            for reason, unread, rc in (("", (), 1), ("fixture", (), 1), ("", (waiver,), 0)):
+                with self.subTest(name=name, reason=reason, unread=unread):
+                    with unittest.mock.patch.object(
+                        upstream_lint, "_c_rules_touched", return_value={name: {1}}
+                    ):
+                        step = upstream_lint._c_rules(self.root, self.base, "HEAD", reason, unread)
+                    self.assertIsInstance(step, upstream_lint.Step)
+                    self.assertEqual(step.rc, rc, step.output)
+                    self.assertIn(f"unread: {name}:", step.output)
+                    self.assertIn(f"{'waived' if unread else 'no waiver'}: {name}:", step.output)
+
+    def test_r3_requested_header_directory_is_unread(self) -> None:
+        """A requested attributes-header directory reaches the ordinary unread report."""
+        name = "libavutil/attributes.h"
+        header = self.root / name
+        header.unlink()
+        header.mkdir()
+        with unittest.mock.patch.object(
+            upstream_lint, "_c_rules_touched", return_value={name: {1}}
+        ):
+            step = upstream_lint._c_rules(self.root, self.base, "HEAD", "")
+        self.assertIsInstance(step, upstream_lint.Step)
+        self.assertEqual(step.rc, 1, step.output)
+        self.assertIn(f"unread: {name}:", step.output)
+        self.assertIn(f"no waiver: {name}:", step.output)
+
+    def test_d3_escaping_source_keeps_unread_status(self) -> None:
+        """Rejecting one source retains unread and waiver statuses for another source."""
+        self.commit_linked_source()
+        name = "libavfilter/vf_unread.c"
+        self.write(name, "int unread;\n")
+        self.commit()
+        self.c_rules_json = json.dumps(
+            {
+                "paths": {"scanned": [name]},
+                "results": [],
+                "errors": [{"type": "Syntax error", "path": name}],
+            }
+        )
+        with unittest.mock.patch.object(upstream_lint, "_run", side_effect=self.command):
+            step = upstream_lint._c_rules(self.root, self.base, "HEAD", "")
+        self.assertEqual(step.rc, 2, step.output)
+        self.assertEqual(step.output.count("libavfilter/vf_x.c"), 1, step.output)
+        self.assertIn("resolves outside the checked tree", step.output)
+        self.assertIn(f"unread: {name}:", step.output)
+        self.assertIn(f"no waiver: {name}:", step.output)
+
+    def test_scanner_failure_reports_preparation_unread(self) -> None:
+        """Rejected scanner output keeps preparation unread paths and drops payload paths."""
+        directory, source = "libavfilter", "libavfilter/vf_x.c"
+        self.write(source, "int ordinary;\n")
+        self.c_rules_json = json.dumps(
+            {
+                "paths": {"scanned": [source]},
+                "results": [],
+                "errors": [
+                    {"type": "Syntax error", "path": source},
+                    {"type": "Unexpected error", "path": source},
+                ],
+            }
+        )
+        waiver = upstream_lint.UnreadWaiver(directory, "fixture", "B", date(2026, 11, 23), False)
+        for unread in ((), (waiver,)):
+            with self.subTest(unread=unread):
+                with (
+                    unittest.mock.patch.object(
+                        upstream_lint,
+                        "_c_rules_touched",
+                        return_value={directory: {1}, source: {1}},
+                    ),
+                    unittest.mock.patch.object(upstream_lint, "_run", side_effect=self.command),
+                ):
+                    step = upstream_lint._c_rules(self.root, self.base, "HEAD", "", unread)
+                self.assertEqual(step.rc, 2, step.output)
+                self.assertIn(f"unread: {directory}:", step.output)
+                self.assertIn(f"{'waived' if unread else 'no waiver'}: {directory}:", step.output)
+                self.assertNotIn(source, step.output)
 
 
 class CRulesBlankingTest(_CRulesBlankingMixin, unittest.TestCase):
@@ -4801,6 +4836,61 @@ class CRulesBlankingTest(_CRulesBlankingMixin, unittest.TestCase):
         )
         expected = source[: -len(b"CALL(1)\n")] + b" " * len(b"CALL(1)") + b"\n"
         self.assert_blanked(source, expected)
+
+    def test_compound_literal_initializer_keeps_terminator_macro(self) -> None:
+        """Compound-literal initializers retain trailing macros without masking functions."""
+        unchanged = (
+            b"#define END(x) ;\nstatic int *p = (int[]){ 1 }\nEND(p)\nint after;\n",
+            b"#define END(x) ;\nstatic int *p = (int[])\n{ 1 }\nEND(p)\n",
+            b"#define END(x) ;\n#if A\nstatic int *p = (int[])\n#endif\n{ 1 }\nEND(p)\n",
+            b"#define END(x) ;\n#if A\nstatic int *p =\n#endif\n(int[]){ 1 }\nEND(p)\n",
+        )
+        for index in range(len(unchanged)):
+            self.assert_blanked(unchanged[index], unchanged[index])
+        blanked_cases = (
+            (
+                b"#define CALL(x) (x)\nDEFINE_PAIR(a = 1, b = 2)\nstatic int f(void)\n"
+                b"{\n    return 0;\n}\nCALL(1)\n"
+            ),
+            (
+                b"#define CALL(x) (x)\nstatic const int t[] = { 1 };\nstatic int g(void)\n"
+                b"{\n    return 0;\n}\nCALL(1)\n"
+            ),
+        )
+        for index in range(len(blanked_cases)):
+            source = blanked_cases[index]
+            expected = source[: -len(b"CALL(1)\n")] + b" " * len(b"CALL(1)") + b"\n"
+            self.assert_blanked(source, expected)
+
+    def test_comment_close_before_macro_call_is_kept(self) -> None:
+        """Comment closers before known macro calls keep the line unblanked."""
+        kept = b"#define BUILD(x) x\n/* open\nnote(*/ BUILD(x)\nint after;\n"
+        self.assert_blanked(kept, kept)
+        blanked = b"#define BUILD(x) x\nint before;\nBUILD(x)\nint after;\n"
+        expected = (
+            b"#define BUILD(x) x\nint before;\n" + b" " * len(b"BUILD(x)") + b"\nint after;\n"
+        )
+        self.assert_blanked(blanked, expected)
+
+    def test_macro_supplied_function_header_is_kept(self) -> None:
+        """Macro calls followed by an opening brace keep the function header line."""
+        header_cases = (
+            (
+                b"#define DECL(x) int x(void)\n#define CALL(x) (x)\n"
+                b"DECL(f)\n{\n    return 0;\n}\nCALL(1)\n"
+            ),
+            (
+                b"#define DECL(x) int x(void)\n#define CALL(x) (x)\n"
+                b"DECL(f)\n\n/* header comment */\n{\n    return 0;\n}\nCALL(1)\n"
+            ),
+        )
+        for index in range(len(header_cases)):
+            source = header_cases[index]
+            expected = source[: -len(b"CALL(1)\n")] + b" " * len(b"CALL(1)") + b"\n"
+            self.assert_blanked(source, expected)
+        plain = b"#define DECLARE(x) int x;\nDECLARE(a)\nint b;\n"
+        expected_plain = b"#define DECLARE(x) int x;\n" + b" " * len(b"DECLARE(a)") + b"\nint b;\n"
+        self.assert_blanked(plain, expected_plain)
 
 
 class CRulesTest(unittest.TestCase):

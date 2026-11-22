@@ -254,15 +254,158 @@ def collect_targets(
     return targets
 
 
-def plain_assignment_after(text: str, offset: int) -> bool:
-    """Return True when masked text after offset begins a plain '=' assignment."""
-    position = offset
-    limit = min(len(text), offset + 256)
-    while position < limit and text[position] in " \t\n\r":
-        position += 1
-    if position >= limit or text[position] != "=":
+_IDENT_TAIL = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_")
+PLAIN_ASSIGN_WINDOW = 256
+
+
+def _member_pred_ok(text: str, index: int) -> bool:
+    """Return True when '(' at index is not directly after an identifier, ']' or ')'."""
+    if index <= 0:
+        return True
+    previous = text[index - 1]
+    return previous not in _IDENT_TAIL and previous not in "])"
+
+
+def _skip_ws_back(text: str, index: int, floor: int) -> int:
+    """Return the last index at or above floor that is not whitespace."""
+    while index >= floor and text[index] in " \t\n\r":
+        index -= 1
+    return index
+
+
+def _scan_ident_start(text: str, index: int, floor: int) -> int:
+    """Return the index where the identifier ending at index begins."""
+    while index >= floor and text[index] in _IDENT_TAIL:
+        index -= 1
+    return index + 1
+
+
+def _scan_balanced_open(text: str, index: int, floor: int, open_ch: str, close_ch: str) -> int:
+    """Return the index of open_ch balancing close_ch at index."""
+    depth = 1
+    index -= 1
+    for _ in range(PLAIN_ASSIGN_WINDOW):
+        if index < floor:
+            return floor
+        ch = text[index]
+        if ch == close_ch:
+            depth += 1
+        elif ch == open_ch:
+            depth -= 1
+            if depth == 0:
+                return index
+        index -= 1
+    return floor
+
+
+def _scan_primary_start(text: str, index: int, floor: int) -> int:
+    """Return the start index of the primary expression ending at index."""
+    for _ in range(PLAIN_ASSIGN_WINDOW):
+        if index < floor:
+            return floor
+        ch = text[index]
+        if ch in _IDENT_TAIL:
+            return _scan_ident_start(text, index, floor)
+        if ch == ")":
+            index = _scan_balanced_open(text, index, floor, "(", ")")
+            continue
+        if ch == "]":
+            index = _scan_balanced_open(text, index, floor, "[", "]")
+            continue
+        if ch in "(*":
+            return index
+        return index
+    return floor
+
+
+def _extend_access_chain(text: str, token_start: int, floor: int) -> int:
+    """Walk left across '->' and '.' to the first token of a member chain."""
+    cursor = token_start
+    for _ in range(32):
+        back = _skip_ws_back(text, cursor - 1, floor)
+        if back >= floor + 1 and text[back] == ">" and text[back - 1] == "-":
+            back = _skip_ws_back(text, back - 2, floor)
+            if back < floor:
+                break
+            cursor = _scan_primary_start(text, back, floor)
+            token_start = cursor
+            continue
+        if back >= floor and text[back] == ".":
+            back = _skip_ws_back(text, back - 1, floor)
+            if back < floor:
+                break
+            cursor = _scan_primary_start(text, back, floor)
+            token_start = cursor
+            continue
+        break
+    return token_start
+
+
+def access_expr_first_token_start(text: str, member_access_start: int) -> int:
+    """Return the index of the first token left of '.' or '->' (identifier, '(' or '*')."""
+    floor = max(0, member_access_start - PLAIN_ASSIGN_WINDOW)
+    end = _skip_ws_back(text, member_access_start - 1, floor)
+    if end < floor:
+        return floor
+    return _extend_access_chain(text, _scan_primary_start(text, end, floor), floor)
+
+
+def matching_open_paren(text: str, close_index: int, lower_bound: int) -> int | None:
+    """Return the index of '(' matching close_index when scanning back to lower_bound."""
+    if close_index >= len(text) or text[close_index] != ")":
+        return None
+    depth = 1
+    for index in range(close_index - 1, lower_bound - 1, -1):
+        ch = text[index]
+        if ch == ")":
+            depth += 1
+        elif ch == "(":
+            depth -= 1
+            if depth == 0:
+                return index
+    return None
+
+
+def wrapper_paren_closes_write(
+    text: str, close_index: int, member_end: int, member_access_start: int
+) -> bool:
+    """Return True when close_index ends a wrapper '(' enclosing the member access."""
+    if member_end > close_index:
         return False
-    return position + 1 >= len(text) or text[position + 1] != "="
+    open_index = matching_open_paren(text, close_index, 0)
+    if open_index is None or open_index >= member_access_start:
+        return False
+    if not _member_pred_ok(text, open_index):
+        return False
+    expr_start = access_expr_first_token_start(text, member_access_start)
+    after = open_index + 1
+    limit = min(len(text), open_index + PLAIN_ASSIGN_WINDOW)
+    while after < limit and text[after] in " \t\n\r":
+        after += 1
+    return after <= expr_start
+
+
+def plain_assignment_after(text: str, member_end: int, member_access_start: int) -> bool:
+    """Return True when text after member_end is optional ')' wrappers then plain '='."""
+    position = member_end
+    limit = min(len(text), member_end + PLAIN_ASSIGN_WINDOW)
+    for _ in range(PLAIN_ASSIGN_WINDOW):
+        if position >= limit:
+            return False
+        while position < limit and text[position] in " \t\n\r":
+            position += 1
+        if position >= limit:
+            return False
+        ch = text[position]
+        if ch == ")":
+            if not wrapper_paren_closes_write(text, position, member_end, member_access_start):
+                return False
+            position += 1
+            continue
+        if ch != "=":
+            return False
+        return position + 1 >= len(text) or text[position + 1] != "="
+    return False
 
 
 def c_feature_reads(source: str) -> list[FeatureSite]:
@@ -273,7 +416,7 @@ def c_feature_reads(source: str) -> list[FeatureSite]:
         feature = match[1]
         if feature not in MAP_STATE.feature_allowlist:
             continue
-        if plain_assignment_after(masked, match.end()):
+        if plain_assignment_after(masked, match.end(), match.start()):
             continue
         line_number = masked.count("\n", 0, match.start()) + 1
         sites.append(FeatureSite(line_number, feature))

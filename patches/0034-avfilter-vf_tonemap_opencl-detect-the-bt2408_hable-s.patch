@@ -13,19 +13,19 @@ the scene-change threshold. Off by default; output is unchanged.
 
 Signed-off-by: lusoris <lusoris@proton.me>
 ---
- doc/filters.texi                   |  20 ++-
+ doc/filters.texi                   |  25 +++-
  libavfilter/Makefile               |   3 +-
  libavfilter/opencl/tonemap_peak.cl | 124 ++++++++++++++++
  libavfilter/opencl_source.h        |   1 +
  libavfilter/vf_tonemap_opencl.c    | 218 +++++++++++++++++++++++++----
- 5 files changed, 330 insertions(+), 36 deletions(-)
+ 5 files changed, 335 insertions(+), 36 deletions(-)
  create mode 100644 libavfilter/opencl/tonemap_peak.cl
 
 diff --git a/doc/filters.texi b/doc/filters.texi
-index 5604b9f8d33cd1a74e26f10ede3cae14effd8b11..320f3d45743a45aa9e386a229875dc26daa5c1cf 100644
+index 98071f63919a5038959c93ffa807620b9b1c46f7..e837dd096aba9a8d1cfa83764ff25db5793f2dce 100644
 --- a/doc/filters.texi
 +++ b/doc/filters.texi
-@@ -28675,14 +28675,22 @@ It accepts the following parameters:
+@@ -28680,14 +28680,22 @@ It accepts the following parameters:
  @item tonemap
  Specify the tone-mapping operator to be used. Same as tonemap option in @ref{tonemap}.
  With @code{bt2408_hable}, the output is in BT.709 primaries whatever
@@ -52,14 +52,19 @@ index 5604b9f8d33cd1a74e26f10ede3cae14effd8b11..320f3d45743a45aa9e386a229875dc26
  @item param
  Tune the tone mapping algorithm. same as param option in @ref{tonemap}.
  
-@@ -28701,6 +28709,10 @@ The tonemapping algorithm parameters is fine-tuned per each scene. And a thresho
+@@ -28706,6 +28714,15 @@ The tonemapping algorithm parameters is fine-tuned per each scene. And a thresho
  is used to detect whether the scene has changed or not. If the distance between
  the current frame average brightness and the current running average exceeds
  a threshold value, we would re-calculate scene average and peak brightness.
 +For @code{bt2408_hable} with @option{peak_detect}, it sets the scene change
-+window: changes below @code{5 * threshold} percent are smoothed, changes above
-+@code{15 * threshold} percent reset smoothing to the new frame, and changes in
-+between blend the two. 0 disables scene change detection.
++window, which applies to the distance between the frame's average PQ level and
++the running average after the running average has taken its per-frame step
++toward the frame (about 5 percent), multiplied by the share of 16x16 tiles
++that hold a non-black pixel, so a change confined to a small part of the frame
++needs a larger change of the average to cross the cutoffs. When that weighted
++distance is below @code{5 * threshold} percent the change is smoothed, above
++@code{15 * threshold} percent the smoothing is reset to the new frame, and in
++between the two are blended. 0 disables scene change detection.
  The default value is 0.2.
  
  @item format

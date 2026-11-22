@@ -70,9 +70,11 @@ Signed-off-by: lusoris <lusoris@proton.me>
  libavfilter/vulkan/Makefile                   |    2 +
  .../vulkan/hqdn3d_horizontal.comp.glsl        |  161 +++
  libavfilter/vulkan/hqdn3d_vertical.comp.glsl  |  234 ++++
+ libavutil/vulkan.c                            |    6 +-
+ libavutil/vulkan.h                            |    6 +
  tests/fate/hw.mak                             |    4 +
  tests/ref/fate/filter-hqdn3d-vulkan           |   21 +
- 14 files changed, 2626 insertions(+), 31 deletions(-)
+ 16 files changed, 2635 insertions(+), 34 deletions(-)
  create mode 100644 libavfilter/hqdn3d_coefs.c
  create mode 100644 libavfilter/hqdn3d_coefs.h
  create mode 100644 libavfilter/tests/hqdn3d_vulkan.c
@@ -94,7 +96,7 @@ index b1656f0f803081cecc0f9ac7136c2d08d0494ca1..231c6b67c5dd7564633dc0801adc81cf
  iccgen_filter_deps="lcms2"
  identity_filter_select="scene_sad"
 diff --git a/doc/filters.texi b/doc/filters.texi
-index dae2ed3c23b0e95dcc25c5e9f9fa8b3684ff9c8d..7b65d803d57ab355f5ce1d7e4c8264f719217f2b 100644
+index 459af37f9eb6190eb44c940d63e78638557577a1..999aef0c6c2177e7525148700d4fc645798576a3 100644
 --- a/doc/filters.texi
 +++ b/doc/filters.texi
 @@ -15792,6 +15792,55 @@ The command accepts the same syntax of the corresponding option.
@@ -2840,6 +2842,54 @@ index 0000000000000000000000000000000000000000..7aec109fff49c3dcec9d8f21c2c77d12
 +            process_planar_spatial(x);
 +    }
 +}
+diff --git a/libavutil/vulkan.c b/libavutil/vulkan.c
+index bf8a72d287c595a3609f402502d55224f3b887e5..ad162149cd2ea7f8b93d99760d1ce58dc38feeb4 100644
+--- a/libavutil/vulkan.c
++++ b/libavutil/vulkan.c
+@@ -1880,7 +1880,7 @@ static void destroy_imageviews(void *opaque, uint8_t *data)
+     av_free(iv);
+ }
+ 
+-static VkFormat map_fmt_to_rep(VkFormat fmt, enum FFVkShaderRepFormat rep_fmt)
++VkFormat ff_vk_map_fmt_to_rep(VkFormat fmt, enum FFVkShaderRepFormat rep_fmt)
+ {
+ #define REPS_FMT(fmt) \
+     [FF_VK_REP_NATIVE] = fmt ## _UINT, \
+@@ -2002,7 +2002,7 @@ int ff_vk_create_imageview(FFVulkanContext *s,
+         .pNext      = &view_usage_info,
+         .image      = vkf->img[FFMIN(plane, nb_images - 1)],
+         .viewType   = VK_IMAGE_VIEW_TYPE_2D,
+-        .format     = map_fmt_to_rep(rep_fmts[plane], rep_fmt),
++        .format     = ff_vk_map_fmt_to_rep(rep_fmts[plane], rep_fmt),
+         .components = ff_comp_identity_map,
+         .subresourceRange = {
+             .aspectMask = ff_vk_aspect_flag(f, plane),
+@@ -2063,7 +2063,7 @@ int ff_vk_create_imageviews(FFVulkanContext *s, FFVkExecContext *e,
+             .pNext      = &view_usage_info,
+             .image      = vkf->img[FFMIN(i, nb_images - 1)],
+             .viewType   = VK_IMAGE_VIEW_TYPE_2D,
+-            .format     = map_fmt_to_rep(rep_fmts[i], rep_fmt),
++            .format     = ff_vk_map_fmt_to_rep(rep_fmts[i], rep_fmt),
+             .components = ff_comp_identity_map,
+             .subresourceRange = {
+                 .aspectMask = ff_vk_aspect_flag(f, i),
+diff --git a/libavutil/vulkan.h b/libavutil/vulkan.h
+index b37d998d3714171440545c2e8014d5ab25e74fe7..f5479df21ff63dd5d4b58a03316f83c66a02983f 100644
+--- a/libavutil/vulkan.h
++++ b/libavutil/vulkan.h
+@@ -420,6 +420,12 @@ enum FFVkShaderRepFormat {
+ const char *ff_vk_shader_rep_fmt(enum AVPixelFormat pix_fmt,
+                                  enum FFVkShaderRepFormat rep_fmt);
+ 
++/**
++ * Returns the view format for the given representation of fmt, or
++ * VK_FORMAT_UNDEFINED if there is none.
++ */
++VkFormat ff_vk_map_fmt_to_rep(VkFormat fmt, enum FFVkShaderRepFormat rep_fmt);
++
+ /**
+  * Loads props/mprops/driver_props
+  */
 diff --git a/tests/fate/hw.mak b/tests/fate/hw.mak
 index 0f126892fd1a92d2e79edf229deeccb96e559c30..bb60d3ccc29550b00071f7c6149ea5f074cf2674 100644
 --- a/tests/fate/hw.mak

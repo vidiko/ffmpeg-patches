@@ -597,7 +597,7 @@ def manifest_lock(root: Path, leftovers: list[str] | None = None):
     try:
         stream.close()
         yield lock
-    except BaseException as exc:
+    except (Exception, KeyboardInterrupt, SystemExit) as exc:
         failure = exc
     finally:
         cleanup_manifest_path(lock, collected)

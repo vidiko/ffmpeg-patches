@@ -1692,12 +1692,17 @@ class FixTest(unittest.TestCase):
         self.assertIn(f"leftover: {lock}: cleanup failed: planted lock unlink", err)
         self.assertTrue(lock.is_file())
         lock.unlink()
+
+        def raise_planted_keyboard_interrupt() -> None:
+            """Raise the planted interrupt inside manifest_lock."""
+            raise KeyboardInterrupt("planted interrupt")
+
         with (
             patch.object(Path, "unlink", autospec=True, side_effect=fail_lock_unlink),
             self.assertRaises(KeyboardInterrupt) as caught,
             upstream_drift.manifest_lock(self.root),
         ):
-            raise KeyboardInterrupt("planted interrupt")
+            raise_planted_keyboard_interrupt()
         self.assertIn(
             f"leftover: {lock}: cleanup failed: planted lock unlink",
             getattr(caught.exception, "__notes__", []),

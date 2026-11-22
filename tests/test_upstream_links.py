@@ -1265,7 +1265,7 @@ class RequestCostTest(unittest.TestCase):
                 drift.HttpsRedirectHandler().redirect_request(
                     request, None, 302, "Found", email.message.Message(), f"{API}/pulls/20"
                 )
-            except BaseException as exc:
+            except (Exception, KeyboardInterrupt, SystemExit) as exc:
                 outcomes.append(exc)
             finally:
                 finished.set()

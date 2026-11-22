@@ -442,6 +442,105 @@ def case_ok_cleanup_after_with_block(self):
     path.unlink()
 """
 
+BASE_EXCEPTION_HANDLER_FIXTURE = """# SPDX-License-Identifier: EUPL-1.2
+\"\"\"Fixture functions for base-exception-handler-without-reraise semgrep rule testing.\"\"\"
+
+failure = None
+
+
+def case_flagged_base_exception_swallow():
+    \"\"\"Flagged: except BaseException assigns without re-raise.\"\"\"
+    global failure
+    try:
+        raise RuntimeError("boom")
+    except BaseException as exc:
+        failure = exc
+
+
+def case_flagged_bare_except_swallow():
+    \"\"\"Flagged: bare except assigns without re-raise.\"\"\"
+    global failure
+    try:
+        raise RuntimeError("boom")
+    except:
+        failure = True
+
+
+def case_ok_tuple_handler():
+    \"\"\"OK: repository tuple defers until cleanup outside the handler.\"\"\"
+    global failure
+    try:
+        raise RuntimeError("boom")
+    except (Exception, KeyboardInterrupt, SystemExit) as exc:
+        failure = exc
+
+
+def case_ok_base_exception_reraise():
+    \"\"\"OK: BaseException handler ends with a bare raise.\"\"\"
+    try:
+        raise RuntimeError("boom")
+    except BaseException:
+        raise
+
+
+def case_ok_exception_handler():
+    \"\"\"OK: Exception alone is not BaseException for CodeQL.\"\"\"
+    try:
+        raise RuntimeError("boom")
+    except Exception as exc:
+        failure = exc
+"""
+
+ASSERT_RAISES_BODY_FIXTURE = """# SPDX-License-Identifier: EUPL-1.2
+\"\"\"Fixture functions for assert-raises-body-bare-raise semgrep rule testing.\"\"\"
+
+import unittest
+from contextlib import contextmanager
+
+
+@contextmanager
+def other_context():
+    \"\"\"Secondary context manager for multi-with fixtures.\"\"\"
+    yield
+
+
+def case_flagged_assert_raises_bare_raise(self):
+    \"\"\"Flagged: assertRaises body is only a raise statement.\"\"\"
+    with self.assertRaises(RuntimeError):
+        raise RuntimeError("planted")
+
+
+def case_flagged_assert_raises_regex_bare_raise(self):
+    \"\"\"Flagged: assertRaisesRegex body is only a raise statement.\"\"\"
+    with self.assertRaisesRegex(RuntimeError, "planted"):
+        raise RuntimeError("planted")
+
+
+def case_flagged_multi_with_bare_raise(self):
+    \"\"\"Flagged: combined with assertRaises as still uses a bare raise body.\"\"\"
+    with other_context(), self.assertRaises(RuntimeError) as caught, other_context():
+        raise RuntimeError("planted")
+
+
+def _call_raise_runtime() -> None:
+    \"\"\"Helper that raises for assertRaises bodies.\"\"\"
+    raise RuntimeError("planted")
+
+
+def case_ok_assert_raises_call(self):
+    \"\"\"OK: assertRaises body calls a helper instead of bare raise.\"\"\"
+    with self.assertRaises(RuntimeError):
+        _call_raise_runtime()
+
+
+def case_ok_if_before_raise(self):
+    \"\"\"OK: raise after another statement inside an if.\"\"\"
+    with self.assertRaises(RuntimeError):
+        if True:
+            self.assertTrue(True)
+            raise RuntimeError("planted")
+"""
+
 NEGATED_STATUS_FIXTURE = (
     "#!/usr/bin/env bash\n"
     "# SPDX-"
@@ -721,6 +820,22 @@ class SemgrepRulesTest(unittest.TestCase):
         self.assertEqual(
             _flagged_in_fixture(SUBTEST_CLEANUP_FIXTURE, "subtest-cleanup-outside-finally"),
             _expected_flagged(SUBTEST_CLEANUP_FIXTURE),
+        )
+
+    def test_base_exception_handler_without_reraise_rule(self) -> None:
+        """Rule base-exception-handler-without-reraise flags swallowing BaseException."""
+        self.assertEqual(
+            _flagged_in_fixture(
+                BASE_EXCEPTION_HANDLER_FIXTURE, "base-exception-handler-without-reraise"
+            ),
+            _expected_flagged(BASE_EXCEPTION_HANDLER_FIXTURE),
+        )
+
+    def test_assert_raises_body_bare_raise_rule(self) -> None:
+        """Rule assert-raises-body-bare-raise flags a with body that is only raise."""
+        self.assertEqual(
+            _flagged_in_fixture(ASSERT_RAISES_BODY_FIXTURE, "assert-raises-body-bare-raise"),
+            _expected_flagged(ASSERT_RAISES_BODY_FIXTURE),
         )
 
     def test_os_open_create_mode_wider_than_owner_rule(self) -> None:

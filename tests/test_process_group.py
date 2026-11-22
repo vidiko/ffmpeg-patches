@@ -10,6 +10,7 @@ import os
 import signal
 import subprocess  # nosec B404 - test subprocesses run fixed commands with deadlines.
 import sys
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -19,6 +20,7 @@ from scripts.process_group import (
     TASKKILL_TIMEOUT_S,
     kill_process_group,
     kill_process_tree,
+    read_bounded,
 )
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -70,6 +72,27 @@ class ProcessGroupTest(unittest.TestCase):
             kill_process_group(fake_own)
         mock_killpg.assert_not_called()
         fake_own.kill.assert_called_once_with()
+
+    def test_read_bounded_timeout_raises_timeout_expired(self) -> None:
+        """Verify read_bounded raises TimeoutExpired with process argv and timeout."""
+        argv = [sys.executable, "-I", "-c", "pass"]
+        timeout = 1.5
+        fake_process = SimpleNamespace(args=argv)
+        read_fd, write_fd = os.pipe()
+        with os.fdopen(read_fd, "rb") as reader, os.fdopen(write_fd, "wb"):
+            for offset in (-1.0, 0.02):
+                with self.subTest(offset=offset):
+                    with self.assertRaises(subprocess.TimeoutExpired) as caught:
+                        read_bounded(
+                            fake_process,
+                            (reader,),
+                            time.monotonic() + offset,
+                            limit=64,
+                            timeout=timeout,
+                        )
+                    self.assertIs(type(caught.exception), subprocess.TimeoutExpired)
+                    self.assertEqual(caught.exception.cmd, argv)
+                    self.assertEqual(caught.exception.timeout, timeout)
 
 
 class ProcessTreeTest(unittest.TestCase):

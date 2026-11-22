@@ -289,6 +289,7 @@ def prepare_tree(tree: Path, raw_commit: str) -> tuple[str, str, str, list[str],
         raise _PreflightError(f"commit {commit} is not an ancestor of HEAD ({head})")
     source_paths = _source_paths(tree, commit)
     _check_checkout_filters(tree, commit, source_paths, checked)
+    _check_checkout_filters(tree, head, source_paths, checked)
     return commit, head, head_tree, source_paths, head_ref
 
 

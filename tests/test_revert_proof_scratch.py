@@ -79,16 +79,41 @@ class RevertProofScratchTest(RevertProofFixture):
         self.assertIn("fixture.txt", error)
         self.assertFalse(self.record_path.exists())
 
+    def _long_nested_libavfilter_path(self, index: int, target_bytes: int = 900) -> str:
+        """Build a long libavfilter path from directory segments capped at 200 bytes each."""
+        prefix = "libavfilter/"
+        tail = f"vf_{index}.c"
+        remaining = target_bytes - len(prefix) - len(tail)
+        parts: list[str] = []
+        segment_cap = 200
+        for _part_index in range(max(1, (remaining + segment_cap - 1) // segment_cap)):
+            if remaining <= 0:
+                break
+            take = min(segment_cap, remaining)
+            parts.append("d" * take)
+            remaining -= take
+        return prefix + "/".join(parts) + "/" + tail
+
     def test_check_attr_batches_bound_encoded_path_bytes(self) -> None:
         """Long valid paths split into byte-bounded check-attr batches before measurement."""
-        segment = "a" * 900
-        paths = [f"libavfilter/{segment}_{index}.c" for index in range(4)]
-        with unittest.mock.patch.object(revert_proof, "MAX_CHECK_ATTR_BYTES", 2_000):
+        batch_limit = 2_000
+        paths = [self._long_nested_libavfilter_path(index) for index in range(4)]
+        for path in paths:
+            for component in path.split("/"):
+                self.assertLessEqual(len(component.encode()), 200)
+        with unittest.mock.patch.object(revert_proof, "MAX_CHECK_ATTR_BYTES", batch_limit):
             batches = revert_proof._filter_path_batches(paths)
-        self.assertGreater(len(batches), 1)
+        self.assertEqual(len(batches), 2)
         for batch in batches:
             size = sum(revert_proof._check_attr_path_bytes(path) for path in batch)
-            self.assertLessEqual(size, revert_proof.MAX_CHECK_ATTR_BYTES)
+            self.assertLessEqual(size, batch_limit)
+        short_paths = [f"libavfilter/short_{index}.c" for index in range(5)]
+        with (
+            unittest.mock.patch.object(revert_proof, "MAX_CHECK_ATTR_BYTES", batch_limit),
+            unittest.mock.patch.object(upstream_lint, "MAX_PATHS", 2),
+        ):
+            count_batches = revert_proof._filter_path_batches(short_paths)
+        self.assertEqual(len(count_batches), 3)
 
     def test_non_utf8_head_filter_refuses_before_measurement(self) -> None:
         """Non-UTF-8 HEAD paths with a configured smudge filter refuse before measurement."""
@@ -141,6 +166,41 @@ class RevertProofScratchTest(RevertProofFixture):
         self.write("libavfilter/vf_x.c", FIXED_SOURCE)
         (self.tree / "libavfilter/vf_del.c").unlink()
         fix = self.commit("fix source and remove filtered path")
+        rc, _, error = self.run_cli(fix, [sys.executable, "-c", "pass"], expect_scratch=False)
+        self.assertEqual(rc, 2, error)
+        self.assertIn("vf_del.c", error)
+        self.assertIn("counter", error)
+        self.assertFalse(self.record_path.exists())
+
+    def test_source_path_fix_filter_removed_at_head_still_refuses(self) -> None:
+        """A fix-commit filter on a deleted path still refuses after HEAD drops the attribute."""
+        self.write(".gitattributes", "libavfilter/vf_del.c filter=counter\n")
+        self.write("libavfilter/vf_del.c", BASE_SOURCE)
+        self.write("libavfilter/vf_x.c", BASE_SOURCE)
+        self.commit("add filtered vf_del at base")
+        run_git(self.tree, "config", "filter.counter.smudge", "exit 99", preserve_config=True)
+        self.write("libavfilter/vf_x.c", FIXED_SOURCE)
+        (self.tree / "libavfilter/vf_del.c").unlink()
+        fix = self.commit("fix removes vf_del while attribute remains")
+        self.write(".gitattributes", "\n")
+        self.commit("HEAD drops vf_del filter attribute")
+        rc, _, error = self.run_cli(fix, [sys.executable, "-c", "pass"], expect_scratch=False)
+        self.assertEqual(rc, 2, error)
+        self.assertIn("vf_del.c", error)
+        self.assertIn("counter", error)
+        self.assertFalse(self.record_path.exists())
+
+    def test_source_path_head_filter_after_fix_refuses_before_reverse_apply(self) -> None:
+        """A filter attribute added at HEAD on a fix-deleted source path is refused."""
+        self.write("libavfilter/vf_del.c", BASE_SOURCE)
+        self.write("libavfilter/vf_x.c", BASE_SOURCE)
+        self.commit("add sources without vf_del filter attribute")
+        self.write("libavfilter/vf_x.c", FIXED_SOURCE)
+        (self.tree / "libavfilter/vf_del.c").unlink()
+        fix = self.commit("fix source and remove vf_del")
+        self.write(".gitattributes", "libavfilter/vf_del.c filter=counter\n")
+        self.commit("attribute filter on deleted path at HEAD")
+        run_git(self.tree, "config", "filter.counter.smudge", "exit 99", preserve_config=True)
         rc, _, error = self.run_cli(fix, [sys.executable, "-c", "pass"], expect_scratch=False)
         self.assertEqual(rc, 2, error)
         self.assertIn("vf_del.c", error)

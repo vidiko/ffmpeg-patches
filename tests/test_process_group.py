@@ -7,10 +7,10 @@ from __future__ import annotations
 import contextlib
 import io
 import os
+import selectors
 import signal
 import subprocess  # nosec B404 - test subprocesses run fixed commands with deadlines.
 import sys
-import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -74,25 +74,39 @@ class ProcessGroupTest(unittest.TestCase):
         fake_own.kill.assert_called_once_with()
 
     def test_read_bounded_timeout_raises_timeout_expired(self) -> None:
-        """Verify read_bounded raises TimeoutExpired with process argv and timeout."""
+        """Verify read_bounded raises TimeoutExpired on elapsed deadlines and empty select."""
         argv = [sys.executable, "-I", "-c", "pass"]
         timeout = 1.5
+        now = 100.0
         fake_process = SimpleNamespace(args=argv)
+        cases = (
+            ("elapsed_deadline", 99.0, False),
+            ("empty_select", 101.0, True),
+        )
         read_fd, write_fd = os.pipe()
         with os.fdopen(read_fd, "rb") as reader, os.fdopen(write_fd, "wb"):
-            for offset in (-1.0, 0.02):
-                with self.subTest(offset=offset):
-                    with self.assertRaises(subprocess.TimeoutExpired) as caught:
+            for case, deadline, expects_select in cases:
+                with self.subTest(case=case):
+                    mock_select = Mock(return_value=[])
+                    with (
+                        patch("scripts.process_group.time.monotonic", return_value=now),
+                        patch.object(selectors.DefaultSelector, "select", mock_select),
+                        self.assertRaises(subprocess.TimeoutExpired) as caught,
+                    ):
                         read_bounded(
                             fake_process,
                             (reader,),
-                            time.monotonic() + offset,
+                            deadline,
                             limit=64,
                             timeout=timeout,
                         )
                     self.assertIs(type(caught.exception), subprocess.TimeoutExpired)
                     self.assertEqual(caught.exception.cmd, argv)
                     self.assertEqual(caught.exception.timeout, timeout)
+                    if expects_select:
+                        mock_select.assert_called_once_with(deadline - now)
+                    else:
+                        mock_select.assert_not_called()
 
 
 class ProcessTreeTest(unittest.TestCase):

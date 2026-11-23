@@ -1425,6 +1425,69 @@ class VulkanSweepTest(unittest.TestCase):
         source = "void f(void)\n{\n    *out = src[0] >> 4;\n}\n"
         self.assertEqual(sweep_port_parity.cpu_sites(source), [(3, "shift")])
 
+    def test_cr18_while_mask_on_other_operand_ignored(self) -> None:
+        """CR18 H1: while-header mask on another operand does not classify the sample read."""
+        source = "void f(void)\n{\n    while (src[0] && (flags & 0xff)) {}\n}\n"
+        self.assertEqual(sweep_port_parity.cpu_sites(source), [])
+
+    def test_cr18_while_shift_on_other_operand_ignored(self) -> None:
+        """CR18 H2: while-header shift on another operand does not classify the sample read."""
+        source = "void f(void)\n{\n    while (src[0] && (n >> 2)) {}\n}\n"
+        self.assertEqual(sweep_port_parity.cpu_sites(source), [])
+
+    def test_cr18_for_condition_mask_on_other_operand_ignored(self) -> None:
+        """CR18 H3: for-condition mask on another operand does not classify the sample read."""
+        source = "void f(void)\n{\n    for (i = 0; src[i] && (flags & 0xff); i++) {}\n}\n"
+        self.assertEqual(sweep_port_parity.cpu_sites(source), [])
+
+    def test_cr18_for_init_mask_on_unbound_name_ignored(self) -> None:
+        """CR18: for-init bound read ignores mask on a different loop variable."""
+        source = "void f(void)\n{\n    for (int v = src[0]; (w & 0xFFF0u) != 0; v++) {}\n}\n"
+        self.assertEqual(sweep_port_parity.cpu_sites(source), [])
+
+    def test_cr18_for_init_shift_on_bound_name(self) -> None:
+        """CR18: for-init bound read classifies shift on the bound loop variable."""
+        source = "void f(void)\n{\n    for (int v = src[0]; (v >> 2) != 0; v++) {}\n}\n"
+        self.assertEqual(sweep_port_parity.cpu_sites(source), [(3, "shift")])
+
+    def test_cr18_for_init_non_whole_word_name_ignored(self) -> None:
+        """CR18: for-init bound read ignores mask on a substring-matching identifier."""
+        source = "void f(void)\n{\n    for (int v = src[0]; (vv & 0xFFF0u) != 0; v++) {}\n}\n"
+        self.assertEqual(sweep_port_parity.cpu_sites(source), [])
+
+    def test_cr18_loop_header_focus_regressions(self) -> None:
+        """CR18 H4: attached and bound-variable header reads still classify correctly."""
+        cases = [
+            (
+                "while_mask_on_sample",
+                "void f(void)\n{\n    while ((src[0] & 0xff) != 0) {}\n}\n",
+                [(3, "mask")],
+            ),
+            (
+                "while_mask_suffix",
+                "void f(void)\n{\n    while (src[0] & 0x3ff) {}\n}\n",
+                [(3, "mask")],
+            ),
+            (
+                "while_cast_mask",
+                "void f(void)\n{\n    while ((int)src[0] & 0x3ff) {}\n}\n",
+                [(3, "mask")],
+            ),
+            (
+                "for_init_mask_on_rhs",
+                "void f(void)\n{\n    for (v = src[0] & 0x3ff; v; v--) {}\n}\n",
+                [(3, "mask")],
+            ),
+            (
+                "while_plain_read",
+                "void f(void)\n{\n    while (src[0]) {}\n}\n",
+                [],
+            ),
+        ]
+        for label, source, expected in cases:
+            with self.subTest(label=label):
+                self.assertEqual(sweep_port_parity.cpu_sites(source), expected)
+
     def test_cr10_4658985429_linked_shaders_dedupes_repeated_symbols(self) -> None:
         """CR10-5429: repeated extern and use symbols link one shader path in first-seen order."""
         c_source = (

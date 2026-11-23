@@ -43,6 +43,10 @@ CLIP = re.compile(r"\b(?:av_clip|CLIP)\w*\s*\(", re.ASCII)
 CLAMP = re.compile(r"\bclamp\s*\(", re.ASCII)
 SHADER_LOAD = re.compile(r"\b(?:imageLoad|texelFetch)\s*\(", re.ASCII)
 _LOOP_HEADER = re.compile(r"^\s*(?:for|while)\s*\(", re.ASCII)
+_FOR_LOOP = re.compile(r"^\s*for\b", re.ASCII)
+_TYPE_WORDS = frozenset(
+    {"char", "const", "double", "float", "int", "long", "short", "signed", "unsigned", "volatile"}
+)
 _OPERAND_OPS = 64
 
 
@@ -259,6 +263,107 @@ def header_inner_call_depth(statement: str, read_start: int, bounds: tuple[int, 
     return depth
 
 
+def _whole_word_at(text: str, index: int, name: str) -> bool:
+    """Return whether name appears as a whole identifier at index."""
+    if not text.startswith(name, index):
+        return False
+    after = index + len(name)
+    if index > 0 and (text[index - 1].isalnum() or text[index - 1] == "_"):
+        return False
+    return not (after < len(text) and (text[after].isalnum() or text[after] == "_"))
+
+
+def for_init_clause_end(statement: str, bounds: tuple[int, int]) -> int:
+    """Return the index of the first ';' that ends the for-init clause in bounds."""
+    depth = 0
+    for index in range(bounds[0], bounds[1]):
+        ch = statement[index]
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+        elif ch == ";" and depth == 0:
+            return index
+    return bounds[1]
+
+
+def _decl_name_before_equals(statement: str, eq_index: int) -> str | None:
+    """Return the declared variable name immediately before one '=' at init depth."""
+    cursor = eq_index
+    for _ in range(16):
+        position = cursor - 1
+        while position >= 0 and statement[position] in " \t":
+            position -= 1
+        if position < 0:
+            return None
+        end = position
+        while position >= 0 and (statement[position].isalnum() or statement[position] == "_"):
+            position -= 1
+        name = statement[position + 1 : end + 1]
+        if not name or not (name[0].isalpha() or name[0] == "_"):
+            return None
+        if name in _TYPE_WORDS:
+            cursor = position + 1
+            continue
+        return name
+    return None
+
+
+def for_init_bound_name(
+    statement: str, read_start: int, read_end: int, bounds: tuple[int, int]
+) -> str | None:
+    """Return the for-init variable name when the sample read is its whole initializer."""
+    if _FOR_LOOP.match(statement.lstrip()) is None:
+        return None
+    init_end = for_init_clause_end(statement, bounds)
+    if read_start >= init_end:
+        return None
+    depth = statement[:read_start].count("(") - statement[:read_start].count(")")
+    rhs_end = _operand_scan_end(statement, read_end, depth)
+    paren_depth = 0
+    for index in range(bounds[0], init_end):
+        ch = statement[index]
+        if ch == "(":
+            paren_depth += 1
+        elif ch == ")":
+            paren_depth -= 1
+        elif ch == "=" and paren_depth == 0:
+            name = _decl_name_before_equals(statement, index)
+            if name is None:
+                continue
+            rhs_start = _skip_space(statement, index + 1, init_end)
+            if rhs_start != read_start or rhs_end > init_end:
+                continue
+            tail_at = _skip_space(statement, rhs_end, init_end)
+            if tail_at == init_end or statement[tail_at] == ",":
+                return name
+    return None
+
+
+def bound_variable_operator_focus(
+    statement: str, name: str, init_end: int, header_end: int, bind_rhs_end: int
+) -> str:
+    """Return attached mask or shift text from later whole-word uses of one loop variable."""
+    pieces: list[str] = []
+    index = init_end
+    name_len = len(name)
+    for _ in range(_OPERAND_OPS):
+        if index >= header_end:
+            break
+        hit = statement.find(name, index, header_end)
+        if hit < 0:
+            break
+        if not _whole_word_at(statement, hit, name):
+            index = hit + 1
+            continue
+        if hit < bind_rhs_end:
+            index = hit + name_len
+            continue
+        pieces.append(attached_operator_text(statement, hit, hit + name_len))
+        index = hit + name_len
+    return "".join(pieces)
+
+
 def normalization_focus(statement: str, read_start: int, read_end: int) -> str:
     """Return the statement slice searched for normalization on one sample read."""
     clip_text = enclosing_clip_focus(statement, read_start, read_end)
@@ -274,7 +379,15 @@ def normalization_focus(statement: str, read_start: int, read_end: int) -> str:
             return tail_slice
         if normalization_kind(tail_slice) is not None:
             return tail_slice
-        return statement[bounds[0] : header_end]
+        bound = for_init_bound_name(statement, read_start, read_end, bounds)
+        if bound is not None:
+            init_end = for_init_clause_end(statement, bounds)
+            depth = statement[:read_start].count("(") - statement[:read_start].count(")")
+            bind_rhs_end = _operand_scan_end(statement, read_end, depth)
+            return bound_variable_operator_focus(
+                statement, bound, init_end, bounds[1], bind_rhs_end
+            )
+        return tail_slice
     return tail
 
 

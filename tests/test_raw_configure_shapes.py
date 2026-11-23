@@ -659,6 +659,35 @@ class RawConfigureShapeTest(RawConfigureGuardBase):
                 self.assertIsNotNone(hit)
                 self.assertIn("unparsable shell text naming a command", hit or "")
 
+    def test_fd_tail_allow_verdict_scoped_to_each_script_text(self) -> None:
+        """Keep allow-list answers separate for the main file and bash -c inline text."""
+        bash_first = (
+            "delay=$((1 << 2))\n"
+            "d=3\n"
+            'bash -c "python3 - x ${d}<<< \\"$d\\" > /tmp/z"\n'
+            'python3 - x 3<<< "$d" > /tmp/y\n'
+        )
+        context = InspectionContext(
+            cwd=self.root,
+            directory_changed=False,
+            files_read=[],
+            classifier=lambda _words: None,
+            script_dir=self.root,
+        )
+
+        def probe(target: str, _context: InspectionContext, _budget: BodyBudget) -> bool:
+            if target == "/tmp/y":
+                return True
+            if target == "/tmp/z":
+                return False
+            return False
+
+        patch = unittest.mock.patch.object(
+            body_mod, "_probe_clean_redirect_target", side_effect=probe
+        )
+        with patch:
+            self.assertIsNone(scan_body(bash_first, context, BodyBudget())[0])
+
     def test_inline_without_primed_verdicts_stays_fail_closed(self) -> None:
         """Refuse an inline descriptor tail when redirect verdicts were not primed."""
         inline = b'python3 - x 3<<< "$d" > /tmp/z\n'

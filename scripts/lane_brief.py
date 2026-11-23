@@ -20,6 +20,7 @@ import importlib
 import io
 import os
 import re
+import shlex
 import stat
 import subprocess  # nosec B404 - runner precheck with explicit argv, no shell, bounded timeout.
 import sys
@@ -65,15 +66,25 @@ ONE_LINE_JOIN = re.compile(
     re.IGNORECASE,
 )
 JOIN_NEGATION = re.compile(r"\b(?:not|never|no|don't)\b", re.IGNORECASE)
-JOIN_BOUNDARY = re.compile(r"[;]|[.!?]\s+|\n[ \t]*(?:\n|[-*+#]|\d+[.)][ \t]|\w+:)")
+JOIN_BOUNDARY = re.compile(
+    r"[;]|[.!?]\s+|\n[ \t]*(?:\n|[-*+#]|\d+[.)][ \t]|\w+:)"
+    r"|\b(?:but|however)\b",
+    re.IGNORECASE,
+)
 FINDING_PREFIX = re.compile(r"^[ \t]*(?:(?:[-*+]|\d+[.)])[ \t]+)*finding:", re.IGNORECASE)
 WHOLE_FILE_LENGTH = re.compile(
     r"\b[gmn]?awk\b[\s\S]*?(?<![/.-])\blength\b(?:\s*\(\s*(?:\$0\s*)?\)|(?![/.-]|\s*\())"
     r"|\b(?:[ef]?grep|rg)\b[\s\S]*?(?<!\\)\.\\?\{\d{2,3}(?:,\d*)?\\?\}"
     r"|\bwc\s+(?:-[a-zA-Z]*L\b|--max-line-length\b)"
 )
+AWK_LENGTH_PROGRAM = re.compile(
+    r"(?<![/.-])\blength\b(?:\s*\(\s*(?:\$0\s*)?\)|(?![/.-]|\s*\())",
+    re.IGNORECASE,
+)
+GREP_COUNTED_DOT = re.compile(r"(?<!\\)\.\\?\{\d{2,3}(?:,\d*)?\\?\}")
+LENGTH_TOOL_NAMES = frozenset({"wc", "awk", "gawk", "mawk", "nawk", "grep", "egrep", "fgrep", "rg"})
 GIT_DIFF_COMMAND = re.compile(r"\bgit\b[^|;&]*\bdiff\b")
-STANDALONE_OBJECT = re.compile(r"(?<![0-9a-fA-F])[0-9a-f]{40}(?![0-9a-fA-F])")
+STANDALONE_OBJECT = re.compile(r"(?<![0-9a-fA-F])[0-9a-fA-F]{40}(?![0-9a-fA-F])")
 NESTED_GIT_C = re.compile(r"""\bgit\s+-C\s+("[^"\n]+"|'[^'\n]+'|[^\s`'";,|&()<>]+)""")
 MAX_NESTED_REPOS = 8
 
@@ -326,16 +337,40 @@ def line_slice(content: str, start: int, end: int) -> str:
     return content[line_start : len(content) if line_end < 0 else line_end]
 
 
+def mask_backtick_inners(content: str) -> str:
+    """Replace backtick span inners with neutral letters at the same offsets."""
+    chars = list(content)
+    for match in BACKTICK_SPAN.finditer(content):
+        for offset in range(match.start(1), match.end(1)):
+            chars[offset] = "x"
+    return "".join(chars)
+
+
+def never_run_clause_spans(content: str) -> list[tuple[int, int]]:
+    """Return Never run clause spans using boundaries outside backtick inners."""
+    masked = mask_backtick_inners(content)
+    return [(match.start(), match.end()) for match in NEVER_RUN_CLAUSE.finditer(masked)]
+
+
 def non_clause_spans(content: str) -> list[re.Match[str]]:
     """Return inline backtick matches that lie outside every Never run clause."""
-    clauses = list(NEVER_RUN_CLAUSE.finditer(content))
-    return [
-        match
-        for match in BACKTICK_SPAN.finditer(content)
-        if not any(
-            clause.start() <= match.start() and match.end() <= clause.end() for clause in clauses
+    clauses = never_run_clause_spans(content)
+    spans = list(BACKTICK_SPAN.finditer(content))
+    if not clauses:
+        return spans
+    outside: list[re.Match[str]] = []
+    clause_index = 0
+    for match in spans:
+        while clause_index < len(clauses) and clauses[clause_index][1] <= match.start():
+            clause_index += 1
+        inside = (
+            clause_index < len(clauses)
+            and clauses[clause_index][0] <= match.start()
+            and match.end() <= clauses[clause_index][1]
         )
-    ]
+        if not inside:
+            outside.append(match)
+    return outside
 
 
 def conflict_make_without_praetorctl(content: str) -> str:
@@ -349,7 +384,7 @@ def conflict_make_without_praetorctl(content: str) -> str:
         ),
         "",
     )
-    if not praetor_clause or any(FORBIDDEN_MAKE.search(clause) for clause in clauses):
+    if not praetor_clause:
         return ""
     make_span = next(
         (
@@ -399,19 +434,328 @@ def conflict_join_under_column_limit(content: str) -> str:
     return f'"{join_text}" under "{limit_text}": give the exact wrapped form instead of a join'
 
 
-def span_lane_owned_file_operands(span: str) -> bool:
-    """Return whether every slash path operand in a command span lies under .lane/."""
-    stripped = re.sub(r"'[^']*'", " ", span)
-    stripped = re.sub(r'"[^"]*"', " ", stripped)
-    operands = [token for token in stripped.split() if "/" in token and not token.startswith("-")]
-    if not operands:
+def shell_quote_advance(
+    span: str, index: int, in_single: bool, in_double: bool
+) -> tuple[int, bool, bool]:
+    """Advance one index through a shell fragment while tracking quote state."""
+    length = len(span)
+    next_index = index
+    next_single = in_single
+    next_double = in_double
+    if index >= length:
+        return next_index, next_single, next_double
+    char = span[index]
+    if in_single:
+        next_index = index + 1
+        next_single = char != "'"
+    elif in_double:
+        if char == "\\" and index + 1 < length:
+            next_index = index + 2
+        else:
+            next_index = index + 1
+            next_double = char != '"'
+    elif char == "'":
+        next_index = index + 1
+        next_single = True
+    elif char == '"':
+        next_index = index + 1
+        next_double = True
+    return next_index, next_single, next_double
+
+
+def append_shell_piece(pieces: list[str], span: str, start: int, end: int) -> int:
+    """Append span[start:end] to pieces when non-empty and return end."""
+    piece = span[start:end].strip()
+    if piece:
+        pieces.append(piece)
+    return end
+
+
+def split_span_fragments(span: str, separator: str) -> list[str]:
+    """Split a shell fragment on separator characters outside single and double quotes."""
+    pieces: list[str] = []
+    start = 0
+    index = 0
+    in_single = False
+    in_double = False
+    length = len(span)
+    for _ in range(length + 1):
+        if index >= length:
+            break
+        quoted, in_single, in_double = shell_quote_advance(span, index, in_single, in_double)
+        if quoted != index:
+            index = quoted
+            continue
+        if span[index] == separator:
+            start = append_shell_piece(pieces, span, start, index) + 1
+        index += 1
+    append_shell_piece(pieces, span, start, length)
+    return pieces
+
+
+def shell_command_boundary(span: str, index: int) -> tuple[str, int]:
+    """Return a shell boundary token and its length when unquoted."""
+    pair = span[index : index + 2]
+    if pair in ("||", "&&"):
+        return pair, 2
+    if span[index] in ";&":
+        return span[index], 1
+    return "", 0
+
+
+def span_command_groups(span: str) -> list[list[str]]:
+    """Split a backtick span into pipeline command strings grouped by shell boundaries."""
+    groups: list[list[str]] = []
+    start = 0
+    index = 0
+    in_single = False
+    in_double = False
+    length = len(span)
+    for _ in range(length + 1):
+        if index >= length:
+            break
+        quoted, in_single, in_double = shell_quote_advance(span, index, in_single, in_double)
+        if quoted != index:
+            index = quoted
+            continue
+        boundary, width = shell_command_boundary(span, index)
+        if not boundary:
+            index += 1
+            continue
+        piece = span[start:index].strip()
+        if piece:
+            groups.append(split_span_fragments(piece, "|"))
+        start = index + width
+        index = start
+    tail = span[start:].strip()
+    if tail:
+        groups.append(split_span_fragments(tail, "|"))
+    return groups
+
+
+def words_of_command(command: str) -> list[str] | None:
+    """Return POSIX shell words for command or None when quoting is unclosed."""
+    try:
+        return shlex.split(command, posix=True)
+    except ValueError:
+        return None
+
+
+def length_tool_index(words: list[str]) -> int | None:
+    """Return the index of the first whole-file length program word."""
+    for index, token in enumerate(words):
+        if Path(token).name in LENGTH_TOOL_NAMES:
+            return index
+    return None
+
+
+def wc_is_length_check(words: list[str], tool_index: int) -> bool:
+    """Return whether wc options request a max-line-length check."""
+    for token in words[tool_index + 1 :]:
+        if token == "--":
+            break
+        if token == "--max-line-length":
+            return True
+        if token.startswith("-") and not token.startswith("--") and "L" in token[1:]:
+            return True
+    return False
+
+
+def strip_awk_double_quotes(program: str) -> str:
+    """Remove double-quoted awk string literals while honoring backslash escapes."""
+    kept: list[str] = []
+    index = 0
+    length = len(program)
+    while index < length:
+        if program[index] != '"':
+            kept.append(program[index])
+            index += 1
+            continue
+        index += 1
+        while index < length:
+            if program[index] == "\\" and index + 1 < length:
+                index += 2
+                continue
+            if program[index] == '"':
+                index += 1
+                break
+            index += 1
+    return "".join(kept)
+
+
+def awk_program_token(words: list[str], tool_index: int) -> tuple[str | None, bool]:
+    """Return the inline awk program token and whether -f is present."""
+    uses_file = False
+    index = tool_index + 1
+    limit = len(words)
+    while index < limit:
+        token = words[index]
+        if token == "--":
+            break
+        if token in ("-f", "--file"):
+            uses_file = True
+            index += 2
+            continue
+        if token in ("-F", "-v"):
+            index += 2
+            continue
+        if token.startswith("-"):
+            index += 1
+            continue
+        return token, uses_file
+    return None, uses_file
+
+
+def awk_is_length_check(words: list[str], tool_index: int) -> bool:
+    """Return whether an awk invocation measures whole-line length."""
+    program, uses_file = awk_program_token(words, tool_index)
+    if uses_file:
+        return any(AWK_LENGTH_PROGRAM.search(token) for token in words)
+    if program is None:
         return False
-    for token in operands:
-        if ".." in token.split("/"):
-            return False
-        if not (token.startswith(".lane/") or "/.lane/" in token):
-            return False
-    return True
+    return bool(AWK_LENGTH_PROGRAM.search(strip_awk_double_quotes(program)))
+
+
+def grep_is_length_check(words: list[str]) -> bool:
+    """Return whether grep or rg uses a counted-dot column-width pattern."""
+    return any(GREP_COUNTED_DOT.search(token) for token in words)
+
+
+def command_is_length_check(words: list[str]) -> bool:
+    """Return whether a parsed shell command performs a whole-file length check."""
+    tool_index = length_tool_index(words)
+    if tool_index is None:
+        return False
+    tool = Path(words[tool_index]).name
+    if tool == "wc":
+        return wc_is_length_check(words, tool_index)
+    if tool in ("awk", "gawk", "mawk", "nawk"):
+        return awk_is_length_check(words, tool_index)
+    return grep_is_length_check(words)
+
+
+def operand_is_lane_owned(operand: str) -> bool:
+    """Return whether a file operand names a path under the worktree .lane/ tree."""
+    if operand == "\x00xargs_stdin":
+        return False
+    parts = operand.split("/")
+    if ".." in parts:
+        return False
+    if operand.startswith(".lane/") or operand.startswith("./.lane/"):
+        return True
+    return operand.startswith("/") and "/.lane/" in operand
+
+
+LENGTH_OPTION_FLAGS = frozenset(
+    {
+        "-e",
+        "-f",
+        "--regexp",
+        "--file",
+        "-F",
+        "-v",
+        "-m",
+        "-A",
+        "-B",
+        "-C",
+        "-g",
+        "-t",
+        "-T",
+        "-M",
+    }
+)
+
+
+def length_redirect_advance(words: list[str], index: int, limit: int) -> tuple[list[str], int]:
+    """Collect stdin operands and skip output redirects starting at index."""
+    found: list[str] = []
+    token = words[index]
+    if token == "<" and index + 1 < limit:
+        found.append(words[index + 1])
+        return found, index + 2
+    if token in {">", ">>", ">&", "2>", "2>>", "2>&1", ">|"}:
+        target = index + 1
+        if token in {">", ">>", ">|"} and target < limit and not words[target].startswith("-"):
+            return found, target + 1
+        return found, index + 1
+    if re.fullmatch(r"\d+", token) and index + 2 < limit and words[index + 1] == "<":
+        found.append(words[index + 2])
+        return found, index + 3
+    if re.fullmatch(r"\d+", token) and index + 1 < limit and words[index + 1] in {">", ">>"}:
+        return found, index + 3
+    return found, index
+
+
+def command_file_operands(words: list[str]) -> list[str]:
+    """Collect file operands for a parsed whole-file length command."""
+    tool_index = length_tool_index(words)
+    if tool_index is None:
+        return []
+    operands: list[str] = []
+    if any(Path(token).name == "xargs" for token in words[:tool_index]):
+        operands.append("\x00xargs_stdin")
+    index = tool_index + 1
+    tool = Path(words[tool_index]).name
+    awk_tool = tool in ("awk", "gawk", "mawk", "nawk")
+    grep_tool = tool in ("grep", "egrep", "fgrep", "rg")
+    program_seen = False
+    pattern_seen = False
+    limit = len(words)
+    while index < limit:
+        token = words[index]
+        if token == "--":
+            operands.extend(words[index + 1 :])
+            break
+        extra, advanced = length_redirect_advance(words, index, limit)
+        if advanced != index:
+            operands.extend(extra)
+            index = advanced
+            continue
+        if token.startswith("-") and (token in LENGTH_OPTION_FLAGS and index + 1 < limit):
+            index += 2
+            continue
+        if token.startswith("-"):
+            index += 1
+            continue
+        if awk_tool and not program_seen:
+            program_seen = True
+            index += 1
+            continue
+        if grep_tool and not pattern_seen:
+            pattern_seen = True
+            index += 1
+            continue
+        operands.append(token)
+        index += 1
+    return operands
+
+
+def length_command_allowed(words: list[str], pipeline: list[list[str]], command_index: int) -> bool:
+    """Return whether a length command may read outside a git diff."""
+    operands = command_file_operands(words)
+    if operands and all(operand_is_lane_owned(operand) for operand in operands):
+        return True
+    if operands or command_index == 0:
+        return False
+    first_text = " ".join(pipeline[0])
+    return bool(GIT_DIFF_COMMAND.search(first_text))
+
+
+def span_whole_file_length_refused(span: str) -> bool:
+    """Return whether any parsed length command in the span must be refused."""
+    for pipeline in span_command_groups(span):
+        parsed: list[list[str]] = []
+        for command in pipeline:
+            words = words_of_command(command)
+            if words is None:
+                return bool(WHOLE_FILE_LENGTH.search(span))
+            parsed.append(words)
+        for command_index, words in enumerate(parsed):
+            if command_is_length_check(words) and not length_command_allowed(
+                words, parsed, command_index
+            ):
+                return True
+    return False
 
 
 def conflict_whole_file_length_check(content: str) -> str:
@@ -420,9 +764,7 @@ def conflict_whole_file_length_check(content: str) -> str:
         if "host ran" in line_slice(content, match.start(), match.end()).lower():
             continue
         span = match.group(1)
-        if WHOLE_FILE_LENGTH.search(span) and not GIT_DIFF_COMMAND.search(span):
-            if span_lane_owned_file_operands(span):
-                continue
+        if span_whole_file_length_refused(span):
             span_text = " ".join(span.split())
             return f"`{span_text}`: check only added lines of a git diff"
     return ""
@@ -430,14 +772,13 @@ def conflict_whole_file_length_check(content: str) -> str:
 
 def standalone_object_names(content: str) -> list[str]:
     """Collect unique standalone 40-hex names outside URL tokens in content order."""
-    return list(
-        dict.fromkeys(
-            name
-            for token in content.split()
-            if "://" not in token
-            for name in STANDALONE_OBJECT.findall(token)
-        )
-    )
+    seen: dict[str, None] = {}
+    for token in content.split():
+        if "://" in token:
+            continue
+        for name in STANDALONE_OBJECT.findall(token):
+            seen.setdefault(name.lower(), None)
+    return list(seen)
 
 
 def probe_repository_root(directory: Path) -> tuple[Path | None, str]:
@@ -455,9 +796,19 @@ def probe_repository_root(directory: Path) -> tuple[Path | None, str]:
 
 def valid_nested_root(path: Path, worktree_root: Path) -> bool:
     """Return whether path is a repository root strictly inside worktree_root."""
+    lane_isolation = importlib.import_module("scripts.lane_isolation")
     if path == worktree_root or not path.is_relative_to(worktree_root):
         return False
-    return probe_repository_root(path)[0] is not None
+    if not path.is_dir():
+        return False
+    root, error = probe_repository_root(path)
+    if root is not None:
+        return True
+    if error.endswith(": not its own repository root"):
+        return False
+    if error:
+        raise lane_isolation.IsolationError(error)
+    return False
 
 
 def nested_repositories(content: str, worktree_root: Path) -> list[Path]:

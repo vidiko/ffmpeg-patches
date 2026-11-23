@@ -662,6 +662,7 @@ class LaneBriefTest(unittest.TestCase):
     def test_conflict_case_4b_passes(self) -> None:
         """Pass case 4b naming the full 40-hex commit held by the worktree."""
         worktree, commit = self.commit_fixture()
+        self.assertEqual(len(commit.strip()), 40)
         rc, error = self.check_snippet(f"HEAD {commit} (origin/main)\n", worktree=worktree)
         self.assertEqual(rc, 0, error)
 
@@ -675,6 +676,7 @@ class LaneBriefTest(unittest.TestCase):
     def test_conflict_case_4d_passes(self) -> None:
         """Pass case 4d containing a 41-hex run rather than a standalone 40-hex name."""
         worktree, commit = self.commit_fixture()
+        self.assertEqual(len(commit.strip()), 40)
         rc, error = self.check_snippet(f"HEAD {commit}0 (origin/main)\n", worktree=worktree)
         self.assertEqual(rc, 0, error)
 
@@ -982,6 +984,212 @@ class LaneBriefTest(unittest.TestCase):
             )
         self.assertEqual(rc, 2, error)
         self.assertIn("nested broken", error)
+
+    def test_round3_k1_never_run_span_semicolon_passes(self) -> None:
+        """Pass K1 when a Never run clause holds a semicolon inside its backtick span."""
+        rc, error = self.check_snippet("Never run `wc -L scripts/a.py; echo done`.\n")
+        self.assertEqual(rc, 0, error)
+        rc, error = self.check_snippet("- run `wc -L scripts/a.py`\n")
+        self.assertEqual(rc, 1, error)
+        self.assertIn("conflict:", error)
+
+    def test_round3_k2_awk_string_literal_passes(self) -> None:
+        """Pass K2 when awk prints a literal length string on a repository file."""
+        rc, error = self.check_snippet("- `awk '{print \"length\"}' scripts/a.py`\n")
+        self.assertEqual(rc, 0, error)
+        for snippet in (
+            "- `awk 'length > 72' scripts/a.py`\n",
+            "- `awk 'length($0) > 72' scripts/a.py`\n",
+        ):
+            with self.subTest(snippet=snippet):
+                rc, error = self.check_snippet(snippet)
+                self.assertEqual(rc, 1, error)
+                self.assertIn("conflict:", error)
+
+    def test_round3_k3_wc_l_after_other_option_refused(self) -> None:
+        """Refuse K3 when wc lists -L after another option on a repository file."""
+        rc, error = self.check_snippet("- `wc -l -L scripts/a.py`\n")
+        self.assertEqual(rc, 1, error)
+        self.assertIn("conflict:", error)
+        rc, error = self.check_snippet("- `wc -l scripts/a.py`\n")
+        self.assertEqual(rc, 0, error)
+
+    def test_round3_k4_uppercase_object_names_normalized(self) -> None:
+        """Normalize K4 standalone 40-hex names from either hex case."""
+        upper = "F" * 40
+        lower = "f" * 40
+        self.assertEqual(lane_brief.standalone_object_names(f"HEAD {upper}\n"), [lower])
+        self.assertEqual(lane_brief.standalone_object_names(f"HEAD {lower}\n"), [lower])
+        mixed = "aAbBcCdDeEfF0123456789aAbBcCdDeEfF012345"
+        self.assertEqual(len(mixed), 40)
+        self.assertEqual(
+            lane_brief.standalone_object_names(f"HEAD {mixed}\n"),
+            [mixed.lower()],
+        )
+        self.assertEqual(lane_brief.standalone_object_names("HEAD " + upper + "0\n"), [])
+        self.assertEqual(lane_brief.standalone_object_names("HEAD " + ("F" * 64) + "\n"), [])
+
+    def test_round3_k4_upper_lower_deduped(self) -> None:
+        """Deduplicate K4 names after lowering mixed-case duplicates."""
+        name = "a" * 40
+        text = f"HEAD {name.upper()} then {name}\n"
+        self.assertEqual(lane_brief.standalone_object_names(text), [name])
+
+    def test_round3_k5_non_clause_spans_matches_bruteforce(self) -> None:
+        """Match K5 non_clause_spans against a brute-force clause scan."""
+        samples = (
+            "Never run `make`;\n`outer`\n",
+            "Never run `a` and `b`;\n`between`\n",
+            "Never run x;\nNever run y;\n`tail`\n",
+            "line one\nNever run `inner;\n` semicolon`.\n`after`\n",
+        )
+        for text in samples:
+            with self.subTest(text=text):
+                brute = [
+                    match
+                    for match in lane_brief.BACKTICK_SPAN.finditer(text)
+                    if not any(
+                        clause.start() <= match.start() and match.end() <= clause.end()
+                        for clause in lane_brief.NEVER_RUN_CLAUSE.finditer(
+                            lane_brief.mask_backtick_inners(text)
+                        )
+                    )
+                ]
+                self.assertEqual(
+                    [match.span() for match in lane_brief.non_clause_spans(text)],
+                    [match.span() for match in brute],
+                )
+
+    def test_round3_k5_non_clause_spans_large_brief_under_two_seconds(self) -> None:
+        """Finish K5 non_clause_spans within two seconds on ten thousand clause pairs."""
+        count = 10_000
+        text = "Never run x;\n" * count + "`a`\n" * count
+        started = time.monotonic()
+        outside = lane_brief.non_clause_spans(text)
+        elapsed = time.monotonic() - started
+        self.assertEqual(len(outside), count)
+        self.assertLess(elapsed, 2.0)
+
+    def test_round3_k6_make_span_with_make_ban_refused(self) -> None:
+        """Refuse K6 when a make span appears while Never run also forbids make."""
+        rc, error = self.check_snippet("Never run make or praetorctl.\n- `make fate-x`\n")
+        self.assertEqual(rc, 1, error)
+        self.assertIn("conflict:", error)
+        rc, error = self.check_snippet("Never run praetorctl.\n- `make fate-x`\n")
+        self.assertEqual(rc, 1, error)
+
+    def test_round3_k7_contrast_clause_limits_join_negation(self) -> None:
+        """Refuse K7 join requests after a contrast clause under a column limit."""
+        snippet = (
+            "Keep lines at most 72 columns.\n"
+            "Do not touch the header, but join the call onto one line.\n"
+        )
+        rc, error = self.check_snippet(snippet)
+        self.assertEqual(rc, 1, error)
+        self.assertIn("conflict:", error)
+        rc, error = self.check_snippet(
+            "Keep lines at most 72 columns.\nDo not join the call onto one line.\n"
+        )
+        self.assertEqual(rc, 0, error)
+        rc, error = self.check_snippet(
+            "Keep lines at most 72 columns.\nJoin the call onto one line.\n"
+        )
+        self.assertEqual(rc, 1, error)
+
+    def test_round3_k8_quoted_operands_lane_check(self) -> None:
+        """Apply K8 lane-owned checks to quoted file operands."""
+        rc, error = self.check_snippet('- `wc -L ".lane/tmp/message draft.txt"`\n')
+        self.assertEqual(rc, 0, error)
+        rc, error = self.check_snippet('- `wc -L .lane/tmp/draft.txt "scripts/lane_brief.py"`\n')
+        self.assertEqual(rc, 1, error)
+        self.assertIn("conflict:", error)
+        rc, error = self.check_snippet("- `wc -L .lane/tmp/draft.txt`\n")
+        self.assertEqual(rc, 0, error)
+
+    def test_round3_k9_bare_makefile_operand_refused(self) -> None:
+        """Refuse K9 when wc -L reads a bare repository filename with a lane path."""
+        rc, error = self.check_snippet("- `wc -L .lane/tmp/draft.txt Makefile`\n")
+        self.assertEqual(rc, 1, error)
+        self.assertIn("conflict:", error)
+
+    def test_round3_k10_relative_lane_segment_refused(self) -> None:
+        """Refuse K10 repository-relative paths that only embed a /.lane/ segment."""
+        rc, error = self.check_snippet("- `wc -L tests/.lane/golden.txt`\n")
+        self.assertEqual(rc, 1, error)
+        self.assertIn("conflict:", error)
+        rc, error = self.check_snippet("- `wc -L /w/x/.lane/tmp/d.txt`\n")
+        self.assertEqual(rc, 0, error)
+
+    def test_round3_k11_diff_exemption_needs_stdin_chain(self) -> None:
+        """Refuse K11 when a piped wc reads an explicit repository file operand."""
+        rc, error = self.check_snippet("- `git diff -- scripts/a.py | wc -L scripts/a.py`\n")
+        self.assertEqual(rc, 1, error)
+        self.assertIn("conflict:", error)
+        rc, error = self.check_snippet(
+            "- `git diff -U0 -- scripts/a.py | grep '^+' | awk 'length > 72'`\n"
+        )
+        self.assertEqual(rc, 0, error)
+
+    def test_round3_k12_broken_nested_git_exits_two(self) -> None:
+        """Exit 2 for K12 when a nested checkout gitdir cannot be resolved."""
+        worktree, commit = self.commit_fixture()
+        broken = worktree / "sub"
+        broken.mkdir()
+        (broken / ".git").write_text("gitdir: /nonexistent/x\n", encoding="utf-8")
+        missing = "1" * 40
+        rc, error = self.check_snippet(f"`git -C sub log -1`\nHEAD {missing}\n", worktree=worktree)
+        self.assertEqual(rc, 2, error)
+        plain = worktree / "plain"
+        plain.mkdir()
+        self.assertFalse(lane_brief.valid_nested_root(plain, worktree.resolve()))
+        self.assertFalse(lane_brief.valid_nested_root(worktree / "missing", worktree.resolve()))
+
+    def test_round3_k13_fixture_head_stays_sha1(self) -> None:
+        """Keep K13 fixture HEAD at 40 hex even when GIT_DEFAULT_HASH is sha256."""
+        with patch.dict(os.environ, {"GIT_DEFAULT_HASH": "sha256"}, clear=False):
+            worktree, commit = self.commit_fixture()
+        self.assertEqual(len(commit.strip()), 40)
+        self.assertEqual(lane_brief.standalone_object_names(f"HEAD {commit}\n"), [commit.strip()])
+
+    def test_round3_g2_grep_context_operand_refused(self) -> None:
+        """Refuse grep counted-dot patterns with a repository operand after -A."""
+        rc, error = self.check_snippet(r"- `grep -A 2 '.\{101\}' scripts/a.py`\n")
+        self.assertEqual(rc, 1, error)
+        self.assertIn("conflict:", error)
+
+    def test_round3_g2_wc_input_redirect_refused(self) -> None:
+        """Refuse wc -L when input is redirected from a repository file."""
+        rc, error = self.check_snippet("- `wc -L < scripts/a.py`\n")
+        self.assertEqual(rc, 1, error)
+        self.assertIn("conflict:", error)
+
+    def test_round3_g2_semicolon_second_command_refused(self) -> None:
+        """Refuse a span whose second semicolon-separated command runs wc -L."""
+        rc, error = self.check_snippet("- `git diff --stat; wc -L scripts/a.py`\n")
+        self.assertEqual(rc, 1, error)
+        self.assertIn("conflict:", error)
+
+    def test_round3_g2_xargs_wc_refused(self) -> None:
+        """Refuse xargs wc -L when file names would come from git diff."""
+        rc, error = self.check_snippet("- `git diff --name-only | xargs wc -L`\n")
+        self.assertEqual(rc, 1, error)
+        self.assertIn("conflict:", error)
+
+    def test_round3_g2_unclosed_quote_wc_refused(self) -> None:
+        """Refuse an unclosed quote span that still names wc -L."""
+        rc, error = self.check_snippet('- `wc -L "scripts/a.py`\n')
+        self.assertEqual(rc, 1, error)
+        self.assertIn("conflict:", error)
+
+    def test_round3_g2_wc_redirect_lane_passes(self) -> None:
+        """Pass wc -L on a lane file when output is redirected after a descriptor."""
+        rc, error = self.check_snippet("- `wc -L .lane/tmp/a.txt > /dev/null 2>&1`\n")
+        self.assertEqual(rc, 0, error)
+
+    def test_round3_g2_awk_f_lane_operand_passes(self) -> None:
+        """Pass awk length with -F colon and a lane-owned file operand."""
+        rc, error = self.check_snippet("- `awk -F: 'length > 72' .lane/evidence/x/msg.txt`\n")
+        self.assertEqual(rc, 0, error)
 
     def test_conflict_alternate_forms_refused(self) -> None:
         """Refuse alternate column-limit, one-line join, and ERE grep length forms."""

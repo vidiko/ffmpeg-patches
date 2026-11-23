@@ -63,6 +63,141 @@ class RevertProofScratchTest(RevertProofFixture):
                 measure.assert_not_called()
                 run_git(self.tree, "config", f"filter.counter.{kind}", "", preserve_config=True)
 
+    def test_clean_filter_on_fix_path_refuses_before_measurement(self) -> None:
+        """A clean-only driver on a fix path refuses before either measurement."""
+        source = "libavfilter/vf_x.c"
+        self.write(".gitattributes", f"{source} filter=cleanonly\n")
+        fix = self.make_fix()
+        run_git(self.tree, "config", "filter.cleanonly.clean", "cat", preserve_config=True)
+        with unittest.mock.patch.object(revert_proof, "measure_scratch", return_value=0) as run:
+            rc, _, error = self.run_cli(fix, [sys.executable, "-c", "pass"], expect_scratch=False)
+        self.assertEqual(rc, 2, error)
+        self.assertIn(source, error)
+        self.assertIn("'cleanonly' (clean)", error)
+        self.assertFalse(self.record_path.exists())
+        run.assert_not_called()
+
+    def test_clean_filter_outside_fix_paths_publishes_record(self) -> None:
+        """A clean-only driver on an unrelated HEAD path allows both measurements."""
+        self.write(".gitattributes", "fixture.txt filter=cleanonly\n")
+        self.write("fixture.txt", "fixture bytes\n")
+        fix = self.make_fix()
+        run_git(self.tree, "config", "filter.cleanonly.clean", "cat", preserve_config=True)
+        rc, _, error = self.run_cli(fix, [sys.executable, "-c", "pass"])
+        self.assertEqual(rc, 0, error)
+        self.assertTrue(self.record_path.is_file())
+
+    def test_filter_preflight_uses_legacy_config_lookup(self) -> None:
+        """Filter preflight uses the Git config form available before Git 2.46."""
+        self.write(".gitattributes", "libavfilter/vf_x.c filter=counter\n")
+        head = self.make_fix()
+        with unittest.mock.patch.object(upstream_lint, "_run", wraps=upstream_lint._run) as run:
+            revert_proof._check_head_checkout_filters(self.tree, head)
+        lookups = [call.args[0][2:] for call in run.call_args_list if "config" in call.args[0]]
+        self.assertIn(["config", "--get", "--default=", "filter.counter.smudge"], lookups)
+        self.assertTrue(all(argv[:3] == ["config", "--get", "--default="] for argv in lookups))
+
+    def _enable_scratch_only_smudge(self) -> None:
+        """Keep a pass-through driver configured solely for the scratch worktrees."""
+        run_git(self.tree, "config", "extensions.worktreeConfig", "true", preserve_config=True)
+        run_git(self.tree, "config", "filter.counter.smudge", "cat", preserve_config=True)
+        caller_override = self.root / "caller-only.config"
+        caller_override.write_text('[filter "counter"]\n    smudge =\n', encoding="utf-8")
+        run_git(
+            self.tree,
+            "config",
+            "--worktree",
+            f"includeIf.gitdir:{self.tree / '.git'}.path",
+            str(caller_override),
+            preserve_config=True,
+        )
+        self.assertEqual(
+            run_git(self.tree, "config", "--get", "filter.counter.smudge", preserve_config=True), ""
+        )
+
+    def test_scratch_checks_source_deleted_from_head(self) -> None:
+        """Scratch config determines whether HEAD attributes reject a restored source path."""
+        source = "libavfilter/vf_del.c"
+        self.write(source, BASE_SOURCE)
+        self.commit("avfilter: add source fixture")
+        (self.tree / source).unlink()
+        fix = self.make_fix()
+        self.write(".gitattributes", f"{source} filter=counter\n")
+        self.commit("attributes: assign driver to deleted source")
+        self._enable_scratch_only_smudge()
+        with (
+            unittest.mock.patch.object(revert_proof, "git_out", wraps=revert_proof.git_out) as git,
+            unittest.mock.patch.object(revert_proof, "measure_reverted", return_value=0) as apply,
+        ):
+            rc, _, error = self.run_cli(fix, [sys.executable, "-c", "pass"])
+        self.assertEqual(rc, 2, error)
+        self.assertIn(source, error)
+        self.assertIn("'counter' (smudge)", error)
+        self.assertFalse(self.record_path.exists())
+        self.assertEqual(sum("reset" in call.args for call in git.call_args_list), 1)
+        apply.assert_not_called()
+
+    def _attribute_override(self, path: str) -> tuple[str, str, str]:
+        """Create separate attribute-override and measurement commits."""
+        self.write(".gitattributes", f"{path} filter=counter\n")
+        override = self.commit("attributes: assign fixture driver")
+        self.write(".gitattributes", "\n")
+        fix = self.make_fix()
+        self.write("fixture-head.txt", "head-only fixture\n")
+        head = self.commit("fixture: advance measurement head")
+        return override, fix, head
+
+    def test_scratch_reset_pins_head_attributes(self) -> None:
+        """Both scratch resets pin HEAD when the caller selects a different attribute tree."""
+        self.write("fixture.txt", "fixture bytes\n")
+        override, fix, head = self._attribute_override("fixture.txt")
+        for source in ("GIT_ATTR_SOURCE", "attr.tree"):
+            with self.subTest(source=source):
+                self._assert_reset_attribute_source(source, override, fix, head)
+
+    def _assert_reset_attribute_source(
+        self, source: str, override: str, fix: str, head: str
+    ) -> None:
+        """Check every reset and retain the caller command under either attribute override."""
+        environment = {"GIT_ATTR_SOURCE": override} if source == "GIT_ATTR_SOURCE" else {}
+        command = [sys.executable, "-c", "pass"]
+        if source == "attr.tree":
+            run_git(self.tree, "config", "attr.tree", override, preserve_config=True)
+        else:
+            command[-1] = f"import os; assert os.environ['GIT_ATTR_SOURCE'] == {override!r}"
+        with (
+            unittest.mock.patch.dict(os.environ, environment),
+            unittest.mock.patch.object(
+                upstream_lint.subprocess, "Popen", wraps=upstream_lint.subprocess.Popen
+            ) as process,
+        ):
+            rc, _, error = self.run_cli(fix, command)
+        self.assertEqual(rc, 0, error)
+        record = json.loads(self.record_path.read_text(encoding="utf-8"))
+        self.assertEqual(record["command"], command)
+        resets = [call.args[0] for call in process.call_args_list if "--hard" in call.args[0]]
+        self.assertEqual(len(resets), 2)
+        for argv in resets[:2]:
+            self.assertIn(f"--attr-source={head}", argv[: argv.index("reset")])
+
+    def test_reverse_apply_pins_head_attributes(self) -> None:
+        """Reverse apply pins HEAD before reading the modified source preimage."""
+        override, fix, head = self._attribute_override("libavfilter/vf_x.c")
+        with (
+            unittest.mock.patch.dict(os.environ, {"GIT_ATTR_SOURCE": override}),
+            unittest.mock.patch.object(
+                upstream_lint.subprocess, "Popen", wraps=upstream_lint.subprocess.Popen
+            ) as process,
+        ):
+            rc, _, error = self.run_cli(fix, ["git", "diff", "--cached", "--exit-code"])
+        self.assertEqual(rc, 0, error)
+        record = json.loads(self.record_path.read_text(encoding="utf-8"))
+        self.assertEqual(record["rc_reverted"], 0)
+        applies = [call.args[0] for call in process.call_args_list if "-R" in call.args[0]]
+        self.assertEqual(len(applies), 1)
+        argv = applies[0]
+        self.assertIn(f"--attr-source={head}", argv[: argv.index("apply")])
+
     def test_hidden_attribute_edit_cannot_hide_head_filter(self) -> None:
         """An ignored working-tree attribute edit cannot hide an active HEAD checkout filter."""
         self.write(".gitattributes", "fixture.txt filter=counter\n")
@@ -243,22 +378,40 @@ class RevertProofScratchTest(RevertProofFixture):
         self.assertTrue(self.record_path.is_file())
 
     def test_scratch_checkout_runs_filter_preflight_before_reset(self) -> None:
-        """The scratch checkout repeats the filter preflight after worktree registration."""
+        """An active scratch-only driver refuses before the hard reset is dispatched."""
+        self.write(".gitattributes", "fixture.txt filter=counter\n")
+        self.write("fixture.txt", "fixture bytes\n")
         fix = self.make_fix()
-        scratch_roots: list[Path] = []
-        real_check = revert_proof._check_head_checkout_filters
+        self._enable_scratch_only_smudge()
+        real_out = revert_proof.git_out
 
-        def capture_check(tree: Path, head: str) -> set[str]:
-            if tree != self.tree:
-                scratch_roots.append(tree)
-            return real_check(tree, head)
+        def refuse_reset(tree: Path, *args: str) -> str:
+            """Trip if a refused scratch checkout attempts Git reset."""
+            self.assertNotIn("reset", args, "scratch reset ran before filter refusal")
+            return real_out(tree, *args)
 
+        with unittest.mock.patch.object(revert_proof, "git_out", side_effect=refuse_reset):
+            rc, _, error = self.run_cli(fix, [sys.executable, "-c", "pass"])
+        self.assertEqual(rc, 2, error)
+        self.assertIn("'counter' (smudge)", error)
+        self.assertFalse(self.record_path.exists())
+
+    def test_filter_free_scratch_preflights_both_measurements(self) -> None:
+        """Filter-free scratch runs each perform preflight and publish both measurements."""
+        fix = self.make_fix()
         with unittest.mock.patch.object(
-            revert_proof, "_check_head_checkout_filters", side_effect=capture_check
-        ):
+            revert_proof,
+            "_check_head_checkout_filters",
+            wraps=revert_proof._check_head_checkout_filters,
+        ) as preflight:
             rc, _, error = self.run_cli(fix, [sys.executable, "-c", "pass"])
         self.assertEqual(rc, 0, error)
+        scratch_roots = [
+            call.args[0] for call in preflight.call_args_list if call.args[0] != self.tree
+        ]
         self.assertEqual(len(scratch_roots), 2)
+        record = json.loads(self.record_path.read_text(encoding="utf-8"))
+        self.assertEqual((record["rc_head"], record["rc_reverted"]), (0, 0))
 
     def test_record_missing_at_requested_path_refuses_success(self) -> None:
         """Publication fails when the record is not left at the requested path."""
@@ -348,21 +501,33 @@ class RevertProofScratchTest(RevertProofFixture):
         sentinel = second / "record.json"
         sentinel.write_bytes(b"sentinel")
         self.record_path = parent / "record.json"
+        self.record_path.write_bytes(b"old record")
+        held = self.root / "held"
         real_check = revert_proof._check_record_location
+        record_checks = 0
 
-        def swap_after_check(config, path):
-            """Replace the requested parent immediately after its path location check."""
+        def swap_after_check(config: revert_proof.ProofConfig, path: Path) -> None:
+            """Swap the directory during the record check inside clear_record."""
+            nonlocal record_checks
             real_check(config, path)
-            if path == self.record_path and not parent.is_symlink():
-                parent.rename(self.root / "held")
-                parent.symlink_to(second, target_is_directory=True)
+            if path == self.record_path:
+                record_checks += 1
+                if record_checks == 2:
+                    parent.rename(held)
+                    second.rename(parent)
 
-        with unittest.mock.patch.object(
-            revert_proof, "_check_record_location", side_effect=swap_after_check
+        with (
+            unittest.mock.patch.object(
+                revert_proof, "_check_record_location", side_effect=swap_after_check
+            ),
+            unittest.mock.patch.object(revert_proof, "measure_scratch", return_value=0),
         ):
-            rc, _, _ = self.run_cli(fix, [sys.executable, "-c", "pass"], expect_scratch=False)
-        self.assertEqual(rc, 2)
-        self.assertEqual(sentinel.read_bytes(), b"sentinel")
+            rc, _, error = self.run_cli(fix, [sys.executable, "-c", "pass"], expect_scratch=False)
+        self.assertEqual(rc, 2, error)
+        self.assertIn("record directory changed", error)
+        self.assertTrue(held.is_dir())
+        self.assertFalse((held / self.record_path.name).exists())
+        self.assertEqual(self.record_path.read_bytes(), b"sentinel")
 
     def test_record_parent_swap_cannot_write_inside_caller(self) -> None:
         """Swapping the pinned parent to a caller symlink refuses publication with exit two."""

@@ -227,6 +227,7 @@ import time
 from collections.abc import Callable, Mapping
 from contextvars import ContextVar
 from dataclasses import dataclass, field
+from itertools import islice
 from pathlib import Path, PurePosixPath
 
 # Ensure repository root is on sys.path for test/tool imports
@@ -252,10 +253,14 @@ GIT_ENVIRONMENT_NAMES = (
     "GIT_CONFIG_SYSTEM",
     "GIT_DIR",
     "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+    "GIT_GLOB_PATHSPECS",
     "GIT_GRAFT_FILE",
+    "GIT_ICASE_PATHSPECS",
     "GIT_IMPLICIT_WORK_TREE",
     "GIT_INDEX_FILE",
+    "GIT_LITERAL_PATHSPECS",
     "GIT_NAMESPACE",
+    "GIT_NOGLOB_PATHSPECS",
     "GIT_NO_REPLACE_OBJECTS",
     "GIT_OBJECT_DIRECTORY",
     "GIT_PREFIX",
@@ -292,6 +297,7 @@ MAX_ENV_ENTRIES = 16384
 MAX_JSON_KEYS = 2000
 MAX_COMMAND_ARGS = 2000
 MAX_DIAGNOSTIC_KEY = 256
+EXTRA_KEY_SAMPLE_SIZE = 5
 RUN_TIMEOUT = 1800
 C_RULES_TIMEOUT = 300
 DOCSTRINGS_TIMEOUT = 300
@@ -327,6 +333,7 @@ FIX_MESSAGE = re.compile(
 )
 LAVFI_PREFIX = re.compile(r"^(?:vf|af|vsrc|asrc|avf|avsrc|vsink|asink|f)_")
 FUNCTION_NAME = re.compile(r"([A-Za-z_]\w*)\s*\(")
+C_CONTROL_WORDS = frozenset({"if", "while", "for", "switch", "return", "sizeof"})
 WORD = re.compile(r"[A-Za-z0-9_]+")
 SOURCE_SUFFIXES = (".c", ".h", ".asm", ".S")
 DIAGNOSTIC_FLAG = re.compile(r"(?<![\w-])-W[A-Za-z0-9#][A-Za-z0-9#+=_-]*")
@@ -564,15 +571,18 @@ def _run_output(
     return output.decode("utf-8", errors="replace")
 
 
-def _run(
+def _run(  # noqa: PLR0913 - keep the optional Git attribute source explicit.
     argv: list[str],
     cwd: Path,
     data: str | bytes | None = None,
     timeout: float = 60,
     *,
     allow_any_executable: bool = False,
+    git_attr_source: str | None = None,
 ) -> RunResult:
     """Run a bounded isolated tool, keeping successful Git stdout free of stderr."""
+    if git_attr_source is not None:
+        argv = [argv[0], "--no-replace-objects", f"--attr-source={git_attr_source}", *argv[1:]]
     if not allow_any_executable:
         try:
             _validate_executable(argv)
@@ -1575,15 +1585,23 @@ def _patch_files(patch: str) -> list[tuple[str, list[str], list[str]]]:
     return entries
 
 
+def _first_function_name(line: str) -> str | None:
+    """Find the first function-like identifier beyond C control and operator words."""
+    for match in islice(FUNCTION_NAME.finditer(line), MAX_PATHS):
+        if match[1] not in C_CONTROL_WORDS:
+            return match[1]
+    return None
+
+
 def _hunk_functions(hunks: list[str]) -> list[str]:
     """Extract the first function name after the second @@ of each hunk header."""
     found: list[str] = []
     for line in hunks:
         parts = line.split("@@", 2)
         if len(parts) == 3:
-            match = FUNCTION_NAME.search(parts[2])
-            if match:
-                found.append(match[1])
+            name = _first_function_name(parts[2])
+            if name is not None:
+                found.append(name)
     return found
 
 
@@ -1591,9 +1609,9 @@ def _function_names_from_added(added: list[str]) -> list[str]:
     """Collect function names introduced on added source lines."""
     found: list[str] = []
     for line in added[:MAX_PATHS]:
-        match = FUNCTION_NAME.search(line)
-        if match:
-            found.append(match[1])
+        name = _first_function_name(line)
+        if name is not None:
+            found.append(name)
     return found
 
 
@@ -1642,8 +1660,9 @@ class _RevertProofScanLimit(RuntimeError):
     """A bounded history scan exceeded a limit that an explicit proof waiver may cover."""
 
 
-def _commit_paths(tree: Path, commit: str) -> list[str]:
-    """Read stored changed paths and raise a waivable limit before classifying overflow."""
+def _commit_paths(tree: Path, commit: str, *, parent: str | None = None) -> list[str]:
+    """Read bounded changed paths, optionally against an explicit stored parent."""
+    revisions = [parent, commit] if parent is not None else [commit]
     paths = list(
         filter(
             None,
@@ -1657,7 +1676,7 @@ def _commit_paths(tree: Path, commit: str) -> list[str]:
                 "--no-renames",
                 "-r",
                 "-z",
-                commit,
+                *revisions,
             ).split("\0"),
         )
     )
@@ -1668,9 +1687,9 @@ def _commit_paths(tree: Path, commit: str) -> list[str]:
     return paths
 
 
-def _commit_history_error(tree: Path, commit: str, parents: str | None = None) -> str | None:
-    """Reject hidden ancestry and replaced commit content without signature display noise."""
-    raw = _git(
+def _stored_commit(tree: Path, commit: str) -> str:
+    """Read an unreplaced commit and suppress legacy graft advice."""
+    return _git(
         tree,
         "-c",
         "advice.graftFileDeprecated=false",
@@ -1679,7 +1698,35 @@ def _commit_history_error(tree: Path, commit: str, parents: str | None = None) -
         "commit",
         commit,
     )
-    stored = re.findall(r"^parent ([0-9a-f]+)$", raw.partition("\n\n")[0], re.MULTILINE)
+
+
+def _stored_parents(raw: str) -> list[str]:
+    """Read parent IDs from raw commit headers."""
+    return re.findall(r"^parent ([0-9a-f]+)$", raw.partition("\n\n")[0], re.MULTILINE)
+
+
+def _regression_commit_paths(tree: Path, commit: str, parents: str) -> list[str]:
+    """Classify apparent roots against the stored parent when its object is available."""
+    if not parents.strip():
+        stored = _stored_parents(_stored_commit(tree, commit))
+        if stored:
+            parent = stored[0]
+            check = _run(
+                ["git", "--no-replace-objects", "cat-file", "--batch-check=%(objecttype)"],
+                tree,
+                data=f"{parent}\n",
+            )
+            if check.returncode or check.timed_out:
+                raise RuntimeError(f"cannot inspect parent {parent}: {check.stdout.strip()}")
+            if check.stdout == "commit\n":
+                return _commit_paths(tree, commit, parent=parent)
+    return _commit_paths(tree, commit)
+
+
+def _commit_history_error(tree: Path, commit: str, parents: str | None = None) -> str | None:
+    """Reject hidden ancestry and replaced commit content without signature display noise."""
+    raw = _stored_commit(tree, commit)
+    stored = _stored_parents(raw)
     if parents is None:
         parents = _git(
             tree,
@@ -1704,9 +1751,7 @@ def _commit_history_error(tree: Path, commit: str, parents: str | None = None) -
 def _skip_commit_history(
     tree: Path, commit: str, parents: str, message: str, history_errors: list[str] | None
 ) -> bool:
-    """Skip irrelevant non-fixes or collect hidden ancestry before reading source paths."""
-    if history_errors is None and not fix_word(message):
-        return True
+    """Raise for incomplete regression history or collect a revert-proof finding."""
     error = _commit_history_error(tree, commit, parents)
     if error is None:
         return False
@@ -1769,7 +1814,9 @@ def _fix_commits(
         commit, _, rest = record.partition("\n")
         parents, _, message = rest.partition("\n")
         subject = message.partition("\n")[0].rstrip("\r")
-        if _skip_commit_history(tree, commit, parents, message, history_errors):
+        if history_errors is not None and _skip_commit_history(
+            tree, commit, parents, message, history_errors
+        ):
             continue
         if not fix_word(message):
             continue
@@ -1777,10 +1824,17 @@ def _fix_commits(
             if include_merges:
                 fixes.append((commit, subject, frozenset()))
             continue
-        paths = _commit_paths(tree, commit)
-        if any(is_source_path(path) for path in paths[:MAX_PATHS]):
-            patch = _git(tree, *_commit_source_patch_args(commit, root=not parents.strip()))
-            fixes.append((commit, subject, reach_names(paths, patch)))
+        paths = (
+            _regression_commit_paths(tree, commit, parents)
+            if history_errors is None
+            else _commit_paths(tree, commit)
+        )
+        if not any(is_source_path(path) for path in paths[:MAX_PATHS]):
+            continue
+        if history_errors is None:
+            _skip_commit_history(tree, commit, parents, message, None)
+        patch = _git(tree, *_commit_source_patch_args(commit, root=not parents.strip()))
+        fixes.append((commit, subject, reach_names(paths, patch)))
     return fixes
 
 
@@ -1917,7 +1971,8 @@ def _revert_proof_schema_error(payload: dict[str, object]) -> str | None:
         return f"missing key: {', '.join(missing)}"
     extra = sorted(payload.keys() - REVERT_PROOF_KEYS)
     if extra:
-        return f"extra key: {', '.join(_bounded_key_text(key) for key in extra)}"
+        sample = ", ".join(_bounded_key_text(key) for key in extra[:EXTRA_KEY_SAMPLE_SIZE])
+        return f"extra key: {sample} ({len(extra)} total)"
     return _revert_proof_type_error(payload)
 
 

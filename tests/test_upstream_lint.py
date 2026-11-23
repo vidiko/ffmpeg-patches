@@ -470,6 +470,16 @@ class TestReachTest(unittest.TestCase):
         )
         self.assertIn("ff_value", upstream_lint.reach_names(["libavfilter/vf_root.c"], patch))
 
+    def test_control_words_do_not_hide_function_reach_names(self) -> None:
+        """Hunk headings and added lines skip control words before real function names."""
+        for keyword in ("if", "while", "for", "switch", "return", "sizeof"):
+            with self.subTest(keyword=keyword):
+                line = f"{keyword} (ff_value(x))"
+                self.assertEqual(
+                    upstream_lint._hunk_functions([f"@@ -1 +1 @@ {line}"]), ["ff_value"]
+                )
+                self.assertEqual(upstream_lint._function_names_from_added([line]), ["ff_value"])
+
     def test_deleted_source_file_keeps_old_path_and_function(self) -> None:
         """Deleted source diffs retain the --- a/ path for hunk function extraction."""
         patch = (
@@ -2322,6 +2332,21 @@ class PipelineTest(FixtureTest):
         rc, output = self.check("--no-revert-proof-reason", "regression-test fixture")
         self.assertEqual(rc, 0, output)
         self.assertIn("step: regression-test rc: 0", output)
+
+    def test_unrelated_test_control_word_does_not_reach_source_guard(self) -> None:
+        """A shared C control word cannot make an unrelated test reach a source fix."""
+        source = "libavfilter/vf_x.c"
+        self.write(
+            source, SOURCE.replace("    return 1;", "    if (1) {\n        return 2;\n    }")
+        )
+        self.commit("avfilter/vf_x: fix missing guard")
+        self.write("tests/ref/fate/filter-unrelated", "if (other_case)\n")
+        self.commit("tests/fate: add unrelated guard")
+        head = self.git("rev-parse", "HEAD").strip()
+        step = upstream_lint._regression_test(self.root, self.base, head, "")
+        self.assertEqual(step.rc, 1, step.output)
+        self.assertIn("test paths changed but none names", step.output)
+        self.assertIn("vf_x", step.output)
 
     def test_fix_with_test_in_later_commit_passes(self) -> None:
         """A test added in a separate commit within the same range satisfies the check."""
@@ -4777,6 +4802,19 @@ class RevertProofStepTest(FixtureTest):
         self.assertIn("extra key:", error or "")
         self.assertNotIn(long_key, error or "")
         self.assertIn("...", error or "")
+
+    def test_schema_samples_many_extra_keys(self) -> None:
+        """A large extra-key diagnostic reports a short sorted sample and the total."""
+        payload = dict.fromkeys(upstream_lint.REVERT_PROOF_KEYS)
+        for index in range(1999, -1, -1):
+            payload[f"extra-{index:04d}-" + "x" * 248] = None
+        error = upstream_lint._revert_proof_schema_error(payload) or ""
+        self.assertLess(len(error), 2000)
+        self.assertIn("2000 total", error)
+        self.assertIn(
+            ", ".join(f"extra-{index:04d}-" + "x" * 245 + "..." for index in range(5)), error
+        )
+        self.assertNotIn("extra-0005-", error)
 
     def test_step_refuses_nul_in_recorded_command_argument(self) -> None:
         """A recorded command argument containing NUL bytes is refused before measurement."""

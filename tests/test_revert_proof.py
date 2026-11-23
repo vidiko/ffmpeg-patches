@@ -802,6 +802,21 @@ class RevertProofTest(RevertProofFixture):
         self.assertEqual(record["reverted_paths"], [source])
         self.assertEqual(record["rc_reverted"], 17)
 
+    def test_inherited_literal_pathspec_mode_keeps_reversal_measurable(self) -> None:
+        """Inherited Git pathspec mode cannot disable explicit literal path selection."""
+        fix = self.make_fix()
+        source = "libavfilter/vf_x.c"
+        script = (
+            "from pathlib import Path; import sys; "
+            f"sys.exit(0 if 'return 2;' in Path({source!r}).read_text() else 17)"
+        )
+        with unittest.mock.patch.dict(os.environ, {"GIT_LITERAL_PATHSPECS": "1"}):
+            rc, _, error = self.run_cli(fix, [sys.executable, "-c", script])
+        self.assertEqual(rc, 0, error)
+        record = json.loads(self.record_path.read_text(encoding="utf-8"))
+        self.assertEqual(record["reverted_paths"], [source])
+        self.assertEqual(record["rc_reverted"], 17)
+
     def test_empty_argument_after_executable_round_trips(self) -> None:
         """A measured command keeps its empty trailing argument and remains consumer-valid."""
         fix = self.make_fix()

@@ -363,6 +363,30 @@ class ScratchReviewRegressionTest(RevertProofFixture):
         cleanup.assert_not_called()
         self.assertFalse(directory.exists())
 
+    def test_long_worktree_listing_keeps_exact_registration_removable(self) -> None:
+        """Find and remove an exact registration beyond the normal path limit."""
+        scratch = self.root / "scratch" / "tree"
+        scratch.mkdir(parents=True)
+        prefix = "HEAD dummy\0" * (upstream_lint.MAX_PATHS + 1)
+        near_match = f"worktree {scratch}-other\0"
+        with unittest.mock.patch.object(revert_proof, "git_out", return_value=prefix + near_match):
+            try:
+                self.assertFalse(revert_proof.scratch_registered(self.tree, scratch))
+            except revert_proof._PreflightError as error:
+                self.fail(f"a large unregistered listing must return false: {error}")
+        with (
+            unittest.mock.patch.object(
+                revert_proof, "git_out", return_value=prefix + near_match + f"worktree {scratch}\0"
+            ),
+            unittest.mock.patch.object(revert_proof, "cleanup_git") as cleanup,
+        ):
+            self.assertTrue(revert_proof.scratch_registered(self.tree, scratch))
+            revert_proof.remove_scratch(self.tree, scratch)
+        cleanup.assert_called_once_with(
+            self.tree, [], "worktree", "remove", "--force", "--force", str(scratch)
+        )
+        self.assertFalse(scratch.parent.exists())
+
     def test_scratch_creation_does_not_run_setup_hooks(self) -> None:
         """Scratch setup suppresses checkout and reference hooks; test commands keep hooks."""
         fix = self.make_fix()

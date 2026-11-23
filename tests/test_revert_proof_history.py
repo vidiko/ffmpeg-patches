@@ -202,6 +202,19 @@ class RevertProofHistoryTest(RevertProofFixture):
         self.assertNotIn("step: regression-test rc: 2", output)
         self.assertEqual(error, "")
 
+    def test_hidden_parent_docs_fix_keeps_regression_success(self) -> None:
+        """An identifiable docs-only fix skips regression history but keeps its proof finding."""
+        self.write("doc/manual.txt", "updated manual\n")
+        commit = self.commit("doc: fix example")
+        self.write(".git/info/grafts", f"{commit}\n")
+        regression = upstream_lint._regression_test(self.tree, self.base, commit, "")
+        self.assertEqual(regression.rc, 0, regression.output)
+        self.assertIn("0 fix commit(s)", regression.output)
+        proof = upstream_lint._revert_proof(self.tree, self.base, commit)
+        self.assertEqual(proof.rc, 1, proof.output)
+        self.assertIn(commit, proof.output)
+        self.assertIn("history is incomplete", proof.output)
+
     def test_shallow_source_fix_cli_reports_regression_failure(self) -> None:
         """A hidden source fix reports a regression-test finding instead of raising."""
         clone = self.root / "shallow"

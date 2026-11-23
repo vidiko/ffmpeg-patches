@@ -16,8 +16,9 @@ every outcome the module survives; input errors mean exit 2, HEAD failure or
 movement or a command launch failure means exit 3 without a record,
 reverse-apply failure means exit 4, and scratch removal
 failure means exit 5 and names its path; a changed record parent or oversized
-encoded record, or a HEAD path using a configured smudge or process filter,
-means exit 2 without publication; an older record is removed before runs
+encoded record means exit 2. Configured smudge or process filters on HEAD
+paths and clean, smudge or process filters on fix source paths also refuse
+publication with exit 2. An older record is removed before runs
 start, output must be outside the caller work tree and Git administration, and
 the temporary parent must be outside the caller work tree, selected without probe writes.
 Ancestry, caller HEAD checks and scratch checkout read stored objects without replace refs.
@@ -74,6 +75,10 @@ MAX_TIMEOUT = 7200
 GIT_TIMEOUT = 60
 MAX_HEAD_PATHS = 100_000
 MAX_CHECK_ATTR_BYTES = 1_500_000
+CHECKOUT_FILTER_KINDS = ("smudge", "process")
+SOURCE_FILTER_KINDS = ("clean", *CHECKOUT_FILTER_KINDS)
+
+FilterChecks = set[tuple[str, str]]
 
 
 class _PreflightError(ValueError):
@@ -215,20 +220,27 @@ def _filter_path_batches(paths: list[str]) -> list[list[str]]:
     return batches
 
 
-def _check_filter_attributes(tree: Path, head: str, paths: list[str], checked: set[str]) -> None:
-    """Refuse active checkout drivers in one bounded batch of path filter attributes."""
+def _check_filter_attributes(
+    tree: Path,
+    head: str,
+    paths: list[str],
+    checked: FilterChecks,
+    kinds: tuple[str, ...],
+) -> None:
+    """Refuse configured filter commands by kind in one bounded path batch."""
     output = git_result(tree, "check-attr", f"--source={head}", "-z", "filter", "--", *paths)
     fields = output.stdout.removesuffix("\0").split("\0")
     if len(fields) != 3 * len(paths):
         raise _PreflightError("unexpected HEAD filter attribute listing")
     for offset in range(0, 3 * len(paths), 3):
         path, _, driver = fields[offset : offset + 3]
-        if driver in checked:
-            continue
-        checked.add(driver)
-        for kind in ("smudge", "process"):
+        for kind in kinds:
+            key = driver, kind
+            if key in checked:
+                continue
+            checked.add(key)
             command = git_result(
-                tree, "config", "get", "--default=", f"filter.{driver}.{kind}"
+                tree, "config", "--get", "--default=", f"filter.{driver}.{kind}"
             ).stdout.removesuffix("\n")
             if command:
                 raise _PreflightError(
@@ -237,23 +249,26 @@ def _check_filter_attributes(tree: Path, head: str, paths: list[str], checked: s
 
 
 def _check_checkout_filters(
-    tree: Path, attr_source: str, paths: list[str], checked: set[str] | None = None
+    tree: Path,
+    attr_source: str,
+    paths: list[str],
+    checked: FilterChecks,
+    *,
+    kinds: tuple[str, ...] = SOURCE_FILTER_KINDS,
 ) -> None:
-    """Reject configured checkout filters on bounded path batches before measurement."""
-    if checked is None:
-        checked = set()
+    """Reject configured filters for selected kinds before measurement."""
     for batch in _filter_path_batches(paths):
-        _check_filter_attributes(tree, attr_source, batch, checked)
+        _check_filter_attributes(tree, attr_source, batch, checked, kinds)
 
 
-def _check_head_checkout_filters(tree: Path, head: str) -> set[str]:
+def _check_head_checkout_filters(tree: Path, head: str) -> FilterChecks:
     """Bound the full HEAD listing and reject configured checkout filters before measurement."""
     output = git_result(tree, "ls-tree", "-r", "--name-only", "-z", head).stdout
     paths = output.removesuffix("\0").split("\0") if output else []
     if len(paths) > MAX_HEAD_PATHS:
         raise _PreflightError(f"HEAD paths exceed MAX_HEAD_PATHS={MAX_HEAD_PATHS}: {len(paths)}")
-    checked: set[str] = set()
-    _check_checkout_filters(tree, head, paths, checked)
+    checked: FilterChecks = set()
+    _check_checkout_filters(tree, head, paths, checked, kinds=CHECKOUT_FILTER_KINDS)
     return checked
 
 
@@ -378,9 +393,7 @@ def cleanup_git(tree: Path, failures: list[str], *args: str) -> None:
 def scratch_registered(tree: Path, scratch: Path) -> bool:
     """Check exact owned scratch registration with unambiguous porcelain paths."""
     fields = git_out(tree, "worktree", "list", "--porcelain", "-z").split("\0")
-    if len(fields) > upstream_lint.MAX_PATHS:
-        raise _PreflightError("worktree listing exceeds MAX_PATHS")
-    return f"worktree {scratch}" in fields[: upstream_lint.MAX_PATHS]
+    return f"worktree {scratch}" in fields
 
 
 def remove_scratch(tree: Path, scratch: Path) -> None:
@@ -515,19 +528,31 @@ def _source_patch(
 
 def measure_reverted(
     config: ProofConfig,
+    head: str,
     commit: str,
     source_paths: list[str],
 ) -> int | str:
     """Validate the exact reverse patch path set, apply it and run the same command."""
     patch = _source_patch(config, commit, source_paths)
     applied = upstream_lint._run(
-        ["git", "apply", "--whitespace=nowarn", "--no-ignore-whitespace", "-R", "-"],
+        [
+            "git",
+            "apply",
+            "--index",
+            "--whitespace=nowarn",
+            "--no-ignore-whitespace",
+            "-R",
+            "-",
+        ],
         config.tree,
         data=patch.stdout_bytes,
         timeout=GIT_TIMEOUT,
+        git_attr_source=head,
     )
     if applied.returncode != 0 or applied.timed_out:
         raise _ReverseApplyError(f"reverse apply failed for {commit}: {applied.stdout.strip()}")
+    # Pinned attribute reads need an initialized index. Leave the reverted patch unstaged.
+    git_out(config.tree, "read-tree", "-i", "--reset", head)
     result = run_test_command(config.command, config.tree, config.timeout)
     if result == "launch-error":
         raise _HeadTestError("test launch-error on reverted checkout (no verdict)")
@@ -575,9 +600,13 @@ def measure_scratch(
             str(scratch),
             head,
         )
-        _check_head_checkout_filters(scratch, head)
+        checked = _check_head_checkout_filters(scratch, head)
+        paths = source_paths or []
+        if commit is not None:
+            _check_checkout_filters(scratch, head, paths, checked)
         git_out(
             scratch,
+            f"--attr-source={head}",
             "-c",
             f"core.hooksPath={hooks}",
             "-c",
@@ -591,7 +620,7 @@ def measure_scratch(
             head,
         )
         if commit is not None:
-            return measure_reverted(scratch_config, commit, source_paths or [])
+            return measure_reverted(scratch_config, head, commit, paths)
         result = run_test_command(config.command, scratch, config.timeout)
         return verify_head_run(scratch, result, head)
     finally:

@@ -1892,8 +1892,6 @@ def _outside_spans(line: str, spans: SpanList) -> str:
 
 def _texi_comment_command_at(line: str, at: int) -> int | None:
     """Return the index of a Texinfo @c or @comment command, or None."""
-    if at > 0 and line[at - 1] == "@":
-        return None
     if line.startswith("@comment", at):
         tail = at + 8
         if tail == len(line) or line[tail] in " \t":
@@ -1909,15 +1907,21 @@ def _texi_comment_command_at(line: str, at: int) -> int | None:
 
 def _texi_strip_comments_line(line: str) -> str:
     """Return one Texinfo line with @c and @comment suffix text removed."""
-    pos = 0
-    while pos < len(line):
-        at = line.find("@", pos)
-        if at < 0:
+    index = 0
+    limit = len(line)
+    for _ in range(limit):
+        if index >= limit:
             break
-        command = _texi_comment_command_at(line, at)
+        if line[index] != "@":
+            index += 1
+            continue
+        if index + 1 < limit and line[index + 1] == "@":
+            index += 2
+            continue
+        command = _texi_comment_command_at(line, index)
         if command is not None:
             return line[:command].rstrip()
-        pos = at + 1
+        index += 1
     return line
 
 

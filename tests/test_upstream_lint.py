@@ -2204,6 +2204,18 @@ class DocTermTest(unittest.TestCase):
         """@@c keeps the mode token because the at-sign is escaped."""
         self.assertEqual(upstream_lint.texi_strip_comments("@@c mode"), "@@c mode")
 
+    def test_texi_strip_comments_triple_at_comment(self) -> None:
+        """@@@c leaves two literal at-signs before the comment command."""
+        self.assertEqual(upstream_lint.texi_strip_comments("@@@c mode"), "@@")
+
+    def test_texi_strip_comments_quad_at_not_comment(self) -> None:
+        """@@@@c keeps the line because only literal at-sign pairs precede c."""
+        self.assertEqual(upstream_lint.texi_strip_comments("@@@@c mode"), "@@@@c mode")
+
+    def test_texi_strip_comments_spaced_pair_before_comment(self) -> None:
+        """text @@ @c keeps the escaped pair and drops the trailing comment."""
+        self.assertEqual(upstream_lint.texi_strip_comments("text @@ @c mode"), "text @@")
+
     def test_texi_strip_comments_inline_commands_preserved(self) -> None:
         """@code and @center lines keep mode because @c is not a comment command."""
         for text in ("@code{mode}", "@center mode"):

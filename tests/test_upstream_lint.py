@@ -5015,6 +5015,111 @@ class CRulesBlankingTest(_CRulesBlankingMixin, unittest.TestCase):
         nested = b"#define DECLARE(x) int x;\nDECLARE(a)\n#if A\nint b;\n#endif\n"
         self.assert_blanked(nested, nested)
 
+    def test_directive_positions_must_match_lexed_positions(self) -> None:
+        """Directive start lines from the lexer must match physical directive line starts."""
+        h1_source = (
+            b"#define VALUE(x) (x)\n"
+            b"static int n =\n"
+            b"#if A\n"
+            b"#define KEEP \\\n"
+            b"#else\n"
+            b"0;\n"
+            b"/* arm */ #else\n"
+            b"VALUE(1)\n"
+            b";\n"
+            b"#endif\n"
+        )
+        self.assert_blanked(h1_source, h1_source)
+        spliced_define = b"#define LONG \\\n  1\n#define CALL(x) int x;\nCALL(a)\nint b;\n"
+        expected_spliced = (
+            b"#define LONG \\\n"
+            b"  1\n"
+            b"#define CALL(x) int x;\n" + b" " * len(b"CALL(a)") + b"\nint b;\n"
+        )
+        blanked = upstream_lint._c_rules_blank(spliced_define, set())
+        self.assertEqual(blanked, expected_spliced)
+        continued_hash = b"#define CALL(x) int x;\n#define KEEP \\\n#else\nCALL(a)\nint b;\n"
+        self.assertEqual(upstream_lint._c_rules_blank(continued_hash, set()), continued_hash)
+        call_body = b"CALL(1)"
+        attr_line = b"int av_fixture_tag a;\n"
+        plain_control = (
+            b"#define CALL(x) (x)\n"
+            + attr_line
+            + b"#if A\nint b;\n#else\nint c;\n#endif\n"
+            + call_body
+            + b"\nint d;\n"
+        )
+        blanked_attr = b"int " + b" " * len(b"av_fixture_tag") + b" a;\n"
+        expected_control = (
+            b"#define CALL(x) (x)\n"
+            + blanked_attr
+            + b"#if A\nint b;\n#else\nint c;\n#endif\n"
+            + b" " * len(call_body)
+            + b"\nint d;\n"
+        )
+        self.assert_blanked(plain_control, expected_control)
+
+    def test_macro_call_before_parameter_list_is_kept(self) -> None:
+        """Macro calls with a parameter-list continuation stay in the scratch copy."""
+        h2_source = b"#define DECL(x) static int x\nDECL(f)\n(void)\n{ return 0; }\n"
+        self.assertEqual(upstream_lint._c_rules_blank(h2_source, set()), h2_source)
+        param_list = b"#define DECL(x) static int x\nDECL(f)\n    (int a);\nint b;\n"
+        self.assertEqual(upstream_lint._c_rules_blank(param_list, set()), param_list)
+        plain = b"#define DECLARE(x) int x;\nDECLARE(a)\nint b;\n"
+        expected_plain = b"#define DECLARE(x) int x;\n" + b" " * len(b"DECLARE(a)") + b"\nint b;\n"
+        blanked = upstream_lint._c_rules_blank(plain, set())
+        self.assertEqual(blanked, expected_plain)
+
+    def test_arm_joins_skip_nested_conditionals(self) -> None:
+        """Precomputed arm joins skip sibling arms and nested conditionals when walking tails."""
+        source = b"#if A\n#if B\n#else\n#endif\n#elif C\n#else\n#endif\n#ifdef D\n#else\n"
+        lines = source.split(b"\n")
+        code, directives, directive_lines = upstream_lint._c_lex_lines(source.decode("latin-1"))
+        mapped = upstream_lint._c_rules_directive_words(lines, code, directives, directive_lines)
+        if mapped is None:
+            self.fail("directive word map missing for nested conditional fixture")
+        joins = upstream_lint._c_rules_arm_joins(mapped, len(lines))
+        self.assertEqual(joins[2], 3)
+        self.assertEqual(joins[4], 6)
+        self.assertEqual(joins[5], 6)
+        self.assertEqual(joins[8], -1)
+        tail_source = b"#define CALL(x) int x;\n#if A\nCALL(a)\n#else\n{\n#endif\nint b;\n"
+        tail_lines = tail_source.split(b"\n")
+        tail_decoded = tail_source.decode("latin-1")
+        tail_code, tail_dirs, tail_dir_lines = upstream_lint._c_lex_lines(tail_decoded)
+        tail_mapped = upstream_lint._c_rules_directive_words(
+            tail_lines, tail_code, tail_dirs, tail_dir_lines
+        )
+        if tail_mapped is None:
+            self.fail("directive word map missing for blank-call tail fixture")
+        tail_joins = upstream_lint._c_rules_arm_joins(tail_mapped, len(tail_lines))
+        self.assertTrue(
+            upstream_lint._c_rules_blank_call_tail(tail_code, tail_mapped, 3, tail_joins)
+        )
+        wrong_joins = list(tail_joins)
+        wrong_joins[3] = 3
+        self.assertFalse(
+            upstream_lint._c_rules_blank_call_tail(tail_code, tail_mapped, 3, wrong_joins)
+        )
+
+    def test_long_conditional_chain_blanks_each_call(self) -> None:
+        """Each macro call in a long elif chain is blanked along the same rule as a line walk."""
+        count = 300
+        parts = [b"#define CALL(x) int x;\n", b"#if A0\n", b"CALL(a0)\n"]
+        for index in range(1, count):
+            parts.append(f"#elif A{index}\n".encode("ascii"))
+            parts.append(f"CALL(a{index})\n".encode("ascii"))
+        parts.append(b"#endif\nint z;\n")
+        source = b"".join(parts)
+        lines = source.split(b"\n")
+        blanked_lines = upstream_lint._c_rules_blank(source, set()).split(b"\n")
+        for index in range(len(lines)):
+            stripped = lines[index].strip()
+            if stripped.startswith(b"CALL("):
+                self.assertEqual(blanked_lines[index], b" " * len(lines[index]))
+            else:
+                self.assertEqual(blanked_lines[index], lines[index])
+
 
 class CRulesTest(unittest.TestCase):
     """Unit coverage of the c-rules allow-list, argv, working directory and waiver."""

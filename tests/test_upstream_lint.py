@@ -1509,6 +1509,368 @@ class ClaimScopeTest(unittest.TestCase):
         self.assertEqual(upstream_lint.source_hunks(""), 0)
 
 
+class ErrorScopeClaimTest(unittest.TestCase):
+    """Positive, negative and boundary coverage of error-handling scope claims."""
+
+    def test_dashenc_before_reword_body_is_flagged(self) -> None:
+        """Loose retain-or-stays wording does not qualify an error-handling subject."""
+        message = (
+            "avformat/dashenc: propagate output close errors\n\n"
+            "Other rename sites retain their existing error handling.\n"
+            "The sticky AVIO error stays.\n"
+        )
+        self.assertEqual(upstream_lint.error_scope_claim(message), "propagate output close errors")
+
+    def test_dashenc_remain_outside_sentence_qualifies(self) -> None:
+        """A remain-outside sentence split across lines qualifies the subject claim."""
+        message = (
+            "avformat/dashenc: propagate output close errors\n\n"
+            "Other rename sites retain their existing error handling.\n"
+            "Errors reported only by the single-file close in dash_free() and\n"
+            "damaged segments left by ignored multi-file streaming write failures\n"
+            "remain outside this change.\n"
+        )
+        self.assertIsNone(upstream_lint.error_scope_claim(message))
+
+    def test_hlsplaylist_unchanged_behavior_qualifies(self) -> None:
+        """As-on-master and unchanged-behavior sentences qualify playlist error subjects."""
+        message = (
+            "avformat/hlsplaylist: return playlist write errors\n\n"
+            "The fail label still overwrites ret with hlsenc_io_close's\n"
+            "result, as on master; close, retry and trailer behavior are unchanged.\n"
+        )
+        self.assertIsNone(upstream_lint.error_scope_claim(message))
+
+    def test_unchanged_without_scope_noun_is_flagged(self) -> None:
+        """An unchanged sentence without a scope noun does not qualify."""
+        message = "avfilter/vf_x: propagate write errors\n\nOutput is unchanged.\n"
+        self.assertEqual(upstream_lint.error_scope_claim(message), "propagate write errors")
+
+    def test_no_other_error_path_remains_qualifies(self) -> None:
+        """A no-other-error-path completeness sentence qualifies the subject."""
+        message = "avfilter/vf_x: report write errors\n\nNo other error path remains.\n"
+        self.assertIsNone(upstream_lint.error_scope_claim(message))
+
+    def test_subject_without_error_noun_is_not_a_claim(self) -> None:
+        """Subjects that propagate timestamps without an error noun pass."""
+        self.assertIsNone(upstream_lint.error_scope_claim("avformat/x: propagate timestamps\n"))
+
+    def test_negated_error_subject_is_not_a_claim(self) -> None:
+        """A negated return-errors subject is not treated as a claim."""
+        self.assertIsNone(
+            upstream_lint.error_scope_claim("avformat/x: do not return write errors\n")
+        )
+
+    def test_signoff_remain_outside_does_not_qualify(self) -> None:
+        """A Signed-off-by line carrying remain-outside text does not qualify."""
+        message = (
+            "avfilter/vf_x: propagate write errors\n\n"
+            "Signed-off-by: Paths remain outside this change <x@invalid>\n"
+        )
+        self.assertEqual(upstream_lint.error_scope_claim(message), "propagate write errors")
+
+    def test_member_access_dot_does_not_split_qualifying_sentence(self) -> None:
+        """A dot inside an identifier keeps one qualification sentence intact."""
+        message = (
+            "avfilter/vf_x: propagate write errors\n\n"
+            "Close errors in pkg.dash_free() remain outside this change.\n"
+        )
+        self.assertIsNone(upstream_lint.error_scope_claim(message))
+
+    def test_error_scope_finding_names_the_fix(self) -> None:
+        """The claim-scope finding for an error subject asks for an exclusion sentence."""
+        findings = upstream_lint._unverified_findings(
+            "0123456789abcdef", "avfilter/vf_x: propagate write errors\n"
+        )
+        self.assertEqual(len(findings), 1)
+        self.assertIn('subject claims error handling ("propagate write errors")', findings[0])
+        self.assertIn("remain outside this change", findings[0])
+
+    def test_avutil_check_av_strerror_failures_flagged(self) -> None:
+        """A check-verb summary after an area error prefix is still a claim."""
+        message = "avutil/error: check av_strerror() failures\n"
+        self.assertEqual(upstream_lint.error_scope_claim(message), "check av_strerror() failures")
+
+    def test_nvenc_avoid_surface_not_claim(self) -> None:
+        """An allow-listed word out of verb position makes no claim."""
+        message = "avcodec/nvenc: avoid invalid surface destruction after init error\n"
+        self.assertIsNone(upstream_lint.error_scope_claim(message))
+
+    def test_fix_leak_and_return_write_errors_flagged(self) -> None:
+        """A return-verb clause after and still claims when error nouns follow."""
+        message = "avcodec/x: fix a leak and return write errors\n"
+        self.assertEqual(upstream_lint.error_scope_claim(message), "return write errors")
+
+    def test_propagate_write_errors_no_prefix_flagged(self) -> None:
+        """A subject summary without an area prefix can still claim error handling."""
+        message = "propagate write errors\n"
+        self.assertEqual(upstream_lint.error_scope_claim(message), "propagate write errors")
+
+    def test_returned_and_catch_inflections_flagged(self) -> None:
+        """Past-tense returned and every inflection of catch claim error handling."""
+        cases = (
+            ("avcodec/foo: returned encode errors\n", "returned encode errors"),
+            ("avcodec/foo: catch write errors\n", "catch write errors"),
+            ("avcodec/foo: catches write errors\n", "catches write errors"),
+            ("avcodec/foo: caught write errors\n", "caught write errors"),
+            ("avcodec/foo: catching write errors\n", "catching write errors"),
+        )
+        for message, expected in cases:
+            with self.subTest(message=message):
+                self.assertEqual(upstream_lint.error_scope_claim(message), expected)
+
+    def test_nominal_error_handling_claims_flagged(self) -> None:
+        """Closed-list nominal verbs before error or failure handling nouns are claims."""
+        cases = (
+            ("avcodec/foo: add error checks\n", "add error checks"),
+            ("avcodec/foo: fix error propagation\n", "fix error propagation"),
+            ("avcodec/foo: fix error handling in init\n", "fix error handling in init"),
+            ("avcodec/foo: improve failure reporting\n", "improve failure reporting"),
+            ("avcodec/foo: rework error checking\n", "rework error checking"),
+            ("avcodec/foo: complete failure check\n", "complete failure check"),
+        )
+        for message, expected in cases:
+            with self.subTest(message=message):
+                self.assertEqual(upstream_lint.error_scope_claim(message), expected)
+
+    def test_surface_noun_adjunct_not_flagged(self) -> None:
+        """A leading surface noun adjunct is not treated as an error-handling verb."""
+        subject = "avcodec/foo: surface format check after init failure\n"
+        self.assertIsNone(upstream_lint.error_scope_claim(subject))
+
+    def test_earlier_clause_negation_does_not_suppress_claim(self) -> None:
+        """Negation in an earlier clause does not suppress a later affirmative claim."""
+        cases = (
+            (
+                "avcodec/foo: do not leak frame and return write errors\n",
+                "return write errors",
+            ),
+            (
+                "avcodec/foo: fix non-monotonic PTS without B-frames and propagate decode errors\n",
+                "propagate decode errors",
+            ),
+            ("avcodec/foo: do not crash, check init failure\n", "check init failure"),
+            ("avcodec/foo: never block; report decode errors\n", "report decode errors"),
+        )
+        for message, expected in cases:
+            with self.subTest(message=message):
+                self.assertEqual(upstream_lint.error_scope_claim(message), expected)
+
+    def test_same_clause_negations_not_flagged(self) -> None:
+        """Negation before the verb inside the same clause suppresses that clause."""
+        for message in (
+            "avformat/foo: do not report errors twice\n",
+            "avformat/foo: never propagate benign EOF errors\n",
+            "avformat/foo: without checking write errors, free frame\n",
+            "avformat/foo: don't return encode errors\n",
+        ):
+            with self.subTest(message=message):
+                self.assertIsNone(upstream_lint.error_scope_claim(message))
+
+    def test_clause_bound_stops_cross_clause_noun_pairing(self) -> None:
+        """An error noun in a later clause does not pair with a verb in an earlier clause."""
+        for message in (
+            "avcodec/foo: check frame size and avoid error log spam\n",
+            "avcodec/foo: check frame size and avoid init failure\n",
+            "avcodec/foo: check frame size, do not return write errors\n",
+            "avcodec/foo: return 0; log write failure\n",
+        ):
+            with self.subTest(message=message):
+                self.assertIsNone(upstream_lint.error_scope_claim(message))
+
+    def test_post_verb_clause_nonclaims_not_flagged(self) -> None:
+        """Post-verb no-error, instead-of, unchanged and no-more-than clauses make no claim."""
+        for message in (
+            "avcodec/foo: return the error code of foo unchanged\n",
+            "avcodec/foo: return 0 when no error occurred\n",
+            "avcodec/foo: return 0 when no failure occurred\n",
+            "avcodec/foo: report errors no more than once\n",
+            "avcodec/foo: return 0 instead of error on empty packet\n",
+        ):
+            with self.subTest(message=message):
+                self.assertIsNone(upstream_lint.error_scope_claim(message))
+
+    def test_error_compound_nouns_not_flagged(self) -> None:
+        """Closed-list compound nouns after error do not count as failure claims."""
+        for message in (
+            "avcodec/foo: check error resilience flags\n",
+            "avcodec/foo: handle error concealment in B-frames\n",
+            "avcodec/foo: forward error callback pointer to context\n",
+            "avcodec/foo: check if error callback is set\n",
+            "avcodec/foo: return standard error string from table\n",
+            "avcodec/foo: check error message format\n",
+            "avcodec/foo: return error text for status\n",
+            "avcodec/foo: report error log level\n",
+            "avcodec/foo: return error name from code\n",
+            "avcodec/foo: check error table bounds\n",
+        ):
+            with self.subTest(message=message):
+                self.assertIsNone(upstream_lint.error_scope_claim(message))
+        self.assertEqual(
+            upstream_lint.error_scope_claim("avcodec/foo: report error message on write failure\n"),
+            "report error message on write failure",
+        )
+
+    def test_multiple_leading_prefixes_skipped(self) -> None:
+        """Every leading area prefix without spaces is skipped before reading the summary."""
+        for message in (
+            "check: fix typo in failure message\n",
+            "avcodec/x: check: fix typo in failure message\n",
+            "avutil/error: document av_strerror() return value\n",
+            "avcodec/error_resilience: return early on skip\n",
+        ):
+            with self.subTest(message=message):
+                self.assertIsNone(upstream_lint.error_scope_claim(message))
+        self.assertEqual(
+            upstream_lint.error_scope_claim("avcodec/x: subsys: propagate write errors\n"),
+            "propagate write errors",
+        )
+
+    def test_abbreviation_and_colon_keep_qualifying_sentence_intact(self) -> None:
+        """Abbreviation dots and colons keep one scope sentence intact while semicolons split."""
+        for body in (
+            "Other error paths, e.g. close, remain outside this change.",
+            "Other error paths, i.e. close, remain outside this change.",
+            "Other error paths (cf. close) remain outside this change.",
+            "Other error paths vs. master remain outside this change.",
+            "Other error paths, close, etc. remain outside this change.",
+            "Other error paths: close and flush remain outside this change.",
+        ):
+            with self.subTest(body=body):
+                message = f"avfilter/vf_x: propagate write errors\n\n{body}\n"
+                self.assertIsNone(upstream_lint.error_scope_claim(message))
+        split_semicolon = (
+            "avfilter/vf_x: propagate write errors\n\nThis stays out of scope; error handling.\n"
+        )
+        self.assertEqual(upstream_lint.error_scope_claim(split_semicolon), "propagate write errors")
+
+    def test_exclamation_question_split_flags_unqualified_claim(self) -> None:
+        """Exclamation and question marks split sentences so missing qualification is flagged."""
+        for body in (
+            "Errors are reported! Output remains unchanged.",
+            "Errors are reported? Output remains unchanged.",
+        ):
+            with self.subTest(body=body):
+                message = f"avfilter/vf_x: propagate write errors\n\n{body}\n"
+                self.assertEqual(upstream_lint.error_scope_claim(message), "propagate write errors")
+
+    def test_exclamation_question_split_qualifies_error_scope(self) -> None:
+        """Split qualification sentences after exclamation or question marks qualify the claim."""
+        for body in (
+            "Is this right? Other error paths remain outside this change.",
+            "Errors are reported! Other error paths remain outside this change.",
+            "Other error paths remain outside this change!",
+        ):
+            with self.subTest(body=body):
+                message = f"avfilter/vf_x: propagate write errors\n\n{body}\n"
+                self.assertIsNone(upstream_lint.error_scope_claim(message))
+
+    def test_in_word_exclamation_question_do_not_split(self) -> None:
+        """In-word exclamation and question marks do not split qualification sentences."""
+        body = "Other error paths in a?b and x!=y remain outside this change."
+        sentences = upstream_lint._qualification_sentences(body)
+        self.assertEqual(len(sentences), 1)
+        self.assertEqual(
+            sentences[0],
+            "Other error paths in a?b and x!=y remain outside this change",
+        )
+        message = f"avfilter/vf_x: propagate write errors\n\n{body}\n"
+        self.assertIsNone(upstream_lint.error_scope_claim(message))
+
+    def test_bare_unchanged_without_other_marker_does_not_qualify(self) -> None:
+        """Bare unchanged, as-before and as-on-master phrases require an other-scope word."""
+        for body in (
+            "The error message text is unchanged.",
+            "Error messages are unchanged.",
+            "Log an error as before when opening the file.",
+            "On failure, free the context as on master.",
+        ):
+            with self.subTest(body=body):
+                message = f"avfilter/vf_x: propagate write errors\n\n{body}\n"
+                self.assertEqual(upstream_lint.error_scope_claim(message), "propagate write errors")
+        for body in (
+            "Other error paths are unchanged.",
+            "Remaining error paths behave as on master.",
+            "The rest of the error handling is unchanged.",
+            "Existing failure handling works as before.",
+        ):
+            with self.subTest(body=body):
+                message = f"avfilter/vf_x: propagate write errors\n\n{body}\n"
+                self.assertIsNone(upstream_lint.error_scope_claim(message))
+
+    def test_quoted_diff_and_trailer_lines_do_not_qualify(self) -> None:
+        """Quoted lines, hunk blocks, -by trailers and address or URL trailers do not qualify."""
+        for line in (
+            "> error handling is unchanged",
+            "> Other error paths remain outside this change.",
+            "@@ -1 +1 @@\n+ // Other error paths remain outside this change.",
+            "diff --git a/x b/x\n- // Other error paths remain outside this change.",
+            "Reviewed-by: Other error paths remain outside this change <x@invalid>",
+            "Suggested-by: Other error paths remain outside this change",
+            "Cc: Other error paths remain outside this change <x@invalid>",
+            "Link: https://example.invalid/other-error-paths-remain-outside-this-change",
+        ):
+            with self.subTest(line=line):
+                message = f"avfilter/vf_x: propagate write errors\n\n{line}\n"
+                self.assertEqual(upstream_lint.error_scope_claim(message), "propagate write errors")
+
+    def test_unchanged_behaviour_nouns_qualify(self) -> None:
+        """Named behaviour, path, case and site nouns qualify conditional unchanged phrases."""
+        for body in (
+            "Read paths are unchanged.",
+            "Seek cases are unchanged.",
+            "Flush path is unchanged.",
+            "Close case works as before.",
+            "Retry site behaves as on master.",
+            "Close sites are unchanged.",
+            "Trailer behavior is unchanged.",
+            "Trailer behaviour is unchanged.",
+        ):
+            with self.subTest(body=body):
+                message = f"avformat/x: return write errors\n\n{body}\n"
+                self.assertIsNone(upstream_lint.error_scope_claim(message))
+        unchanged_message = (
+            "avformat/x: return write errors\n\nThe error message text is unchanged.\n"
+        )
+        self.assertEqual(upstream_lint.error_scope_claim(unchanged_message), "return write errors")
+
+    def test_body_bullets_qualify(self) -> None:
+        """Body bullet lines outside quoted hunk blocks qualify error-handling subjects."""
+        for line in (
+            "- Other close and flush error paths are unchanged.",
+            "+ Other close and flush error paths are unchanged.",
+        ):
+            with self.subTest(line=line):
+                message = f"avfilter/vf_x: propagate write errors\n\n{line}\n"
+                self.assertIsNone(upstream_lint.error_scope_claim(message))
+
+    def test_quoted_hunk_blocks_dropped_until_empty_line(self) -> None:
+        """Quoted diff and hunk blocks drop every line until the next empty line."""
+        for hunk in (
+            "@@ -1 +1 @@\n+ Other error paths are unchanged.",
+            "diff --git a/x b/x\n- Other error paths are unchanged.",
+            "@@ -1 +1 @@ Other error paths are unchanged.\n+Other error paths are unchanged.",
+            "diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n Other error paths are unchanged.",
+        ):
+            with self.subTest(hunk=hunk):
+                message = f"avfilter/vf_x: propagate write errors\n\n{hunk}\n"
+                self.assertEqual(upstream_lint.error_scope_claim(message), "propagate write errors")
+        after_empty = (
+            "avfilter/vf_x: propagate write errors\n\n"
+            "@@ -1 +1 @@\n"
+            "+ Ignored hunk line.\n\n"
+            "Other error paths are unchanged.\n"
+        )
+        self.assertIsNone(upstream_lint.error_scope_claim(after_empty))
+        after_diff_empty = (
+            "avfilter/vf_x: propagate write errors\n\n"
+            "diff --git a/x b/x\n"
+            "- Ignored hunk line.\n\n"
+            "Other error paths are unchanged.\n"
+        )
+        self.assertIsNone(upstream_lint.error_scope_claim(after_diff_empty))
+
+
 class DocTermTest(unittest.TestCase):
     """Positive, negative and boundary coverage of doc terms the added code requires."""
 
@@ -2668,6 +3030,34 @@ class PipelineTest(FixtureTest):
         """An encode speed claim with an fps figure passes claim-scope."""
         self.write("libavfilter/vf_x.c", SOURCE.replace("return 1", "return 2"))
         self.commit("avfilter/vf_x: paint maps once\n\nEncoding runs at 120 fps, not 100 fps.")
+        rc, output = self.check()
+        self.assertEqual(rc, 0, output)
+        self.assertIn("step: claim-scope rc: 0", output)
+
+    def test_error_scope_claim_fails(self) -> None:
+        """An error-handling subject without a scope sentence fails claim-scope."""
+        self.write("libavfilter/vf_x.c", SOURCE.replace("return 1", "return 2"))
+        self.commit("avfilter/vf_x: propagate write errors")
+        rc, output = self.check()
+        self.assertEqual(rc, 1, output)
+        self.assertIn("step: claim-scope rc: 1", output)
+        self.assertIn('subject claims error handling ("propagate write errors")', output)
+
+    def test_error_scope_claim_is_not_waived(self) -> None:
+        """Passing --claim-reason cannot waive an error-handling scope claim."""
+        self.write("libavfilter/vf_x.c", SOURCE.replace("return 1", "return 2"))
+        self.commit("avfilter/vf_x: propagate write errors")
+        rc, output = self.check("--claim-reason", "only one path changed")
+        self.assertEqual(rc, 1, output)
+        self.assertIn("step: claim-scope rc: 1", output)
+
+    def test_error_scope_remain_outside_passes(self) -> None:
+        """A body sentence that leaves close-path errors outside passes claim-scope."""
+        self.write("libavfilter/vf_x.c", SOURCE.replace("return 1", "return 2"))
+        self.commit(
+            "avfilter/vf_x: propagate write errors\n\n"
+            "Errors from the close path remain outside this change."
+        )
         rc, output = self.check()
         self.assertEqual(rc, 0, output)
         self.assertIn("step: claim-scope rc: 0", output)

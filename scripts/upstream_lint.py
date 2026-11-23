@@ -81,6 +81,43 @@ any letter case are ignored, and a range of more than MAX_CLAIM_COMMITS commits
 fails with rc 2; claims worded otherwise, and claims that a multi-hunk diff
 still does not support, are not detected.
 
+The step also fails, never waivable, a commit whose subject line claims error
+handling. The summary is the text after every leading "<token>: " prefix whose
+token holds no whitespace, or the whole subject when none is present. Each
+clause of the summary ends at a comma, a semicolon, or the whitespace-bounded
+word "and" between words. Within a clause, a verb counts only as the clause's
+first word, so any word before it in that clause (including a negation such as
+"do not" or "never") makes no claim there without suppressing later clauses. A
+clause claims error handling when its first word is propagate, return, check,
+handle, report, forward or catch in any inflection followed in the same clause
+by error or failure (singular or plural) where singular error is not followed by
+resilience, concealment, or singular or plural callback, string, message, text,
+log, name or table; or when its first word is add, fix, improve, rework or
+complete in any inflection followed in the same clause by error or failure
+directly before handling, propagation, check, checks, checking or reporting. A
+clause whose text after the verb holds no error, no errors, no failure, no
+failures, instead of, unchanged or no more than makes no claim. An error noun in
+a skipped prefix neither makes nor blocks a claim. The commit passes only when
+its body, after dropping quoted hunk blocks (every line from a line starting
+with "diff --git " or "@@ ", that start line included, up to the next empty
+line), lines starting with ">", "<Token>-by:" trailer lines, and "<Token>:
+<email or url>" trailer lines while keeping "- " and "+ " lines outside hunk
+blocks, holds a sentence that names both a scope noun (singular or plural
+error, failure, path, case or site, or behavior, behaviour or handling) and an
+exclusion: remain or remains outside, stay or stays outside, outside this or
+the change, outside this commit or series, out of scope, left for or to a
+follow-up, not covered or handled by this change, remain, remains, stay or
+stays unhandled, unchecked, ignored or unchanged, no other followed within
+three words by error, errors, failure or failures and later in the same
+sentence by remain, remains or is left, or is unchanged, are unchanged, as on
+master or as before when the same sentence also holds other, remaining, rest or
+existing, or one of the ERROR_SCOPE_BEHAVIOUR_NOUNS nouns (behavior, behaviour,
+path, paths, case, cases, site, sites). Sentences split on ";", "?", "!" or "." at the
+end of the body or before whitespace, not on ":", and a period inside a number,
+inside an identifier such as pkg.dash_free(), or before whitespace after e.g,
+i.e, cf, vs or etc does not end a sentence. --claim-reason TEXT does not waive
+this rule. Error-handling subjects worded otherwise are not detected.
+
 The doc-terms step fails when base..head adds lines both to library or fftools
 sources and to Texinfo files under doc/, and an added source line shows a
 behaviour whose added description leaves one of its cases out: a test for
@@ -307,6 +344,65 @@ SPEED_NEGATION = re.compile(
 END_TO_END_MEASURE = re.compile(
     r"\d+(?:\.\d+)?\s*(?:fps|frames/s)\b|(?<![\w-])-benchmark\b|\bbench:\s*utime="
     r"|\bspeed=\s*\d|\bhyperfine\b",
+    re.IGNORECASE,
+)
+ERROR_SCOPE_VERB = re.compile(
+    r"(?:propagat(?:e|es|ed|ing)|return(?:s|ed|ing)?|check(?:s|ed|ing)?|"
+    r"handl(?:e|es|ed|ing)|report(?:s|ed|ing)?|forward(?:s|ed|ing)?|"
+    r"catch(?:es|ing)?|caught)(?![-\w])",
+    re.IGNORECASE,
+)
+ERROR_SCOPE_NOMINAL_VERB = re.compile(
+    r"(?:add(?:s|ed|ing)?|fix(?:es|ed|ing)?|improv(?:e|es|ed|ing)|"
+    r"rework(?:s|ed|ing)?|complet(?:e|es|ed|ing))(?![-\w])",
+    re.IGNORECASE,
+)
+ERROR_SCOPE_CLAUSE_SPLIT = re.compile(r"[,;]|\s+and\s+", re.IGNORECASE)
+ERROR_SCOPE_NOUN = re.compile(r"\b(?:errors?|failures?)\b", re.IGNORECASE)
+ERROR_NOMINAL_NOUN = re.compile(
+    r"\b(?:error|failure)\s+(?:handling|propagation|checks?|checking|reporting)\b",
+    re.IGNORECASE,
+)
+ERROR_COMPOUND_NOUN = re.compile(
+    r"\s+(?:resilience|concealment|callbacks?|strings?|messages?|texts?|logs?|names?|tables?)\b",
+    re.IGNORECASE,
+)
+ERROR_CLAUSE_NONCLAIM = re.compile(
+    r"\b(?:no\s+(?:errors?|failures?)|instead\s+of|unchanged|no\s+more\s+than)\b",
+    re.IGNORECASE,
+)
+ERROR_ABBREVIATION = re.compile(r"(?<![\w.])(?:e\.g|i\.e|cf|vs|etc)$", re.IGNORECASE)
+ERROR_BODY_TRAILER = re.compile(
+    r"^[A-Za-z][A-Za-z0-9-]*(?:-by:.*|:\s+(?:<?https?://\S+.*|"
+    r"[^\s<>@]+@[^\s<>@]+\s*|[^<>]*<[^\s<>@]+@[^\s<>@]+>\s*))$",
+    re.IGNORECASE,
+)
+ERROR_SCOPE_EXCLUSION = re.compile(
+    r"\b(?:remain(?:s)? outside|stay(?:s)? outside|outside this change|outside the change|"
+    r"outside this commit|outside this series|out of scope|left for a follow-up|"
+    r"left to a follow-up|not covered by this change|not handled by this change|"
+    r"remain(?:s)? unhandled|stay(?:s)? unhandled|remain(?:s)? unchecked|"
+    r"stay(?:s)? unchecked|remain(?:s)? ignored|stay(?:s)? ignored|"
+    r"remain(?:s)? unchanged|stay(?:s)? unchanged)\b",
+    re.IGNORECASE,
+)
+ERROR_SCOPE_CONDITIONAL_EXCLUSION = re.compile(
+    r"\b(?:is unchanged|are unchanged|as on master|as before)\b",
+    re.IGNORECASE,
+)
+ERROR_SCOPE_OTHER_MARKER = re.compile(
+    r"\b(?:other|remaining|rest|existing)\b",
+    re.IGNORECASE,
+)
+ERROR_SCOPE_BEHAVIOUR_NOUNS = frozenset(
+    {"behavior", "behaviour", "path", "paths", "case", "cases", "site", "sites"}
+)
+ERROR_SCOPE_COMPLETENESS = re.compile(
+    r"\bno other(?:\s+\S+){0,2}\s+(?:errors?|failures?)\b.*\b(?:remain(?:s)?|is left)\b",
+    re.IGNORECASE,
+)
+ERROR_SCOPE_QUALIFIER_NOUN = re.compile(
+    r"\b(?:errors?|failures?|paths?|cases?|sites?|behaviou?r|handling)\b",
     re.IGNORECASE,
 )
 # Exact upstream category headers allowed to block added lines. Keep this an
@@ -1562,6 +1658,177 @@ def scope_claim(message: str) -> str | None:
     return match[0] if match else None
 
 
+def _error_scope_summary_start(subject: str) -> int:
+    """Return the index where the commit subject summary begins after leading prefixes."""
+    start = 0
+    for _ in range(len(subject)):
+        sep = subject.find(": ", start)
+        if sep <= start or any(char.isspace() for char in subject[start:sep]):
+            break
+        start = sep + 2
+    return start
+
+
+def _error_scope_clause_spans(subject: str, summary_start: int) -> list[tuple[int, int]]:
+    """Return trimmed (start, end) character spans for each clause in the summary."""
+    rest = subject[summary_start:]
+    trimmed_start = summary_start + len(rest) - len(rest.lstrip())
+    trimmed_end = len(subject.rstrip())
+    if trimmed_start >= trimmed_end:
+        return []
+    spans: list[tuple[int, int]] = []
+    cursor = trimmed_start
+    for sep in ERROR_SCOPE_CLAUSE_SPLIT.finditer(subject, trimmed_start, trimmed_end):
+        clause = subject[cursor : sep.start()].strip()
+        if clause:
+            start = subject.find(clause, cursor, sep.start())
+            spans.append((start, start + len(clause)))
+        cursor = sep.end()
+    tail = subject[cursor:trimmed_end].strip()
+    if tail:
+        start = subject.find(tail, cursor, trimmed_end)
+        spans.append((start, start + len(tail)))
+    return spans
+
+
+def _clause_noun_matches(after_verb: str, nominal: bool) -> bool:
+    """Return whether the post-verb clause text holds an unexcluded error claim noun."""
+    if ERROR_CLAUSE_NONCLAIM.search(after_verb):
+        return False
+    if nominal:
+        return ERROR_NOMINAL_NOUN.search(after_verb) is not None
+    for noun in ERROR_SCOPE_NOUN.finditer(after_verb):
+        if noun[0].lower() == "error" and ERROR_COMPOUND_NOUN.match(after_verb, noun.end()):
+            continue
+        return True
+    return False
+
+
+def _error_scope_subject_claim(subject: str) -> str | None:
+    """Return the subject error-handling claim phrase, or None when absent or excluded."""
+    summary_start = _error_scope_summary_start(subject)
+    for clause_start, clause_end in _error_scope_clause_spans(subject, summary_start):
+        clause = subject[clause_start:clause_end]
+        verb = ERROR_SCOPE_VERB.match(clause)
+        nominal = False
+        if verb is None:
+            verb = ERROR_SCOPE_NOMINAL_VERB.match(clause)
+            nominal = True
+        if verb is None:
+            continue
+        after_verb = subject[clause_start + verb.end() : clause_end]
+        if _clause_noun_matches(after_verb, nominal):
+            return clause
+    return None
+
+
+def _period_splits_sentence(text: str, index: int) -> bool:
+    """Return whether a dot at index ends a qualification sentence."""
+    if (
+        index + 1 < len(text)
+        and text[index + 1].isdigit()
+        and (index == 0 or text[index - 1].isdigit())
+    ):
+        return False
+    if 0 < index < len(text) - 1 and text[index - 1].isalnum() and text[index + 1].isalnum():
+        return False
+    if index + 1 >= len(text):
+        return True
+    if not text[index + 1].isspace():
+        return False
+    return ERROR_ABBREVIATION.search(text, 0, index) is None
+
+
+def _sentence_breaks_at(text: str, index: int) -> bool:
+    """Return whether character index ends a qualification sentence."""
+    char = text[index]
+    if char in ";?!":
+        return index + 1 >= len(text) or text[index + 1].isspace()
+    return char == "." and _period_splits_sentence(text, index)
+
+
+def _skip_whitespace(text: str, start: int) -> int:
+    """Return the first non-whitespace index in text at or after start."""
+    limit = len(text)
+    for _ in range(limit - start):
+        if not text[start].isspace():
+            break
+        start += 1
+    return start
+
+
+def _qualification_sentences(text: str) -> list[str]:
+    """Split flattened body text into qualification sentences."""
+    parts: list[str] = []
+    start = 0
+    index = 0
+    limit = len(text)
+    for _ in range(limit):
+        if index >= limit:
+            break
+        if not _sentence_breaks_at(text, index):
+            index += 1
+            continue
+        part = text[start:index].strip()
+        if part:
+            parts.append(part)
+        start = _skip_whitespace(text, index + 1)
+        index = start
+    tail = text[start:].strip()
+    if tail:
+        parts.append(tail)
+    return parts
+
+
+def _error_scope_sentence_qualifies(sentence: str) -> bool:
+    """Return whether one sentence qualifies an error-handling subject claim."""
+    if not ERROR_SCOPE_QUALIFIER_NOUN.search(sentence):
+        return False
+    if ERROR_SCOPE_EXCLUSION.search(sentence) or ERROR_SCOPE_COMPLETENESS.search(sentence):
+        return True
+    if not ERROR_SCOPE_CONDITIONAL_EXCLUSION.search(sentence):
+        return False
+    return bool(
+        ERROR_SCOPE_OTHER_MARKER.search(sentence)
+        or not ERROR_SCOPE_BEHAVIOUR_NOUNS.isdisjoint(re.findall(r"\w+", sentence.lower()))
+    )
+
+
+def _error_scope_body_lines(lines: list[str]) -> list[str]:
+    """Return body lines with quotes, quoted hunk blocks and standard trailers removed."""
+    kept: list[str] = []
+    in_hunk = False
+    for line in lines:
+        if in_hunk:
+            if not line:
+                in_hunk = False
+            continue
+        if line.startswith(("diff --git ", "@@ ")):
+            in_hunk = True
+            continue
+        if line.startswith(">") or ERROR_BODY_TRAILER.match(line) is not None:
+            continue
+        kept.append(line)
+    return kept
+
+
+def error_scope_claim(message: str) -> str | None:
+    """Return the subject error-handling claim when the body lacks a scope sentence."""
+    lines = message.splitlines()
+    if not lines:
+        return None
+    claim = _error_scope_subject_claim(lines[0])
+    if claim is None:
+        return None
+    flattened = " ".join("\n".join(_error_scope_body_lines(lines[1:])).split())
+    if not flattened:
+        return claim
+    for sentence in _qualification_sentences(flattened):
+        if _error_scope_sentence_qualifies(sentence):
+            return None
+    return claim
+
+
 def speed_claim(message: str) -> str | None:
     """Return the first encode or decode speed claim in a message without an end-to-end figure."""
     text = _without_signoff(message)
@@ -1587,6 +1854,13 @@ def _unverified_findings(commit: str, message: str) -> list[str]:
         findings.append(
             f'{commit[:12]}: claims "{speed}" without an end-to-end measurement; '
             "name an ffmpeg -benchmark or fps result, or drop the claim"
+        )
+    error_scope = error_scope_claim(message)
+    if error_scope is not None:
+        findings.append(
+            f'{commit[:12]}: subject claims error handling ("{error_scope}") but no body '
+            "sentence names the error paths left outside the change; add one, for example "
+            '"... remain outside this change" or "no other error path remains"'
         )
     return findings
 

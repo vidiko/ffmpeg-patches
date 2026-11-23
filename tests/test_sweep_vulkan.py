@@ -290,6 +290,131 @@ R7_NONUNIFORM_ONLY_DISASM = "\n".join(
     )
 )
 
+R7_NONUNIFORM_RESOURCE_DISASM = "\n".join(
+    (
+        "%float = OpTypeFloat 32",
+        "%uint = OpTypeInt 32 0",
+        "%28 = OpTypeImage %float 2D 0 0 0 2 Rgba8",
+        "%uint_4 = OpConstant %uint 4",
+        "%_arr_28_uint_4 = OpTypeArray %28 %uint_4",
+        "%_ptr_UniformConstant__arr_28_uint_4 = OpTypePointer UniformConstant %_arr_28_uint_4",
+        "%src = OpVariable %_ptr_UniformConstant__arr_28_uint_4 UniformConstant",
+        "%_ptr_UniformConstant_28 = OpTypePointer UniformConstant %28",
+        "%37 = OpTypeImage %float 2D 0 0 0 2 Unknown",
+        "%dst = OpVariable %_ptr_UniformConstant__arr_28_uint_4 UniformConstant",
+        "%int = OpTypeInt 32 1",
+        "%int_0 = OpConstant %int 0",
+        "OpDecorate %38 NonUniform",
+        "%35 = OpAccessChain %_ptr_UniformConstant_28 %src %33",
+        "%36 = OpLoad %28 %35",
+        "%38 = OpCopyObject %37 %36",
+        "%43 = OpAccessChain %_ptr_UniformConstant_28 %dst %int_0",
+    )
+)
+
+R7_NONUNIFORM_MIXED_DISASM = "\n".join(
+    (
+        "%float = OpTypeFloat 32",
+        "%uint = OpTypeInt 32 0",
+        "%28 = OpTypeImage %float 2D 0 0 0 2 Rgba8",
+        "%uint_4 = OpConstant %uint 4",
+        "%_arr_28_uint_4 = OpTypeArray %28 %uint_4",
+        "%_ptr_UniformConstant__arr_28_uint_4 = OpTypePointer UniformConstant %_arr_28_uint_4",
+        "%src = OpVariable %_ptr_UniformConstant__arr_28_uint_4 UniformConstant",
+        "%_ptr_UniformConstant_28 = OpTypePointer UniformConstant %28",
+        "%37 = OpTypeImage %float 2D 0 0 0 2 Unknown",
+        "%dst = OpVariable %_ptr_UniformConstant__arr_28_uint_4 UniformConstant",
+        "OpDecorate %38 NonUniform",
+        "%35 = OpAccessChain %_ptr_UniformConstant_28 %src %33",
+        "%36 = OpLoad %28 %35",
+        "%38 = OpCopyObject %37 %36",
+        "%49 = OpAccessChain %_ptr_UniformConstant_28 %dst %48",
+    )
+)
+
+CR16_NONUNIFORM_INDEX_DISASM = "\n".join(
+    (
+        "%float = OpTypeFloat 32",
+        "%uint = OpTypeInt 32 0",
+        "%28 = OpTypeImage %float 2D 0 0 0 2 Rgba8",
+        "%uint_4 = OpConstant %uint 4",
+        "%_arr_28_uint_4 = OpTypeArray %28 %uint_4",
+        "%_ptr_UniformConstant__arr_28_uint_4 = OpTypePointer UniformConstant %_arr_28_uint_4",
+        "%src = OpVariable %_ptr_UniformConstant__arr_28_uint_4 UniformConstant",
+        "%dst = OpVariable %_ptr_UniformConstant__arr_28_uint_4 UniformConstant",
+        "%_ptr_UniformConstant_28 = OpTypePointer UniformConstant %28",
+        "OpDecorate %34 NonUniform",
+        "OpDecorate %36 NonUniform",
+        "OpDecorate %37 NonUniform",
+        "%34 = OpCopyObject %uint %33",
+        "%36 = OpAccessChain %_ptr_UniformConstant_28 %src %34",
+        "%37 = OpLoad %28 %36",
+        "%47 = OpLoad %uint %46",
+        "%48 = OpAccessChain %_ptr_UniformConstant_28 %dst %47",
+    )
+)
+
+CR16B_DOUBLE_LOAD_NONUNIFORM_DISASM = "\n".join(
+    (
+        "%float = OpTypeFloat 32",
+        "%uint = OpTypeInt 32 0",
+        "%28 = OpTypeImage %float 2D 0 0 0 2 Rgba8",
+        "%uint_4 = OpConstant %uint 4",
+        "%_arr_28_uint_4 = OpTypeArray %28 %uint_4",
+        "%_ptr_UniformConstant__arr_28_uint_4 = OpTypePointer UniformConstant %_arr_28_uint_4",
+        "%src = OpVariable %_ptr_UniformConstant__arr_28_uint_4 UniformConstant",
+        "%_ptr_UniformConstant_28 = OpTypePointer UniformConstant %28",
+        "%37 = OpTypeImage %float 2D 0 0 0 2 Unknown",
+        "%dst = OpVariable %_ptr_UniformConstant__arr_28_uint_4 UniformConstant",
+        "%int = OpTypeInt 32 1",
+        "%int_0 = OpConstant %int 0",
+        "OpDecorate %38 NonUniform",
+        "%35 = OpAccessChain %_ptr_UniformConstant_28 %src %33",
+        "%36 = OpLoad %28 %35",
+        "%38 = OpCopyObject %37 %36",
+        "%44 = OpLoad %28 %35",
+        "%43 = OpAccessChain %_ptr_UniformConstant_28 %dst %int_0",
+    )
+)
+
+CR16B_DOUBLE_COPY_NONUNIFORM_DISASM = "\n".join(
+    (
+        "%float = OpTypeFloat 32",
+        "%uint = OpTypeInt 32 0",
+        "%28 = OpTypeImage %float 2D 0 0 0 2 Rgba8",
+        "%uint_4 = OpConstant %uint 4",
+        "%_arr_28_uint_4 = OpTypeArray %28 %uint_4",
+        "%_ptr_UniformConstant__arr_28_uint_4 = OpTypePointer UniformConstant %_arr_28_uint_4",
+        "%src = OpVariable %_ptr_UniformConstant__arr_28_uint_4 UniformConstant",
+        "%_ptr_UniformConstant_28 = OpTypePointer UniformConstant %28",
+        "%37 = OpTypeImage %float 2D 0 0 0 2 Unknown",
+        "%dst = OpVariable %_ptr_UniformConstant__arr_28_uint_4 UniformConstant",
+        "%int = OpTypeInt 32 1",
+        "%int_0 = OpConstant %int 0",
+        "OpDecorate %38 NonUniform",
+        "%35 = OpAccessChain %_ptr_UniformConstant_28 %src %33",
+        "%36 = OpLoad %28 %35",
+        "%38 = OpCopyObject %37 %36",
+        "%40 = OpCopyObject %37 %36",
+        "%43 = OpAccessChain %_ptr_UniformConstant_28 %dst %int_0",
+    )
+)
+
+NU_RES2_SHADER = """\
+#version 460
+#extension GL_EXT_nonuniform_qualifier : require
+#extension GL_EXT_shader_image_load_formatted : require
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 0, rgba8) uniform readonly image2D src[4];
+layout(set = 0, binding = 1, rgba8) uniform writeonly image2D dst[4];
+void main() {
+    uint i = gl_GlobalInvocationID.z;
+    ivec2 pos = ivec2(gl_GlobalInvocationID.xy);
+    vec4 v = imageLoad(nonuniformEXT(src[i]), pos);
+    imageStore(dst[0], pos, v);
+}
+"""
+
 
 def load_mutant_module(rel_path: str, old: str, new: str, tmp: Path) -> ModuleType:
     """Load one mutated sweep module copy from a temporary directory."""
@@ -1250,6 +1375,56 @@ class VulkanSweepTest(unittest.TestCase):
         source = "unsigned v = use(src[0] >> 4, flags & 0xff);\n"
         self.assertEqual(sweep_port_parity.cpu_sites(source), [(1, "shift")])
 
+    def test_cr16_loop_header_while_shift_operand_focus(self) -> None:
+        """CR16: while-header sample reads classify shift without a later header mask."""
+        source = "void f(void)\n{\n    while (use(src[0] >> 4, flags & 0xff)) {}\n}\n"
+        self.assertEqual(sweep_port_parity.cpu_sites(source), [(3, "shift")])
+
+    def test_cr16_loop_header_for_shift_operand_focus(self) -> None:
+        """CR16: for-header sample reads classify shift without a later header mask."""
+        source = "void f(void)\n{\n    for (int i = use(src[0] >> 4, flags & 0xff); i; i--) {}\n}\n"
+        self.assertEqual(sweep_port_parity.cpu_sites(source), [(3, "shift")])
+
+    def test_cr16_loop_header_no_mask_without_shift(self) -> None:
+        """CR16: a header sample without shift ignores mask on a separate call argument."""
+        source = "void f(void)\n{\n    while (use(src[0], flags & 0xff)) {}\n}\n"
+        self.assertEqual(sweep_port_parity.cpu_sites(source), [])
+
+    def test_cr16_enclosing_av_clip_counts_for_read(self) -> None:
+        """CR16: a sample read inside av_clip classifies as clip normalization."""
+        source = "void f(void)\n{\n    *out = av_clip(src[0], 0, 255);\n}\n"
+        self.assertEqual(sweep_port_parity.cpu_sites(source), [(3, "clip")])
+
+    def test_cr16_read_outside_enclosing_clip_ignored(self) -> None:
+        """CR16: a sample read after av_clip does not inherit clip from that call."""
+        source = "void f(void)\n{\n    *out = av_clip(x, 0, 255) + src[0];\n}\n"
+        self.assertEqual(sweep_port_parity.cpu_sites(source), [])
+
+    def test_cr16_macro_r_n16_shift_after_close_paren(self) -> None:
+        """CR16: AV_RN16 shift after the macro argument list classifies as shift."""
+        source = "void f(uint16_t *src, uint16_t *out)\n{\n    *out = AV_RN16(src) >> 4;\n}\n"
+        self.assertEqual(sweep_port_parity.cpu_sites(source), [(3, "shift")])
+
+    def test_cr16_macro_r_n16_mask_after_close_paren(self) -> None:
+        """CR16: AV_RN16 mask after the macro argument list classifies as mask."""
+        source = "void f(uint16_t *src, uint16_t *out)\n{\n    *out = AV_RN16(src) & 0x3ff;\n}\n"
+        self.assertEqual(sweep_port_parity.cpu_sites(source), [(3, "mask")])
+
+    def test_cr16_macro_mask_inside_args_not_outside(self) -> None:
+        """CR16: mask operators inside AV_RN16 arguments do not classify the read."""
+        source = (
+            "void f(uint16_t *src, int n, uint16_t *out)\n"
+            "{\n"
+            "    *out = AV_RN16(src + (n & 0xff));\n"
+            "}\n"
+        )
+        self.assertEqual(sweep_port_parity.cpu_sites(source), [])
+
+    def test_cr16_plain_shift_line_kept(self) -> None:
+        """CR16: plain src shift on its line still classifies as shift."""
+        source = "void f(void)\n{\n    *out = src[0] >> 4;\n}\n"
+        self.assertEqual(sweep_port_parity.cpu_sites(source), [(3, "shift")])
+
     def test_cr10_4658985429_linked_shaders_dedupes_repeated_symbols(self) -> None:
         """CR10-5429: repeated extern and use symbols link one shader path in first-seen order."""
         c_source = (
@@ -1358,6 +1533,66 @@ class VulkanSweepTest(unittest.TestCase):
             sweep_vulkan_features.dynamic_storage_index(R7_NONUNIFORM_ONLY_DISASM),
             (False, True),
         )
+
+    def test_cr16_nonuniform_resource_copy_operand(self) -> None:
+        """CR16: NonUniform on OpCopyObject image operand yields non-uniform without dynamic."""
+        self.assertEqual(
+            sweep_vulkan_features.dynamic_storage_index(R7_NONUNIFORM_RESOURCE_DISASM),
+            (False, True),
+        )
+
+    def test_cr16b_nonuniform_double_pointer_load(self) -> None:
+        """CR16b: first decorated load copy wins when the same pointer is loaded again."""
+        self.assertEqual(
+            sweep_vulkan_features.dynamic_storage_index(CR16B_DOUBLE_LOAD_NONUNIFORM_DISASM),
+            (False, True),
+        )
+
+    def test_cr16b_nonuniform_double_load_copy(self) -> None:
+        """CR16b: decorated copy wins when the same load is copied again without decorate."""
+        self.assertEqual(
+            sweep_vulkan_features.dynamic_storage_index(CR16B_DOUBLE_COPY_NONUNIFORM_DISASM),
+            (False, True),
+        )
+
+    def test_cr16_nonuniform_mixed_dynamic_and_copy(self) -> None:
+        """CR16: decorated image operand with dynamic dst index yields both flags."""
+        self.assertEqual(
+            sweep_vulkan_features.dynamic_storage_index(R7_NONUNIFORM_MIXED_DISASM),
+            (True, True),
+        )
+
+    def test_cr16_nonuniform_index_form_dynamic_and_nonuniform(self) -> None:
+        """CR16: index-form NonUniform src access with dynamic dst keeps both requirements."""
+        self.assertEqual(
+            sweep_vulkan_features.dynamic_storage_index(CR16_NONUNIFORM_INDEX_DISASM),
+            (True, True),
+        )
+
+    @unittest.skipIf(SKIP_VULKAN, SKIP_REASON)
+    def test_cr16_nu_res2_glslang_copy_object_nonuniform(self) -> None:
+        """CR16: resource-form NonUniform decorates OpCopyObject and yields non-uniform only."""
+        with tempfile.TemporaryDirectory() as scratch:
+            work = Path(scratch)
+            deadline = time.monotonic() + 120
+            spv = sweep_vulkan_features.compile_shader(NU_RES2_SHADER, work, deadline)
+            disasm = sweep_vulkan_features.run_tool(
+                [
+                    str(sweep_vulkan_features.SPIRV_DIS),
+                    str(spv),
+                ],
+                deadline,
+                sweep_vulkan_features.MAX_TOOL_BYTES,
+                "spirv-dis",
+            )
+        copy_id = ""
+        for line in disasm.splitlines():
+            if "OpCopyObject" in line and "=" in line:
+                copy_id = line.split("=", 1)[0].strip()
+                break
+        self.assertRegex(copy_id, r"%\w+")
+        self.assertIn(f"OpDecorate {copy_id} NonUniform", disasm)
+        self.assertEqual(sweep_vulkan_features.dynamic_storage_index(disasm), (False, True))
 
     def test_cr13_f2_scoped_params_both_orders(self) -> None:
         """Scoped params keep the VkPhysicalDeviceFeatures gate read in either declaration order."""

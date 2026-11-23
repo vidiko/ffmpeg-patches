@@ -1041,6 +1041,49 @@ def storage_image_array_vars(disasm: str) -> set[str]:
     return vars_found
 
 
+def spirv_pointer_loads(disasm: str) -> dict[str, set[str]]:
+    """Map SPIR-V pointer operand ids to every OpLoad result id."""
+    loads: dict[str, set[str]] = {}
+    for match in re.finditer(r"(%\w+) = OpLoad \S+ (%\w+)", disasm):
+        loads.setdefault(match[2], set()).add(match[1])
+    return loads
+
+
+def spirv_object_copies(disasm: str) -> dict[str, set[str]]:
+    """Map SPIR-V OpCopyObject source ids to every copy result id."""
+    copies: dict[str, set[str]] = {}
+    for match in re.finditer(r"(%\w+) = OpCopyObject \S+ (%\w+)", disasm):
+        copies.setdefault(match[2], set()).add(match[1])
+    return copies
+
+
+def storage_index_nonuniform(
+    chain_id: str,
+    index: str,
+    base: str,
+    maps: tuple[set[str], dict[str, set[str]], dict[str, set[str]]],
+) -> bool:
+    """Return whether one storage-image access is non-uniform via index, base, or image operand."""
+    nonuniform_ids, loads, copies = maps
+    if index in nonuniform_ids or base in nonuniform_ids:
+        return True
+    if chain_id in nonuniform_ids:
+        return True
+    load_ids = loads.get(chain_id)
+    if not load_ids:
+        return False
+    for load_id in load_ids:
+        if load_id in nonuniform_ids:
+            return True
+        copy_ids = copies.get(load_id)
+        if not copy_ids:
+            continue
+        for copy_id in copy_ids:
+            if copy_id in nonuniform_ids:
+                return True
+    return False
+
+
 def dynamic_storage_index(disasm: str) -> tuple[bool, bool]:
     """Detect dynamic and non-uniform storage-image array indexing in SPIR-V text."""
     assignments = {match[1]: match[2] for match in re.finditer(r"(%\w+) = (Op\w+)", disasm)}
@@ -1050,20 +1093,28 @@ def dynamic_storage_index(disasm: str) -> tuple[bool, bool]:
             constants.add(match[1])
     nonuniform_ids = {match[1] for match in re.finditer(r"OpDecorate (%\w+) NonUniform", disasm)}
     array_vars = storage_image_array_vars(disasm)
+    loads = spirv_pointer_loads(disasm)
+    copies = spirv_object_copies(disasm)
+    index_maps: tuple[set[str], dict[str, set[str]], dict[str, set[str]]] = (
+        nonuniform_ids,
+        loads,
+        copies,
+    )
     dynamic = False
     nonuniform = False
     for line in disasm.splitlines():
         chain = re.search(r"(%\w+) = OpAccessChain \S+ (%\w+)(?: (%\w+))?", line)
         if chain is None:
             continue
+        chain_id = chain[1]
         base = chain[2]
         index = chain[3]
         if index is None or base not in array_vars:
             continue
-        indexed_nonuniform = index in nonuniform_ids or base in nonuniform_ids
-        if indexed_nonuniform:
+        if storage_index_nonuniform(chain_id, index, base, index_maps):
             nonuniform = True
-        elif index not in constants and not index.startswith("%int_"):
+            continue
+        if index not in constants and not index.startswith("%int_"):
             dynamic = True
     return dynamic, nonuniform
 

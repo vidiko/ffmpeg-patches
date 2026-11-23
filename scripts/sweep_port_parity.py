@@ -141,6 +141,35 @@ def matching_close_paren(text: str, open_index: int) -> int | None:
     return None
 
 
+_MACRO_READ = re.compile(r"\b(?:AV_RN16[A-Z]?|AV_RL16|AV_RB16)\s*\(", re.ASCII)
+
+
+def sample_read_end(statement: str, read_start: int, read_end: int) -> int:
+    """Extend one macro sample read through its balanced argument list."""
+    if read_end <= read_start or statement[read_end - 1] != "(":
+        return read_end
+    prefix = statement[read_start:read_end]
+    if _MACRO_READ.match(prefix) is None:
+        return read_end
+    close_index = matching_close_paren(statement, read_end - 1)
+    if close_index is None:
+        return read_end
+    return close_index + 1
+
+
+def enclosing_clip_focus(statement: str, read_start: int, read_end: int) -> str | None:
+    """Return clip or clamp call text when the sample read is one of its arguments."""
+    for pattern in (CLIP, CLAMP):
+        for match in pattern.finditer(statement):
+            open_index = match.end() - 1
+            close_index = matching_close_paren(statement, open_index)
+            if close_index is None:
+                continue
+            if open_index < read_start and read_end <= close_index:
+                return statement[match.start() : close_index + 1]
+    return None
+
+
 def loop_header_bounds(statement: str) -> tuple[int, int] | None:
     """Return the inclusive header bounds for a leading for/while statement."""
     trimmed = statement.lstrip()
@@ -190,10 +219,9 @@ def _extend_mask_tail(text: str, position: int, limit: int) -> int:
     return position
 
 
-def sample_operand_text(statement: str, read_start: int, read_end: int) -> str:
-    """Extend one sample read through attached mask, shift, clip, or clamp operators."""
+def _operand_scan_end(statement: str, read_end: int, depth: int) -> int:
+    """Return the end offset after attached mask or shift operators following read_end."""
     limit = len(statement)
-    depth = statement[:read_start].count("(") - statement[:read_start].count(")")
     position = read_end
     for _ in range(_OPERAND_OPS):
         position = _skip_space(statement, position, limit)
@@ -209,15 +237,45 @@ def sample_operand_text(statement: str, read_start: int, read_end: int) -> str:
             )
             continue
         break
-    return statement[read_start:position]
+    return position
+
+
+def attached_operator_text(statement: str, read_start: int, read_end: int) -> str:
+    """Return operators attached after one sample read without its argument or macro text."""
+    depth = statement[:read_start].count("(") - statement[:read_start].count(")")
+    end = _operand_scan_end(statement, read_end, depth)
+    return statement[read_end:end]
+
+
+def header_inner_call_depth(statement: str, read_start: int, bounds: tuple[int, int]) -> int:
+    """Return parenthesis depth at read_start from the loop header opening parenthesis."""
+    depth = 0
+    for index in range(max(0, bounds[0] - 1), read_start):
+        ch = statement[index]
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+    return depth
 
 
 def normalization_focus(statement: str, read_start: int, read_end: int) -> str:
     """Return the statement slice searched for normalization on one sample read."""
+    clip_text = enclosing_clip_focus(statement, read_start, read_end)
+    if clip_text is not None:
+        return clip_text
+    tail = attached_operator_text(statement, read_start, read_end)
     bounds = loop_header_bounds(statement)
-    if bounds is not None and read_start <= bounds[1]:
-        return statement[bounds[0] : bounds[1]]
-    return sample_operand_text(statement, read_start, read_end)
+    if bounds is not None and bounds[0] <= read_start <= bounds[1]:
+        header_end = bounds[1] + 1
+        tail_end = min(read_end + len(tail), header_end)
+        tail_slice = statement[read_end:tail_end]
+        if header_inner_call_depth(statement, read_start, bounds) > 1:
+            return tail_slice
+        if normalization_kind(tail_slice) is not None:
+            return tail_slice
+        return statement[bounds[0] : header_end]
+    return tail
 
 
 def normalization_kind(text: str) -> str | None:
@@ -242,7 +300,9 @@ def cpu_sites(source: str) -> list[tuple[int, str]]:
         read_match = SAMPLE_READ.search(statement)
         if read_match is None:
             continue
-        focus = normalization_focus(statement, read_match.start(), read_match.end())
+        read_start = read_match.start()
+        read_end = sample_read_end(statement, read_start, read_match.end())
+        focus = normalization_focus(statement, read_start, read_end)
         kind = normalization_kind(focus)
         if kind is None:
             continue

@@ -25,7 +25,7 @@ from pathlib import Path
 
 from tests.helpers import GIT_ENVIRONMENT_NAMES, isolated_git_environment
 
-sys.path.append(str(Path(__file__).resolve().parents[1] / "scripts"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 import upstream_lint  # noqa: E402
 
 UPSTREAM = Path(os.environ["UPSTREAM_TREE"]) if os.environ.get("UPSTREAM_TREE") else None
@@ -1533,11 +1533,11 @@ class ErrorScopeClaimTest(unittest.TestCase):
         self.assertIsNone(upstream_lint.error_scope_claim(message))
 
     def test_hlsplaylist_unchanged_behavior_qualifies(self) -> None:
-        """As-on-master and other-unchanged-behavior sentences qualify playlist subjects."""
+        """As-on-master and unchanged-behavior sentences qualify playlist error subjects."""
         message = (
             "avformat/hlsplaylist: return playlist write errors\n\n"
             "The fail label still overwrites ret with hlsenc_io_close's\n"
-            "result, as on master; other close, retry and trailer behavior are unchanged.\n"
+            "result, as on master; close, retry and trailer behavior are unchanged.\n"
         )
         self.assertIsNone(upstream_lint.error_scope_claim(message))
 
@@ -1766,12 +1766,12 @@ class ErrorScopeClaimTest(unittest.TestCase):
                 self.assertIsNone(upstream_lint.error_scope_claim(message))
 
     def test_quoted_diff_and_trailer_lines_do_not_qualify(self) -> None:
-        """Quoted lines, diff lines, -by trailers and address or URL trailers do not qualify."""
+        """Quoted lines, hunk blocks, -by trailers and address or URL trailers do not qualify."""
         for line in (
             "> error handling is unchanged",
             "> Other error paths remain outside this change.",
-            "+ // Other error paths remain outside this change.",
-            "- // Other error paths remain outside this change.",
+            "@@ -1 +1 @@\n+ // Other error paths remain outside this change.",
+            "diff --git a/x b/x\n- // Other error paths remain outside this change.",
             "Reviewed-by: Other error paths remain outside this change <x@invalid>",
             "Suggested-by: Other error paths remain outside this change",
             "Cc: Other error paths remain outside this change <x@invalid>",
@@ -1780,6 +1780,62 @@ class ErrorScopeClaimTest(unittest.TestCase):
             with self.subTest(line=line):
                 message = f"avfilter/vf_x: propagate write errors\n\n{line}\n"
                 self.assertEqual(upstream_lint.error_scope_claim(message), "propagate write errors")
+
+    def test_unchanged_behaviour_nouns_qualify(self) -> None:
+        """Named behaviour, path, case and site nouns qualify conditional unchanged phrases."""
+        for body in (
+            "Read paths are unchanged.",
+            "Seek cases are unchanged.",
+            "Flush path is unchanged.",
+            "Close case works as before.",
+            "Retry site behaves as on master.",
+            "Close sites are unchanged.",
+            "Trailer behavior is unchanged.",
+            "Trailer behaviour is unchanged.",
+        ):
+            with self.subTest(body=body):
+                message = f"avformat/x: return write errors\n\n{body}\n"
+                self.assertIsNone(upstream_lint.error_scope_claim(message))
+        unchanged_message = (
+            "avformat/x: return write errors\n\nThe error message text is unchanged.\n"
+        )
+        self.assertEqual(upstream_lint.error_scope_claim(unchanged_message), "return write errors")
+
+    def test_body_bullets_qualify(self) -> None:
+        """Body bullet lines outside quoted hunk blocks qualify error-handling subjects."""
+        for line in (
+            "- Other close and flush error paths are unchanged.",
+            "+ Other close and flush error paths are unchanged.",
+        ):
+            with self.subTest(line=line):
+                message = f"avfilter/vf_x: propagate write errors\n\n{line}\n"
+                self.assertIsNone(upstream_lint.error_scope_claim(message))
+
+    def test_quoted_hunk_blocks_dropped_until_empty_line(self) -> None:
+        """Quoted diff and hunk blocks drop every line until the next empty line."""
+        for hunk in (
+            "@@ -1 +1 @@\n+ Other error paths are unchanged.",
+            "diff --git a/x b/x\n- Other error paths are unchanged.",
+            "@@ -1 +1 @@ Other error paths are unchanged.\n+Other error paths are unchanged.",
+            "diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n Other error paths are unchanged.",
+        ):
+            with self.subTest(hunk=hunk):
+                message = f"avfilter/vf_x: propagate write errors\n\n{hunk}\n"
+                self.assertEqual(upstream_lint.error_scope_claim(message), "propagate write errors")
+        after_empty = (
+            "avfilter/vf_x: propagate write errors\n\n"
+            "@@ -1 +1 @@\n"
+            "+ Ignored hunk line.\n\n"
+            "Other error paths are unchanged.\n"
+        )
+        self.assertIsNone(upstream_lint.error_scope_claim(after_empty))
+        after_diff_empty = (
+            "avfilter/vf_x: propagate write errors\n\n"
+            "diff --git a/x b/x\n"
+            "- Ignored hunk line.\n\n"
+            "Other error paths are unchanged.\n"
+        )
+        self.assertIsNone(upstream_lint.error_scope_claim(after_diff_empty))
 
 
 class DocTermTest(unittest.TestCase):

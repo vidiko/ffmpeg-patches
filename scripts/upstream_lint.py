@@ -98,17 +98,21 @@ directly before handling, propagation, check, checks, checking or reporting. A
 clause whose text after the verb holds no error, no errors, no failure, no
 failures, instead of, unchanged or no more than makes no claim. An error noun in
 a skipped prefix neither makes nor blocks a claim. The commit passes only when
-its body, after dropping lines starting with ">", "+ " or "- ", "<Token>-by:"
-trailer lines, and "<Token>: <email or url>" trailer lines, holds a sentence
-that names both a scope noun (singular or plural error, failure, path, case or
-site, or behavior, behaviour or handling) and an exclusion: remain or remains
-outside, stay or stays outside, outside this or the change, outside this commit
-or series, out of scope, left for or to a follow-up, not covered or handled by
-this change, remain, remains, stay or stays unhandled, unchecked, ignored or
-unchanged, no other followed within three words by error, errors, failure or
-failures and later in the same sentence by remain, remains or is left, or is
-unchanged, are unchanged, as on master or as before when the same sentence also
-holds other, remaining, rest or existing. Sentences split on ";" or "." at the
+its body, after dropping quoted hunk blocks (every line from a line starting
+with "diff --git " or "@@ ", that start line included, up to the next empty
+line), lines starting with ">", "<Token>-by:" trailer lines, and "<Token>:
+<email or url>" trailer lines while keeping "- " and "+ " lines outside hunk
+blocks, holds a sentence that names both a scope noun (singular or plural
+error, failure, path, case or site, or behavior, behaviour or handling) and an
+exclusion: remain or remains outside, stay or stays outside, outside this or
+the change, outside this commit or series, out of scope, left for or to a
+follow-up, not covered or handled by this change, remain, remains, stay or
+stays unhandled, unchecked, ignored or unchanged, no other followed within
+three words by error, errors, failure or failures and later in the same
+sentence by remain, remains or is left, or is unchanged, are unchanged, as on
+master or as before when the same sentence also holds other, remaining, rest or
+existing, or one of the ERROR_SCOPE_BEHAVIOUR_NOUNS nouns (behavior, behaviour,
+path, paths, case, cases, site, sites). Sentences split on ";" or "." at the
 end of the body or before whitespace, not on ":", and a period inside a number,
 inside an identifier such as pkg.dash_free(), or before whitespace after e.g,
 i.e, cf, vs or etc does not end a sentence. --claim-reason TEXT does not waive
@@ -389,6 +393,9 @@ ERROR_SCOPE_CONDITIONAL_EXCLUSION = re.compile(
 ERROR_SCOPE_OTHER_MARKER = re.compile(
     r"\b(?:other|remaining|rest|existing)\b",
     re.IGNORECASE,
+)
+ERROR_SCOPE_BEHAVIOUR_NOUNS = frozenset(
+    {"behavior", "behaviour", "path", "paths", "case", "cases", "site", "sites"}
 )
 ERROR_SCOPE_COMPLETENESS = re.compile(
     r"\bno other(?:\s+\S+){0,2}\s+(?:errors?|failures?)\b.*\b(?:remain(?:s)?|is left)\b",
@@ -1779,19 +1786,30 @@ def _error_scope_sentence_qualifies(sentence: str) -> bool:
         return False
     if ERROR_SCOPE_EXCLUSION.search(sentence) or ERROR_SCOPE_COMPLETENESS.search(sentence):
         return True
+    if not ERROR_SCOPE_CONDITIONAL_EXCLUSION.search(sentence):
+        return False
     return bool(
-        ERROR_SCOPE_CONDITIONAL_EXCLUSION.search(sentence)
-        and ERROR_SCOPE_OTHER_MARKER.search(sentence)
+        ERROR_SCOPE_OTHER_MARKER.search(sentence)
+        or not ERROR_SCOPE_BEHAVIOUR_NOUNS.isdisjoint(re.findall(r"\w+", sentence.lower()))
     )
 
 
 def _error_scope_body_lines(lines: list[str]) -> list[str]:
-    """Return body lines with quotes, diff lines and standard trailers removed."""
-    return [
-        line
-        for line in lines
-        if not line.startswith((">", "+ ", "- ")) and ERROR_BODY_TRAILER.match(line) is None
-    ]
+    """Return body lines with quotes, quoted hunk blocks and standard trailers removed."""
+    kept: list[str] = []
+    in_hunk = False
+    for line in lines:
+        if in_hunk:
+            if not line:
+                in_hunk = False
+            continue
+        if line.startswith(("diff --git ", "@@ ")):
+            in_hunk = True
+            continue
+        if line.startswith(">") or ERROR_BODY_TRAILER.match(line) is not None:
+            continue
+        kept.append(line)
+    return kept
 
 
 def error_scope_claim(message: str) -> str | None:

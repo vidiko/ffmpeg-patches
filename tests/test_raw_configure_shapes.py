@@ -745,14 +745,25 @@ class RawConfigureShapeTest(RawConfigureGuardBase):
             self._check_parser_body(body, refused=True)
 
     def test_fd_descriptor_top_level_rule_isolates_nontop_tail(self) -> None:
-        """Measure whether disabling only the top-level rule allows a nested tail shape."""
+        """Prove scan_body prelude refuses nested tails; subshell flips under patch."""
         p1 = 'delay=$((1 << 2))\npython3 - x 3<<< "$d" > /tmp/y\n'
         tail = p1.split("\n", 1)[1]
-        shapes = (
-            f"delay=$((1 << 2))\nif true; then\n  {tail}fi\n",
-            f"delay=$((1 << 2))\nwhile false; do\n  {tail}done\n",
-            f"delay=$((1 << 2))\nf() {{\n  {tail}}}\n",
-            f"delay=$((1 << 2))\n{{\n  {tail}}}\n",
+        outside = "descriptor here-string tail sits outside a top-level simple command"
+        blocked = (
+            (
+                f"delay=$((1 << 2))\nif true; then\n  {tail}fi\n",
+                "unparsable shell text naming a command near line 1",
+            ),
+            (
+                f"delay=$((1 << 2))\nwhile false; do\n  {tail}done\n",
+                "unparsable shell text naming a command near line 1",
+            ),
+            (
+                f"delay=$((1 << 2))\nf() {{\n  {tail}}}\n",
+                "unparsable shell text naming a command near line 2",
+            ),
+            (f"delay=$((1 << 2))\n{{\n  {tail}}}\n", outside),
+            (f"delay=$((1 << 2))\n(\n  {tail})\n", outside),
         )
         context = InspectionContext(
             cwd=self.root,
@@ -761,16 +772,13 @@ class RawConfigureShapeTest(RawConfigureGuardBase):
             classifier=lambda _words: None,
             script_dir=self.root,
         )
-        flips = 0
-        for body in shapes:
-            self.assertIsNotNone(scan_body(body, context, BodyBudget())[0])
+        for body, want in blocked:
+            self.assertEqual(scan_body(body, context, BodyBudget())[0], want)
         with unittest.mock.patch(
             "scripts.raw_configure_body.tail_line_is_toplevel", return_value=True
         ):
-            for body in shapes:
-                hit = scan_body(body, context, BodyBudget())[0]
-                if hit is None:
-                    flips += 1
-        if flips > 0:
-            self.assertGreater(flips, 0)
+            for body, _want in blocked[:-1]:
+                self.assertIsNotNone(scan_body(body, context, BodyBudget())[0])
+            subshell = blocked[-1][0]
+            self.assertIsNone(scan_body(subshell, context, BodyBudget())[0])
         self.assertIsNone(scan_body(p1, context, BodyBudget())[0])

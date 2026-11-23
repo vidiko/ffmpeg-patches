@@ -220,6 +220,7 @@ class CommitRangeTest(GitFixture):
 
     def test_remote_tracking_history_is_excluded(self) -> None:
         """Exclude already-published history even if it contains an invalid old sign-off."""
+        self.git("remote", "add", "origin", "https://example.invalid/origin.git")
         old = self.commit("published without signoff", signed=False)
         self.git("update-ref", "refs/remotes/origin/main", old)
         self.assertEqual(signoff.introduced_commits(old, ZERO, str(self.root)), [])
@@ -279,11 +280,136 @@ class CommitRangeTest(GitFixture):
                 unittest.mock.patch.object(
                     signoff,
                     "git",
-                    side_effect=[f"{sha}\n", "Signoff Fixture\n", "signoff@example.invalid\n", raw],
+                    side_effect=[
+                        "",
+                        f"{sha}\n",
+                        "Signoff Fixture\n",
+                        "signoff@example.invalid\n",
+                        raw,
+                    ],
                 ),
                 self.assertRaises(ValueError),
             ):
                 signoff.check_commits(sha, ZERO, str(self.root))
+
+
+class MessagePathStdinTest(GitFixture):
+    """Exercise the hook message-path channel that reads one path line from stdin."""
+
+    def _run_signoff_stdin(self, path_line: str, message: Path) -> subprocess.CompletedProcess[str]:
+        """Run signoff with --message-path-stdin and the given path line on stdin."""
+        return subprocess.run(  # nosec B603 - fixed Python argv, fixture paths, no shell.
+            [sys.executable, "-B", str(ROOT / "scripts/signoff.py"), "--message-path-stdin"],
+            input=path_line,
+            cwd=self.root,
+            env=self.env,
+            capture_output=True,
+            encoding="utf-8",
+            check=False,
+            timeout=30,
+        )
+
+    def test_message_path_stdin_signed_and_unsigned(self) -> None:
+        """Accept a signed message file path and refuse an unsigned one through stdin."""
+        message = self.root / "hook-message.txt"
+        message.write_text(f"Subject\n\n{TRAILER}\n", encoding="utf-8")
+        signed = self._run_signoff_stdin(str(message) + "\n", message)
+        self.assertEqual(signed.returncode, 0, signed.stderr)
+        message.write_text("Subject without trailer\n", encoding="utf-8")
+        refused = self._run_signoff_stdin(str(message) + "\n", message)
+        self.assertEqual(refused.returncode, 1, refused.stderr)
+        self.assertIn("no Signed-off-by", refused.stderr)
+
+    def test_message_path_stdin_fail_closed_inputs(self) -> None:
+        """Refuse empty stdin, two lines and a missing file with exit status two."""
+        message = self.root / "present.txt"
+        message.write_text(f"Subject\n\n{TRAILER}\n", encoding="utf-8")
+        for path_line, label in (
+            ("", "empty"),
+            (f"{message}\nsecond\n", "two lines"),
+            (str(self.root / "absent.txt") + "\n", "missing file"),
+        ):
+            with self.subTest(label=label):
+                result = self._run_signoff_stdin(path_line, message)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn("cannot decide", result.stderr)
+
+
+class ConsideredRemotesTest(GitFixture):
+    """Check introduced commits against per-remote tracking history."""
+
+    def test_fork_only_unsigned_refused_for_origin_scope(self) -> None:
+        """Refuse a fork-only unsigned commit when only origin is the considered remote."""
+        self.git("remote", "add", "origin", "https://example.invalid/origin.git")
+        self.git("remote", "add", "fork", "https://example.invalid/fork.git")
+        base = self.commit("origin base", signed=True)
+        self.git("update-ref", "refs/remotes/origin/main", base)
+        unsigned = self.commit("unsigned on fork", signed=False)
+        self.git("update-ref", "refs/remotes/fork/topic", unsigned)
+        signed_sha = self.commit("signed tip")
+        reason_origin = signoff.check_commits(
+            signed_sha, base, str(self.root), considered_remotes=["origin"]
+        )
+        self.assertIsNotNone(reason_origin)
+        self.assertIn(unsigned, reason_origin)
+        reason_all = signoff.check_commits(signed_sha, base, str(self.root))
+        self.assertIsNotNone(reason_all)
+        self.assertIn(unsigned, reason_all)
+
+    def test_unsigned_on_origin_tracking_passes(self) -> None:
+        """Pass when the unsigned commit is also reachable from origin tracking refs."""
+        self.git("remote", "add", "origin", "https://example.invalid/origin.git")
+        self.git("remote", "add", "fork", "https://example.invalid/fork.git")
+        unsigned = self.commit("unsigned", signed=False)
+        self.git("update-ref", "refs/remotes/fork/topic", unsigned)
+        self.git("update-ref", "refs/remotes/origin/main", unsigned)
+        signed_sha = self.commit("signed", signed=True)
+        self.assertIsNone(
+            signoff.check_commits(
+                signed_sha, unsigned, str(self.root), considered_remotes=["origin"]
+            )
+        )
+        self.assertIsNone(signoff.check_commits(signed_sha, unsigned, str(self.root)))
+
+    def test_stale_second_remote_causes_documented_false_refusal(self) -> None:
+        """Refuse when a stale remote lacks unsigned history that origin already published."""
+        self.git("remote", "add", "origin", "https://example.invalid/origin.git")
+        self.git("remote", "add", "stale", "https://example.invalid/stale.git")
+        base = self.commit("stale base", signed=True)
+        self.git("update-ref", "refs/remotes/stale/main", base)
+        old_unsigned = self.commit("old unsigned", signed=False)
+        self.git("update-ref", "refs/remotes/origin/main", old_unsigned)
+        signed_sha = self.commit("new signed")
+        self.assertIsNone(
+            signoff.check_commits(
+                signed_sha, old_unsigned, str(self.root), considered_remotes=["origin"]
+            )
+        )
+        refused = signoff.check_commits(signed_sha, ZERO, str(self.root))
+        self.assertIsNotNone(refused)
+        self.assertIn(old_unsigned, refused)
+
+    def test_no_remote_counts_every_commit_against_advertised_head(self) -> None:
+        """Treat every local commit as introduced with no remote and an unknown head."""
+        old_unsigned = self.commit("local unsigned", signed=False)
+        signed_sha = self.commit("local signed", signed=True)
+        refused = signoff.check_commits(signed_sha, ZERO, str(self.root))
+        self.assertIsNotNone(refused)
+        self.assertIn(old_unsigned, refused)
+        self.assertIsNone(signoff.check_commits(signed_sha, old_unsigned, str(self.root)))
+
+    def test_remote_count_above_cap_fails_closed(self) -> None:
+        """Refuse when the considered-remote list exceeds the fixed remote cap."""
+        cap = signoff.MAX_REMOTES
+        names = [f"r{index}" for index in range(cap + 1)]
+        for _index, name in enumerate(names):
+            self.git(
+                "config",
+                f"remote.{name}.url",
+                f"https://example.invalid/{name}.git",
+            )
+        with self.assertRaisesRegex(ValueError, str(cap)):
+            signoff.check_commits(self.commit(), ZERO, str(self.root), considered_remotes=names)
 
 
 if __name__ == "__main__":

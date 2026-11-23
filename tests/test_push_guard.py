@@ -1545,6 +1545,58 @@ class APIReaderTest(unittest.TestCase):
                 self.assertLessEqual(t, 20)
 
 
+class SignoffConsideredRemotesTest(unittest.TestCase):
+    """Record which remote scope push_guard passes to the sign-off reader."""
+
+    def test_named_remote_passes_destination_only(self) -> None:
+        """Pass only the push destination when it is a configured remote name."""
+        with (
+            unittest.mock.patch.object(
+                push_guard.signoff, "check_commits", return_value=None
+            ) as checker,
+            unittest.mock.patch.object(
+                push_guard.signoff, "configured_remotes", return_value=["origin", "fork"]
+            ),
+        ):
+            status, _, _ = guard(unittest.mock.Mock(return_value="[]"), update())
+        self.assertEqual(status, 0)
+        self.assertEqual(
+            checker.call_args.kwargs.get("considered_remotes"),
+            ["origin"],
+        )
+
+    def test_bare_url_passes_empty_considered_remote_list(self) -> None:
+        """Pass an empty considered-remote list for a bare URL not named in git remote."""
+        bare = "https://github.com/vidiko/ffmpeg-patches.git"
+        with (
+            unittest.mock.patch.object(
+                push_guard.signoff, "check_commits", return_value=None
+            ) as checker,
+            unittest.mock.patch.object(
+                push_guard.signoff, "configured_remotes", return_value=["origin"]
+            ),
+            unittest.mock.patch("sys.stdin", io.StringIO(update())),
+        ):
+            status, _, _ = capture_main(
+                lambda argv: push_guard.main(argv, unittest.mock.Mock(return_value="[]")),
+                bare,
+                bare,
+            )
+        self.assertEqual(status, 0)
+        self.assertEqual(checker.call_args.kwargs.get("considered_remotes"), [])
+
+    def test_from_config_passes_no_considered_remote_list(self) -> None:
+        """Omit the considered-remote keyword in --from-config mode."""
+        with unittest.mock.patch.object(
+            push_guard.signoff, "check_commits", return_value=None
+        ) as checker:
+            status, _, _ = config_guard(
+                unittest.mock.Mock(return_value="[]"), lambda: {"origin": [REMOTE]}, update()
+            )
+        self.assertEqual(status, 0)
+        self.assertNotIn("considered_remotes", checker.call_args.kwargs)
+
+
 class SignoffPushTest(GitFixture):
     """Refuse invalid introduced merges before reading remote pull requests."""
 

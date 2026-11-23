@@ -10,7 +10,9 @@ and review reads end by that deadline. Remote configuration queries share a
     push_guard.py REMOTE_NAME REMOTE_URL
         Read Git pre-push ref updates from stdin. For each branch update,
         validate introduced commits (including merges) against the configured
-        sign-off identity before any GitHub query, then query its pull requests
+        sign-off identity before any GitHub query. Named pushes check introduced
+        history against the destination remote only; bare URLs check only the
+        advertised head. Then query its pull requests
         through gh, newest first (fewer than 100). Non-GitHub remotes still
         require valid sign-offs; tags and
         branch deletions skip sign-off checks. These updates pass without
@@ -22,8 +24,10 @@ and review reads end by that deadline. Remote configuration queries share a
     push_guard.py --from-config
         Check each update against every GitHub repository in configured remote
         expanded push URLs because lefthook cannot safely pass the pushed remote.
-        A matching closed PR head in another repository also refuses the push
-        (fail closed); rename the branch to proceed.
+        Sign-off checks use every configured remote and only add refusals;
+        a stale second remote missing origin history may refuse until fetched or
+        removed. A matching closed PR head in another repository also refuses
+        the push (fail closed); rename the branch to proceed.
         Known gap: a push to a bare URL absent from all configured remotes
         is not seen in this mode.
         The guard reads PR state and reviews once before Git updates the ref,
@@ -487,13 +491,25 @@ def branch_update(line: str) -> tuple[str, str, str] | None:
     return remote_ref.removeprefix("refs/heads/"), local_sha, remote_sha
 
 
-def check_signoff_update(line: str) -> int:
+def signoff_considered_remotes(remote_name: str, cwd: str | None) -> list[str] | None:
+    """Return destination-only remotes, an empty list for an unconfigured name, or None."""
+    try:
+        names = signoff.configured_remotes(cwd)
+    except ValueError:
+        names = []
+    if remote_name in names:
+        return [remote_name]
+    return []
+
+
+def check_signoff_update(line: str, considered_remotes: list[str] | None | object = ...) -> int:
     """Check sign-offs once per branch update, independently of remote hosting."""
     update = branch_update(line)
     if update is None:
         return 0
     branch, local_sha, remote_sha = update
-    reason = signoff.check_commits(local_sha, remote_sha)
+    kwargs = {} if considered_remotes is ... else {"considered_remotes": considered_remotes}
+    reason = signoff.check_commits(local_sha, remote_sha, **kwargs)
     if reason:
         print(f"push_guard: refusing branch {branch}: {reason}; {signoff.FIX}", file=sys.stderr)
         return 1
@@ -600,6 +616,7 @@ def check_updates(
     reader: APIReader,
     clock: Callable[[], float] = time.monotonic,
     activity: ActivityReader = read_review_activity,
+    considered_remotes: list[str] | None | object = ...,
 ) -> int:
     """Check at most MAX_UPDATES ref updates, failing closed on input or API errors."""
     start = clock()
@@ -615,7 +632,7 @@ def check_updates(
                 return 0
             if index == MAX_UPDATES:
                 raise ValueError(f"more than {MAX_UPDATES} pre-push updates")
-            status = check_signoff_update(line)
+            status = check_signoff_update(line, considered_remotes)
             if status:
                 return status
             for repository_index in range(MAX_REPOSITORIES):
@@ -651,7 +668,12 @@ def main(
         return 2
     if not repositories:
         print("push_guard: non-GitHub remote; skipping pull request checks", file=sys.stderr)
-    return check_updates(repositories, reader, activity=activity_reader)
+    considered: list[str] | None | object = ...
+    if not args.from_config:
+        considered = signoff_considered_remotes(args.remote_name, None)
+    return check_updates(
+        repositories, reader, activity=activity_reader, considered_remotes=considered
+    )
 
 
 if __name__ == "__main__":

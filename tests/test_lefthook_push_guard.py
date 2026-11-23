@@ -27,6 +27,10 @@ from tests.test_signoff import GitFixture
 
 ROOT = Path(__file__).resolve().parents[1]
 SERIES_INSTALL_COMMAND = "python3 -m pip install --require-hashes -r requirements-dev.txt"
+COMMIT_MSG_SIGNOFF_RUN = (
+    "sh .config/lefthook/python.sh scripts/signoff.py --message-path-stdin "
+    "<<'SIGNOFF_HOOK_PATH '\n{1}\nSIGNOFF_HOOK_PATH"
+)
 
 
 def _series_steps(root: Path) -> list[dict]:
@@ -189,8 +193,7 @@ class LefthookPushGuardTest(unittest.TestCase):
                 "jobs": [
                     {
                         "name": "signoff",
-                        "run": "sh .config/lefthook/python.sh scripts/signoff.py "
-                        "--message-file '{1}'",
+                        "run": COMMIT_MSG_SIGNOFF_RUN,
                     }
                 ]
             },
@@ -674,10 +677,7 @@ class LefthookPushGuardTest(unittest.TestCase):
             for field in ("run", "args"):
                 with self.subTest(hook=hook, job=index, field=field):
                     if hook == "commit-msg" and field == "run":
-                        self.assertEqual(
-                            job.get(field),
-                            "sh .config/lefthook/python.sh scripts/signoff.py --message-file '{1}'",
-                        )
+                        self.assertEqual(job.get(field), COMMIT_MSG_SIGNOFF_RUN)
                     else:
                         self.assertNotRegex(str(job.get(field, "")), r"\{\d+\}")
 
@@ -800,6 +800,52 @@ class LefthookSignoffTest(GitFixture):
             self.skipTest("lefthook binary is not on PATH")
         self._run_merge_hook_signoff_checks(lefthook)
 
+    def test_merge_hook_apostrophe_and_space_in_git_dir(self) -> None:
+        """Pass and refuse merges when the message file path holds an apostrophe and a space."""
+        lefthook = shutil.which("lefthook")
+        if lefthook is None:
+            self.skipTest("lefthook binary is not on PATH")
+        git_dir = self._reinit_with_git_dir_named("git dir's space")
+        self.assertIn("'", git_dir)
+        self.assertIn(" ", git_dir)
+        merge_msg = self.git("rev-parse", "--git-path", "MERGE_MSG")
+        self.assertIn("'", merge_msg)
+        self.assertIn(" ", merge_msg)
+        self._run_merge_hook_signoff_checks(lefthook)
+
+    def test_merge_hook_command_substitution_in_git_dir_is_literal(self) -> None:
+        """Never run shell metacharacters embedded in the Git directory path."""
+        lefthook = shutil.which("lefthook")
+        if lefthook is None:
+            self.skipTest("lefthook binary is not on PATH")
+        marker = self.root / "shell-ran-marker"
+        name = f"git $(touch {marker})"
+        self._reinit_with_git_dir_named(name)
+        self._run_merge_hook_signoff_checks(lefthook)
+        self.assertFalse(marker.exists(), "shell interpreted the git directory path")
+
+    def _reinit_with_git_dir_named(self, directory_name: str) -> str:
+        """Point the fixture at a separate git directory with the given directory name."""
+        dot_git = self.root / ".git"
+        if dot_git.is_dir():
+            shutil.rmtree(dot_git)
+        elif dot_git.is_file():
+            dot_git.unlink()
+        spaced_owner = tempfile.TemporaryDirectory()
+        self.addCleanup(spaced_owner.cleanup)
+        git_dir = Path(spaced_owner.name) / directory_name
+        git_dir.mkdir(parents=True)
+        _run_fixture_command(
+            self.root,
+            self.env,
+            ["git", "init", "--separate-git-dir", str(git_dir), "-q", "-b", "main"],
+        )
+        self.git("config", "user.name", "Signoff Fixture")
+        self.git("config", "user.email", "signoff@example.invalid")
+        self.git("config", "commit.gpgsign", "false")
+        self.git("config", "core.hooksPath", str(self.root / "empty-hooks"))
+        return str(git_dir)
+
     def _reinit_with_spaced_git_dir(self) -> None:
         """Point the fixture at a separate git directory whose path contains a space."""
         dot_git = self.root / ".git"
@@ -851,10 +897,11 @@ class LefthookSignoffTest(GitFixture):
 
     def install_message_hook(self, lefthook: str) -> None:
         """Install only the production commit-msg job in a disposable fixture repository."""
-        config = yaml.safe_load((ROOT / "lefthook.yml").read_text(encoding="utf-8"))
-        (self.root / "lefthook.yml").write_text(
-            yaml.safe_dump({"commit-msg": config["commit-msg"]}), encoding="utf-8"
-        )
+        root_config = (ROOT / "lefthook.yml").read_text(encoding="utf-8")
+        start = root_config.index("commit-msg:")
+        end = root_config.index("\n\npost-commit:")
+        block = root_config[start:end]
+        (self.root / "lefthook.yml").write_text(block, encoding="utf-8")
         (self.root / "scripts").mkdir()
         shutil.copyfile(ROOT / "scripts/signoff.py", self.root / "scripts/signoff.py")
         # Test the job wiring; interpreter selection is outside this unit.

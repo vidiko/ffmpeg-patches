@@ -553,6 +553,39 @@ class AdmitCosignTest(unittest.TestCase):
         self.assertEqual(status, 1)
         self.assertIn("SHA256SUMS listing:", err)
 
+    def test_r5_sums_repeats_tarball_line(self) -> None:
+        """R5: a repeated tarball line violates the listing entry count."""
+        sums = self.fixture.assets / "SHA256SUMS"
+        tarball_line, sbom_line = sums.read_text(encoding="utf-8").splitlines()
+        sums.write_text(f"{tarball_line}\n{tarball_line}\n{sbom_line}\n", encoding="utf-8")
+        self._resign_sums(self.fixture)
+        status, _, err = admit(*self.fixture.admit_argv())
+        self.assertEqual(status, 1, err)
+        self.assertIn("expected 2 names", err)
+
+    def test_r5_sums_lists_tarball_name_twice(self) -> None:
+        """R5: two tarball entries trigger the duplicate-name refusal."""
+        sums = self.fixture.assets / "SHA256SUMS"
+        tarball_line, _ = sums.read_text(encoding="utf-8").splitlines()
+        sums.write_text(f"{tarball_line}\n{tarball_line}\n", encoding="utf-8")
+        self._resign_sums(self.fixture)
+        status, _, err = admit(*self.fixture.admit_argv())
+        self.assertEqual(status, 1, err)
+        self.assertIn("duplicate name", err)
+
+    def test_r5_sums_substitutes_sbom_name(self) -> None:
+        """R5: an existing substitute for the SBOM violates the listing name set."""
+        sums = self.fixture.assets / "SHA256SUMS"
+        tarball_line, _ = sums.read_text(encoding="utf-8").splitlines()
+        substitute = self.fixture.assets / "substitute.json"
+        substitute.write_bytes(b"{}\n")
+        digest = hashlib.sha256(substitute.read_bytes()).hexdigest()
+        sums.write_text(f"{tarball_line}\n{digest}  {substitute.name}\n", encoding="utf-8")
+        self._resign_sums(self.fixture)
+        status, _, err = admit(*self.fixture.admit_argv())
+        self.assertEqual(status, 1, err)
+        self.assertIn("SHA256SUMS listing: expected", err)
+
     def test_r6_wrong_series_commit_in_predicate(self) -> None:
         """R6: a wrong series commit in the predicate is refused at check f."""
         template = json.loads(PREDICATE_TEMPLATE.read_text(encoding="utf-8"))

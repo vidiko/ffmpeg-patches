@@ -17,6 +17,52 @@ from tests import revert_proof_helpers
 from tests.helpers import capture_main, run_git
 from tests.revert_proof_helpers import BASE_SOURCE, FIXED_SOURCE, RevertProofFixture
 
+_FILTER_CAPABLE = frozenset({"status", "reset", "apply", "checkout", "add", "stash", "diff"})
+
+
+def _git_plumbing_command(argv: list[str]) -> str | None:
+    """Return the first Git plumbing subcommand after global options in argv."""
+    skip_next = False
+    for index, token in enumerate(argv[1:], start=1):
+        if skip_next:
+            skip_next = False
+            continue
+        if token.startswith("-"):
+            if token in ("-c", "-C") and index + 1 < len(argv):
+                skip_next = True
+            continue
+        if token == "git":
+            continue
+        return token
+    return None
+
+
+def _filter_capable_git_command(argv: list[str]) -> bool:
+    """Report whether argv starts a Git command that may run clean, smudge or process filters."""
+    subcommand = _git_plumbing_command(argv)
+    if subcommand is None or subcommand == "diff-tree":
+        return False
+    if subcommand == "update-index":
+        return "--refresh" in argv
+    if subcommand == "read-tree" and "-i" in argv:
+        return True
+    return subcommand in _FILTER_CAPABLE
+
+
+def _git_call_pins_head(argv: list[str], head: str, *, attr_source: str | None = None) -> bool:
+    """Report whether argv or git_attr_source pins --attr-source=<head> on the command."""
+    if attr_source == head:
+        return True
+    marker = f"--attr-source={head}"
+    subcommand = _git_plumbing_command(argv)
+    if subcommand is None:
+        return False
+    try:
+        end = argv.index(subcommand)
+    except ValueError:
+        return False
+    return marker in argv[1:end]
+
 
 class RevertProofScratchTest(RevertProofFixture):
     """Check revert-proof scratch behavior using isolated Git fixtures."""
@@ -197,6 +243,131 @@ class RevertProofScratchTest(RevertProofFixture):
         self.assertEqual(len(applies), 1)
         argv = applies[0]
         self.assertIn(f"--attr-source={head}", argv[: argv.index("apply")])
+
+    def _pass_through_marker_filters(
+        self, marker_dir: Path, *, caller_disable: bool = True
+    ) -> None:
+        """Configure counter drivers that copy stdin to stdout and leave marker files."""
+        marker_dir.mkdir(exist_ok=True)
+        for kind in ("clean", "smudge"):
+            marker = marker_dir / kind
+            program = (
+                "import sys; from pathlib import Path; "
+                f"p = Path({str(marker)!r}); "
+                "sys.stdout.buffer.write(sys.stdin.buffer.read()); "
+                "p.write_bytes(b'1')"
+            )
+            command = f'{sys.executable} -c "{program}"'
+            run_git(self.tree, "config", f"filter.counter.{kind}", command, preserve_config=True)
+        if not caller_disable:
+            return
+        caller_override = self.root / "caller-no-counter.config"
+        caller_override.write_text(
+            '[filter "counter"]\n    clean =\n    smudge =\n', encoding="utf-8"
+        )
+        run_git(self.tree, "config", "extensions.worktreeConfig", "true", preserve_config=True)
+        run_git(
+            self.tree,
+            "config",
+            "--worktree",
+            f"includeIf.gitdir:{self.tree / '.git'}.path",
+            str(caller_override),
+            preserve_config=True,
+        )
+
+    def test_prepare_tree_pins_status_under_attribute_override(self) -> None:
+        """prepare_tree status pins HEAD when override filter drivers are active on the caller."""
+        self.write("fixture.txt", "fixture bytes\n")
+        marker_dir = self.root / "prepare-markers"
+        override, fix, _head = self._attribute_override("fixture.txt")
+        self._pass_through_marker_filters(marker_dir, caller_disable=False)
+        fixture = self.tree / "fixture.txt"
+        stale = fixture.stat().st_mtime - 3600
+        os.utime(fixture, (stale, stale))
+        for marker in (marker_dir / "clean", marker_dir / "smudge"):
+            marker.unlink(missing_ok=True)
+        with unittest.mock.patch.dict(os.environ, {"GIT_ATTR_SOURCE": override}):
+            revert_proof.prepare_tree(self.tree, fix)
+        self.assertFalse((marker_dir / "clean").exists())
+        self.assertFalse((marker_dir / "smudge").exists())
+
+    def _assert_override_runs_no_filter_markers(
+        self, source: str, override: str, fix: str, head: str, marker_dir: Path
+    ) -> None:
+        """Require a published record and no marker files under either attribute override."""
+        environment = {"GIT_ATTR_SOURCE": override} if source == "GIT_ATTR_SOURCE" else {}
+        command = [sys.executable, "-c", "pass"]
+        if source == "attr.tree":
+            run_git(self.tree, "config", "attr.tree", override, preserve_config=True)
+        else:
+            command[-1] = f"import os; assert os.environ['GIT_ATTR_SOURCE'] == {override!r}"
+        for marker in (marker_dir / "clean", marker_dir / "smudge"):
+            marker.unlink(missing_ok=True)
+        with unittest.mock.patch.dict(os.environ, environment):
+            rc, _, error = self.run_cli(fix, command)
+        if source == "attr.tree":
+            run_git(self.tree, "config", "--unset", "attr.tree", preserve_config=True)
+        self.assertEqual(rc, 0, error)
+        self.assertTrue(self.record_path.is_file())
+        self.assertFalse((marker_dir / "clean").exists())
+        self.assertFalse((marker_dir / "smudge").exists())
+
+    def test_pinned_status_ignores_override_filter_markers(self) -> None:
+        """Pinned status keeps override attribute trees from running filter marker drivers."""
+        self.write("fixture.txt", "fixture bytes\n")
+        marker_dir = self.root / "status-markers"
+        override, fix, head = self._attribute_override("fixture.txt")
+        self._pass_through_marker_filters(marker_dir)
+        for source in ("GIT_ATTR_SOURCE", "attr.tree"):
+            with self.subTest(source=source):
+                self._assert_override_runs_no_filter_markers(
+                    source, override, fix, head, marker_dir
+                )
+
+    def test_pinned_reverse_apply_ignores_override_filter_markers(self) -> None:
+        """Pinned reverse apply keeps override trees from running filter marker drivers."""
+        marker_dir = self.root / "apply-markers"
+        override, fix, head = self._attribute_override("libavfilter/vf_x.c")
+        self._pass_through_marker_filters(marker_dir)
+        for source in ("GIT_ATTR_SOURCE", "attr.tree"):
+            with self.subTest(source=source):
+                self._assert_override_runs_no_filter_markers(
+                    source, override, fix, head, marker_dir
+                )
+
+    def test_filter_capable_git_calls_pin_attribute_source(self) -> None:
+        """Every filter-capable Git call during a pinned measurement carries --attr-source=HEAD."""
+        self.write("fixture.txt", "fixture bytes\n")
+        marker_dir = self.root / "audit-markers"
+        override, fix, head = self._attribute_override("fixture.txt")
+        self._pass_through_marker_filters(marker_dir)
+        rows: list[tuple[str, str, str, str]] = []
+        with (
+            unittest.mock.patch.dict(os.environ, {"GIT_ATTR_SOURCE": override}),
+            unittest.mock.patch.object(upstream_lint, "_run", wraps=upstream_lint._run) as run,
+        ):
+            rc, _, error = self.run_cli(fix, [sys.executable, "-c", "pass"])
+        self.assertEqual(rc, 0, error)
+        for call in run.call_args_list:
+            argv = list(call.args[0])
+            if not argv or argv[0] != "git":
+                continue
+            cwd = call.args[1]
+            role = "caller" if cwd == self.tree else "scratch"
+            capable = _filter_capable_git_command(argv)
+            attr_source = call.kwargs.get("git_attr_source")
+            pinned = _git_call_pins_head(argv, head, attr_source=attr_source)
+            subcommand = _git_plumbing_command(argv) or "?"
+            rows.append((subcommand, role, "yes" if capable else "no", "yes" if pinned else "no"))
+            if capable:
+                self.assertTrue(pinned, argv)
+        audit_path = os.environ.get("REVERT_PROOF_AUDIT_EV")
+        if audit_path:
+            lines = [
+                "subcommand\ttree role\tfilter-capable\tpinned",
+                *("\t".join(row) for row in rows),
+            ]
+            Path(audit_path).write_text("\n".join(lines) + "\n", encoding="utf-8")
 
     def test_hidden_attribute_edit_cannot_hide_head_filter(self) -> None:
         """An ignored working-tree attribute edit cannot hide an active HEAD checkout filter."""

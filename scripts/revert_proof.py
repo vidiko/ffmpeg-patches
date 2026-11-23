@@ -128,9 +128,16 @@ def git_out(tree: Path, *args: str) -> str:
     return git_result(tree, *args).stdout
 
 
-def tracked_status(tree: Path) -> str:
-    """Read tracked porcelain status without refreshing the caller index."""
-    return git_out(tree, "--no-optional-locks", "status", "--porcelain", "--untracked-files=no")
+def tracked_status(tree: Path, attr_source: str) -> str:
+    """Read tracked porcelain status pinning the HEAD attribute source."""
+    return git_out(
+        tree,
+        f"--attr-source={attr_source}",
+        "--no-optional-locks",
+        "status",
+        "--porcelain",
+        "--untracked-files=no",
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -281,7 +288,7 @@ def prepare_tree(tree: Path, raw_commit: str) -> tuple[str, str, str, list[str],
     head = git_out(tree, "rev-parse", "--verify", f"{head_ref}^{{commit}}").strip()
     head_tree = git_out(tree, "rev-parse", "--verify", f"{head}^{{tree}}").strip()
     checked = _check_head_checkout_filters(tree, head)
-    if tracked_status(tree):
+    if tracked_status(tree, head):
         raise _PreflightError(
             f"dirty tree: uncommitted changes to tracked files that git status shows in {tree}; "
             "the proof is about the commit, not uncommitted work"
@@ -357,7 +364,7 @@ def verify_head_run(scratch: Path, rc_head: int | str, head: str) -> int:
         raise _HeadTestError(f"test fails at head (rc={rc_head}) in clean checkout {scratch}")
     if git_out(scratch, "rev-parse", "--verify", "HEAD^{commit}").strip() != head:
         raise _HeadTestError(f"test moved scratch HEAD in {scratch}")
-    if tracked_status(scratch):
+    if tracked_status(scratch, head):
         raise _HeadTestError(f"test modified tracked files at head in {scratch}")
     return 0
 
@@ -552,7 +559,7 @@ def measure_reverted(
     if applied.returncode != 0 or applied.timed_out:
         raise _ReverseApplyError(f"reverse apply failed for {commit}: {applied.stdout.strip()}")
     # Pinned attribute reads need an initialized index. Leave the reverted patch unstaged.
-    git_out(config.tree, "read-tree", "-i", "--reset", head)
+    git_out(config.tree, f"--attr-source={head}", "read-tree", "-i", "--reset", head)
     result = run_test_command(config.command, config.tree, config.timeout)
     if result == "launch-error":
         raise _HeadTestError("test launch-error on reverted checkout (no verdict)")

@@ -50,9 +50,13 @@ The revert-proof step requires one measured scripts/revert_proof.py JSON record
 Root commits imported through unrelated history are included against the empty
 tree; fix wording and source-path classification apply as for other commits.
 Stored parent headers are compared with Git's visible parents before classification.
-Shallow, grafted or replaced ancestry that hides parents gets an incomplete-history
-finding instead of a snapshot diff; fetch missing history or restore the original
-ancestry. A genuine zero-parent root keeps the empty-tree comparison.
+The regression-test step classifies each fix commit's changed paths against its stored
+parent when that parent object is available. A shallow clone that lacks the parent
+object fails because those paths cannot be classified; fetch the parent with
+``git fetch --deepen=<commits>`` or ``git fetch --unshallow`` so the step can classify
+the commit. Shallow, grafted or replaced ancestry that hides parents gets an
+incomplete-history finding instead of a snapshot diff; fetch missing history or restore
+the original ancestry. A genuine zero-parent root keeps the empty-tree comparison.
 The shared runner keeps successful Git stdout separate from stderr so advice
 cannot become parsed data; failed and timed-out calls retain stderr diagnostics.
 scripts/revert_proof.py runs the same trusted test command at HEAD and after
@@ -1705,6 +1709,16 @@ def _stored_parents(raw: str) -> list[str]:
     return re.findall(r"^parent ([0-9a-f]+)$", raw.partition("\n\n")[0], re.MULTILINE)
 
 
+def _missing_parent_classification_error(commit: str, parent: str) -> str:
+    """Build a regression stop when a stored parent object is absent from the clone."""
+    return (
+        f"{commit}: history is incomplete; parent {parent} is missing; "
+        "changed paths cannot be classified without that parent; "
+        "fetch missing parents with git fetch --unshallow "
+        "or git fetch --deepen=<commits>, or restore parents hidden by grafts/replace refs"
+    )
+
+
 def _regression_commit_paths(tree: Path, commit: str, parents: str) -> list[str]:
     """Classify apparent roots against the stored parent when its object is available."""
     if not parents.strip():
@@ -1720,6 +1734,7 @@ def _regression_commit_paths(tree: Path, commit: str, parents: str) -> list[str]
                 raise RuntimeError(f"cannot inspect parent {parent}: {check.stdout.strip()}")
             if check.stdout == "commit\n":
                 return _commit_paths(tree, commit, parent=parent)
+            raise RuntimeError(_missing_parent_classification_error(commit, parent))
     return _commit_paths(tree, commit)
 
 

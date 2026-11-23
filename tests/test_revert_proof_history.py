@@ -9,6 +9,7 @@ import json
 import os
 import sys
 import unittest.mock
+from pathlib import Path
 
 from scripts import revert_proof, upstream_lint
 from tests.helpers import capture_main, run_git
@@ -214,6 +215,61 @@ class RevertProofHistoryTest(RevertProofFixture):
         self.assertEqual(proof.rc, 1, proof.output)
         self.assertIn(commit, proof.output)
         self.assertIn("history is incomplete", proof.output)
+
+    def _assert_shallow_parent_classification_stop(
+        self, clone: Path, base: str, commit: str, waiver: str = ""
+    ) -> None:
+        """Require a missing-parent stop that names the commit, parent and classification."""
+        parent = run_git(self.tree, "rev-parse", f"{commit}^", preserve_config=True)
+        head = run_git(clone, "rev-parse", "HEAD", preserve_config=True)
+        step = upstream_lint._regression_test(clone, base, head, waiver)
+        self.assertEqual(step.rc, 1, step.output)
+        self.assertIn(commit, step.output)
+        self.assertIn(parent, step.output)
+        self.assertIn("history is incomplete", step.output)
+        self.assertIn("cannot be classified", step.output)
+        self.assertIn("git fetch --unshallow", step.output)
+
+    def test_shallow_missing_parent_docs_fix_reports_classification_stop(self) -> None:
+        """A shallow docs-only fix stops when the stored parent object is absent from the clone."""
+        clone = self.root / "shallow"
+        base, commit = clone_shallow_side_fix(
+            self.tree, clone, "doc/manual.txt", "doc: fix wording"
+        )
+        self._assert_shallow_parent_classification_stop(clone, base, commit)
+        rc, output, error = self.lint_cli(clone, base)
+        self.assertEqual(rc, 1, output + error)
+        self.assertIn("step: regression-test rc: 1", output)
+        self.assertIn("step: revert-proof rc: 1", output)
+        self.assertEqual(error, "")
+
+    def test_shallow_missing_parent_docs_waiver_keeps_classification_stop(self) -> None:
+        """A docs-only waiver cannot turn a missing-parent classification stop into success."""
+        clone = self.root / "shallow"
+        base, commit = clone_shallow_side_fix(
+            self.tree, clone, "doc/manual.txt", "doc: fix wording"
+        )
+        self._assert_shallow_parent_classification_stop(clone, base, commit, "docs only")
+
+    def test_shallow_missing_parent_after_unshallow_classifies_docs_fix(self) -> None:
+        """Fetching the parent lets regression-test classify a docs-only fix against it."""
+        clone = self.root / "shallow"
+        base, commit = clone_shallow_side_fix(
+            self.tree, clone, "doc/manual.txt", "doc: fix wording"
+        )
+        run_git(clone, "fetch", "-q", "--unshallow", preserve_config=True)
+        head = run_git(clone, "rev-parse", "HEAD", preserve_config=True)
+        step = upstream_lint._regression_test(clone, base, head, "")
+        self.assertEqual(step.rc, 0, step.output)
+        self.assertIn("0 fix commit(s)", step.output)
+
+    def test_shallow_missing_parent_source_fix_reports_classification_stop(self) -> None:
+        """A shallow source fix stops with the missing-parent classification, not a root diff."""
+        clone = self.root / "shallow"
+        base, commit = clone_shallow_side_fix(
+            self.tree, clone, "libavfilter/vf_x.c", "avfilter/vf_x: fix value"
+        )
+        self._assert_shallow_parent_classification_stop(clone, base, commit)
 
     def test_shallow_source_fix_cli_reports_regression_failure(self) -> None:
         """A hidden source fix reports a regression-test finding instead of raising."""

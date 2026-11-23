@@ -491,6 +491,61 @@ DOC_MODE_FOO_DUAL_OMIT = (
     "Other knob.\n"
     "@end table\n"
 )
+INTERPLAY_ALIAS_MUX_STRUCT = (
+    "#define OFFSET(x) offsetof(MuxContext, x)\n"
+    "typedef struct MuxContext {\n"
+    "    int foo;\n"
+    "    int mode;\n"
+    "} MuxContext;\n"
+)
+INTERPLAY_ALIAS_W_TABLE = (
+    "static const AVOption w_options[] = {\n"
+    '    { "foo", "foo", OFFSET(foo), 0 },\n'
+    '    { "mode", "mode", OFFSET(mode), 0 },\n'
+    '    { "mode_alias", "alias", OFFSET(mode), 0 },\n'
+    "};\n"
+)
+INTERPLAY_ALIAS_N_TABLE = (
+    'static const AVOption n_options[] = {\n    { "mode", "mode", OFFSET(mode), 0 },\n};\n'
+)
+INTERPLAY_ALIAS_WN_W_FIRST = (
+    INTERPLAY_ALIAS_MUX_STRUCT + INTERPLAY_ALIAS_W_TABLE + INTERPLAY_ALIAS_N_TABLE
+)
+INTERPLAY_ALIAS_WN_N_FIRST = (
+    INTERPLAY_ALIAS_MUX_STRUCT + INTERPLAY_ALIAS_N_TABLE + INTERPLAY_ALIAS_W_TABLE
+)
+INTERPLAY_ALIAS_P_ROWS = (
+    "static const AVOption p_options[] = {\n"
+    '    { "foo", "foo", OFFSET(foo), 0 },\n'
+    '    { "mode", "mode", OFFSET(mode), 0 },\n'
+    "};\n"
+)
+INTERPLAY_ALIAS_Q_TABLE = (
+    "static const AVOption q_options[] = {\n"
+    '    { "mode", "mode", OFFSET(mode), 0 },\n'
+    '    { "m", "short", OFFSET(mode), 0 },\n'
+    "};\n"
+)
+INTERPLAY_ALIAS_PQ_P_FIRST = (
+    INTERPLAY_ALIAS_MUX_STRUCT + INTERPLAY_ALIAS_P_ROWS + INTERPLAY_ALIAS_Q_TABLE
+)
+INTERPLAY_ALIAS_PQ_Q_FIRST = (
+    INTERPLAY_ALIAS_MUX_STRUCT + INTERPLAY_ALIAS_Q_TABLE + INTERPLAY_ALIAS_P_ROWS
+)
+DOC_MODE_FOO_NAMES_M = (
+    "@table @option\n"
+    "@item foo\n"
+    "Enable the foo flag.\n"
+    "Coupled with m selection.\n"
+    "@item mode\n"
+    "Select mode.\n"
+    "@item other\n"
+    "Other knob.\n"
+    "@end table\n"
+)
+DOC_MODE_INTERPLAY_BASE = (
+    "@table @option\n@item foo\nEnable the foo flag.\n@item mode\nSelect mode.\n@end table\n"
+)
 DASHENC_IGNORE_TEST_SPACED = "    if (!c-> ignore_io_errors && ret >= 0) { ret = 0; }\n"
 DASHENC_T1_SPACED_SOURCE = (
     DASHENC_OPTIONS
@@ -2327,6 +2382,21 @@ class DocTermTest(unittest.TestCase):
         self.assertTrue(added)
         self.assertEqual(upstream_lint._interplay_pairs(code_lines, added, tables), [])
 
+    def test_neighbour_alias_group_for_pair_table_order_independent(self) -> None:
+        """Pair neighbour groups ignore table order and unrelated tables."""
+        want_wn = frozenset({"mode", "mode_alias"})
+        want_pq = frozenset({"mode"})
+        for label, source, expect in (
+            ("wn_w_first", INTERPLAY_ALIAS_WN_W_FIRST, want_wn),
+            ("wn_n_first", INTERPLAY_ALIAS_WN_N_FIRST, want_wn),
+            ("pq_p_first", INTERPLAY_ALIAS_PQ_P_FIRST, want_pq),
+            ("pq_q_first", INTERPLAY_ALIAS_PQ_Q_FIRST, want_pq),
+        ):
+            with self.subTest(order=label):
+                tables = upstream_lint.avoption_tables(source)
+                group = upstream_lint._neighbour_alias_group_for_pair(tables, "foo", "mode")
+                self.assertEqual(group, expect)
+
 
 WRAP_TEXT = (
     "@section libsvtav1\n"
@@ -3758,6 +3828,66 @@ class PipelineTest(FixtureTest):
         rc, output = self.check()
         self.assertEqual(rc, 1, output)
         self.assertIn("step: doc-terms rc: 1", output)
+
+    def test_doc_terms_option_interplay_two_table_alias_w_n_w_first_passes(self) -> None:
+        """Foo naming mode_alias passes when the pairing table lists mode_alias near mode."""
+        src = INTERPLAY_ALIAS_WN_W_FIRST + MUX_WRITE_MODE
+        self.write("libavformat/dashenc.c", src)
+        self.write("doc/muxers.texi", DOC_MODE_INTERPLAY_BASE)
+        self.commit("libavformat/dashenc: interplay w then n tables")
+        self.base = self.git("rev-parse", "HEAD").strip()
+        self.write("libavformat/dashenc.c", INTERPLAY_ALIAS_WN_W_FIRST + MUX_WRITE_MODE_FOO)
+        self.write("doc/muxers.texi", DOC_MODE_FOO_NAMES_ALIAS)
+        self.commit("libavformat/dashenc: foo names mode_alias")
+        rc, output = self.check()
+        self.assertEqual(rc, 0, output)
+        self.assertIn("step: doc-terms rc: 0", output)
+        self.assertNotIn("option interplay:", output)
+
+    def test_doc_terms_option_interplay_two_table_alias_w_n_n_first_passes(self) -> None:
+        """Table order cannot shrink the neighbour alias group for foo near mode pairs."""
+        src = INTERPLAY_ALIAS_WN_N_FIRST + MUX_WRITE_MODE
+        self.write("libavformat/dashenc.c", src)
+        self.write("doc/muxers.texi", DOC_MODE_INTERPLAY_BASE)
+        self.commit("libavformat/dashenc: interplay n then w tables")
+        self.base = self.git("rev-parse", "HEAD").strip()
+        self.write("libavformat/dashenc.c", INTERPLAY_ALIAS_WN_N_FIRST + MUX_WRITE_MODE_FOO)
+        self.write("doc/muxers.texi", DOC_MODE_FOO_NAMES_ALIAS)
+        self.commit("libavformat/dashenc: foo names mode_alias rev")
+        rc, output = self.check()
+        self.assertEqual(rc, 0, output)
+        self.assertIn("step: doc-terms rc: 0", output)
+        self.assertNotIn("option interplay:", output)
+
+    def test_doc_terms_option_interplay_two_table_alias_p_q_p_first_fails(self) -> None:
+        """Foo naming m fails when the pairing table lists only mode near foo."""
+        src = INTERPLAY_ALIAS_PQ_P_FIRST + MUX_WRITE_MODE
+        self.write("libavformat/dashenc.c", src)
+        self.write("doc/muxers.texi", DOC_MODE_INTERPLAY_BASE)
+        self.commit("libavformat/dashenc: interplay p then q tables")
+        self.base = self.git("rev-parse", "HEAD").strip()
+        self.write("libavformat/dashenc.c", INTERPLAY_ALIAS_PQ_P_FIRST + MUX_WRITE_MODE_FOO)
+        self.write("doc/muxers.texi", DOC_MODE_FOO_NAMES_M)
+        self.commit("libavformat/dashenc: foo names m")
+        rc, output = self.check()
+        self.assertEqual(rc, 1, output)
+        self.assertIn("step: doc-terms rc: 1", output)
+        self.assertIn("foo near mode", output)
+
+    def test_doc_terms_option_interplay_two_table_alias_p_q_q_first_fails(self) -> None:
+        """Table order cannot widen the neighbour alias group for foo near mode pairs."""
+        src = INTERPLAY_ALIAS_PQ_Q_FIRST + MUX_WRITE_MODE
+        self.write("libavformat/dashenc.c", src)
+        self.write("doc/muxers.texi", DOC_MODE_INTERPLAY_BASE)
+        self.commit("libavformat/dashenc: interplay q then p tables")
+        self.base = self.git("rev-parse", "HEAD").strip()
+        self.write("libavformat/dashenc.c", INTERPLAY_ALIAS_PQ_Q_FIRST + MUX_WRITE_MODE_FOO)
+        self.write("doc/muxers.texi", DOC_MODE_FOO_NAMES_M)
+        self.commit("libavformat/dashenc: foo names m rev")
+        rc, output = self.check()
+        self.assertEqual(rc, 1, output)
+        self.assertIn("step: doc-terms rc: 1", output)
+        self.assertIn("foo near mode", output)
 
     def _write_dashenc_fixture(self) -> None:
         """Write the dashenc and muxers fixture files shared by option-interplay tests."""

@@ -98,7 +98,8 @@ for that option gains text but never names any public option name that shares
 the neighbour field (underscore in the name may match a hyphen or space).
 Commented-out AVOption table headers and entry rows are ignored, whitespace
 after -> is allowed in option tests, and naming any alias of the neighbour
-field satisfies the entry. Entry scope is the nearest preceding
+field in a table that holds both options on different fields satisfies the entry.
+Entry scope is the nearest preceding
 @item or @itemx through the line before the next @item, @itemx or @end; the full
 entry text at head is used, not added lines alone. Only structure member access
 with -> is treated as an option test, and inside an if or while condition only
@@ -1997,17 +1998,25 @@ def _interplay_pairs_for_line(
     return raw
 
 
-def _neighbour_alias_groups(
+def _neighbour_alias_group_for_pair(
     tables: list[dict[str, list[str]]],
-) -> dict[str, frozenset[str]]:
-    """Map each option name to every alias sharing its OFFSET field in one table."""
-    groups: dict[str, frozenset[str]] = {}
+    option_a: str,
+    option_b: str,
+) -> frozenset[str]:
+    """Union neighbour-field aliases from tables holding both options on different fields."""
+    group: set[str] = {option_b}
     for table in tables:
-        for names in table.values():
-            group = frozenset(names)
-            for name in names:
-                groups[name] = group
-    return groups
+        field_a = None
+        field_b = None
+        for option_field, names in table.items():
+            if option_a in names:
+                field_a = option_field
+            if option_b in names:
+                field_b = option_field
+        if field_a is None or field_b is None or field_a == field_b:
+            continue
+        group.update(table.get(field_b, ()))
+    return frozenset(group)
 
 
 def _dedupe_interplay_pairs(
@@ -2060,13 +2069,12 @@ def _interplay_findings_one_path(
         return []
     raw_lines = raw.split("\n")
     code_lines = _code_lines(raw)
-    alias_groups = _neighbour_alias_groups(tables)
     findings: list[str] = []
     for number, option_a, option_b in _interplay_pairs(code_lines, added, tables):
         entry_texts = doc_entries.get(option_a)
         if entry_texts is None:
             continue
-        group = alias_groups.get(option_b, frozenset({option_b}))
+        group = _neighbour_alias_group_for_pair(tables, option_a, option_b)
         if all(any(option_named_in_text(alias, text) for alias in group) for text in entry_texts):
             continue
         snippet = raw_lines[number - 1].strip()

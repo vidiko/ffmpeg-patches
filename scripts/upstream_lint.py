@@ -94,8 +94,11 @@ preprocessor lines blanked, so a comment that names the behaviour does not
 count, and neither does a macro that tests the flag. It also fails when an added
 line tests one AVOption field within three head lines of a test of a neighbour
 field from the same AVOption table in that file, and the changed Texinfo entry
-for that option gains text but never names the neighbour option (underscore in
-the name may match a hyphen or space). Entry scope is the nearest preceding
+for that option gains text but never names any public option name that shares
+the neighbour field (underscore in the name may match a hyphen or space).
+Commented-out AVOption table headers and entry rows are ignored, whitespace
+after -> is allowed in option tests, and naming any alias of the neighbour
+field satisfies the entry. Entry scope is the nearest preceding
 @item or @itemx through the line before the next @item, @itemx or @end; the full
 entry text at head is used, not added lines alone. Only structure member access
 with -> is treated as an option test, and inside an if or while condition only
@@ -1784,6 +1787,18 @@ OUTSIDE_TEST_MARKERS = ("&&", "||", "?")
 SpanList = tuple[tuple[int, int], ...] | list[tuple[int, int]]
 
 
+def _avoption_parse_source(raw: str) -> str:
+    """Return source with C comments blanked for AVOption table parsing."""
+
+    def blank_comment(match: re.Match[str]) -> str:
+        piece = match[0]
+        if piece.startswith("/*") or piece.startswith("//"):
+            return re.sub(r"[^\n]", " ", piece)
+        return piece
+
+    return C_NONCODE.sub(blank_comment, raw)
+
+
 def _avoption_entries_map(chunk: str) -> dict[str, list[str]]:
     """Map each AVOption OFFSET field in one source slice to its option names."""
     mapping: dict[str, list[str]] = {}
@@ -1799,17 +1814,18 @@ def _avoption_entries_map(chunk: str) -> dict[str, list[str]]:
 
 def avoption_tables(raw: str) -> list[dict[str, list[str]]]:
     """Return one field-to-option-names map per AVOption table in source order."""
-    headers = list(AVOPTION_TABLE_HEAD.finditer(raw))
+    source = _avoption_parse_source(raw)
+    headers = list(AVOPTION_TABLE_HEAD.finditer(source))
     if not headers:
-        only = _avoption_entries_map(raw)
+        only = _avoption_entries_map(source)
         return [only] if only else []
     tables: list[dict[str, list[str]]] = []
-    leading = _avoption_entries_map(raw[: headers[0].start()])
+    leading = _avoption_entries_map(source[: headers[0].start()])
     if leading:
         tables.append(leading)
     for index, header in enumerate(headers):
-        end = headers[index + 1].start() if index + 1 < len(headers) else len(raw)
-        tables.append(_avoption_entries_map(raw[header.end() : end]))
+        end = headers[index + 1].start() if index + 1 < len(headers) else len(source)
+        tables.append(_avoption_entries_map(source[header.end() : end]))
     return tables
 
 
@@ -1885,7 +1901,7 @@ def _option_fields_tested(
         return frozenset()
     found: set[str] = set()
     for option_field in fields:
-        pattern = rf"->{re.escape(option_field)}(?!\w)"
+        pattern = rf"->\s*{re.escape(option_field)}(?!\w)"
         if any(re.search(pattern, part) for part in targets):
             found.add(option_field)
     return frozenset(found)
@@ -1981,6 +1997,19 @@ def _interplay_pairs_for_line(
     return raw
 
 
+def _neighbour_alias_groups(
+    tables: list[dict[str, list[str]]],
+) -> dict[str, frozenset[str]]:
+    """Map each option name to every alias sharing its OFFSET field in one table."""
+    groups: dict[str, frozenset[str]] = {}
+    for table in tables:
+        for names in table.values():
+            group = frozenset(names)
+            for name in names:
+                groups[name] = group
+    return groups
+
+
 def _dedupe_interplay_pairs(
     raw: list[tuple[int, str, str]],
 ) -> list[tuple[int, str, str]]:
@@ -2031,12 +2060,14 @@ def _interplay_findings_one_path(
         return []
     raw_lines = raw.split("\n")
     code_lines = _code_lines(raw)
+    alias_groups = _neighbour_alias_groups(tables)
     findings: list[str] = []
     for number, option_a, option_b in _interplay_pairs(code_lines, added, tables):
         entry_texts = doc_entries.get(option_a)
         if entry_texts is None:
             continue
-        if all(option_named_in_text(option_b, text) for text in entry_texts):
+        group = alias_groups.get(option_b, frozenset({option_b}))
+        if all(any(option_named_in_text(alias, text) for alias in group) for text in entry_texts):
             continue
         snippet = raw_lines[number - 1].strip()
         findings.append(

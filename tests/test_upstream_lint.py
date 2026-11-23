@@ -344,6 +344,161 @@ DOC_FOO_BAR_T1 = (
     "Enable bar mode.\n"
     "@end table\n"
 )
+AVOPTION_COMMENT_BAR_BLOCK = (
+    "#define OFFSET(x) offsetof(Ctx, x)\n"
+    "typedef struct Ctx { int foo, bar; } Ctx;\n"
+    "static const AVOption options[] = {\n"
+    '    { "foo", "help", OFFSET(foo), 0 },\n'
+    '    /* { "bar", "old", OFFSET(bar), 0 }, */\n'
+    "};\n"
+)
+AVOPTION_COMMENT_BAR_LINE = (
+    "#define OFFSET(x) offsetof(Ctx, x)\n"
+    "typedef struct Ctx { int foo, bar; } Ctx;\n"
+    "static const AVOption options[] = {\n"
+    '    { "foo", "help", OFFSET(foo), 0 },\n'
+    '    // { "bar", "old", OFFSET(bar), 0 },\n'
+    "};\n"
+)
+AVOPTION_HELP_LITERALS = (
+    "#define OFFSET(x) offsetof(Ctx, x)\n"
+    "typedef struct Ctx { int a_field, b_field; } Ctx;\n"
+    "static const AVOption options[] = {\n"
+    '    { "a", "http://example.invalid/doc", OFFSET(a_field), 0 },\n'
+    '    { "b", "/* not a comment */", OFFSET(b_field), 0 },\n'
+    "};\n"
+)
+AVOPTION_COMMENTED_HEADER_MID = (
+    "#define OFFSET(x) offsetof(Ctx, x)\n"
+    "typedef struct Ctx { int foo, baz; } Ctx;\n"
+    "static const AVOption options[] = {\n"
+    '    { "foo", "help", OFFSET(foo), 0 },\n'
+    "    /* static const AVOption old_options[] = { */\n"
+    '    { "baz", "help", OFFSET(baz), 0 },\n'
+    "};\n"
+)
+ONE_TABLE_COMMENT_BAR = (
+    "#define OFFSET(x) offsetof(MuxContext, x)\n"
+    "typedef struct MuxContext {\n"
+    "    int foo;\n"
+    "    int bar;\n"
+    "} MuxContext;\n"
+    "static const AVOption a_options[] = {\n"
+    '    { "foo", "foo", OFFSET(foo), 0 },\n'
+    '    /* { "bar", "bar", OFFSET(bar), 0 }, */\n'
+    "};\n"
+)
+MODE_ALIAS_OPTIONS = (
+    "#define OFFSET(x) offsetof(MuxContext, x)\n"
+    "typedef struct MuxContext {\n"
+    "    int foo;\n"
+    "    int mode;\n"
+    "    int other;\n"
+    "} MuxContext;\n"
+    "static const AVOption options[] = {\n"
+    '    { "foo", "foo", OFFSET(foo), 0 },\n'
+    '    { "mode", "mode", OFFSET(mode), 0 },\n'
+    '    { "mode_alias", "alias", OFFSET(mode), 0 },\n'
+    '    { "other", "other", OFFSET(other), 0 },\n'
+    "};\n"
+)
+MUX_WRITE_MODE = (
+    "int mux_write(MuxContext *c)\n{\n"
+    "    if (c->mode) {\n        return 2;\n    }\n    return 0;\n}\n"
+)
+MUX_WRITE_MODE_FOO = (
+    "int mux_write(MuxContext *c)\n{\n"
+    "    if (c->foo) {\n        return 1;\n    }\n"
+    "    if (c->mode) {\n        return 2;\n    }\n    return 0;\n}\n"
+)
+DOC_MODE_BASE = (
+    "@table @option\n"
+    "@item foo\n"
+    "Enable the foo flag.\n"
+    "@item mode\n"
+    "Select mode.\n"
+    "@item mode_alias\n"
+    "Alias for mode.\n"
+    "@item other\n"
+    "Other knob.\n"
+    "@end table\n"
+)
+DOC_MODE_FOO_NAMES_MODE = (
+    "@table @option\n"
+    "@item foo\n"
+    "Enable the foo flag.\n"
+    "Coupled with mode selection.\n"
+    "@item mode\n"
+    "Select mode.\n"
+    "@item mode_alias\n"
+    "Alias for mode.\n"
+    "@item other\n"
+    "Other knob.\n"
+    "@end table\n"
+)
+DOC_MODE_FOO_NAMES_ALIAS = (
+    "@table @option\n"
+    "@item foo\n"
+    "Enable the foo flag.\n"
+    "Coupled with mode_alias naming.\n"
+    "@item mode\n"
+    "Select mode.\n"
+    "@item mode_alias\n"
+    "Alias for mode.\n"
+    "@item other\n"
+    "Other knob.\n"
+    "@end table\n"
+)
+DOC_MODE_FOO_NAMES_OTHER = (
+    "@table @option\n"
+    "@item foo\n"
+    "Enable the foo flag.\n"
+    "Coupled with the other knob.\n"
+    "@item mode\n"
+    "Select mode.\n"
+    "@item mode_alias\n"
+    "Alias for mode.\n"
+    "@item other\n"
+    "Other knob.\n"
+    "@end table\n"
+)
+DOC_MODE_FOO_OMIT = (
+    "@table @option\n"
+    "@item foo\n"
+    "Enable the foo flag.\n"
+    "Skip extra header packets.\n"
+    "@item mode\n"
+    "Select mode.\n"
+    "@item mode_alias\n"
+    "Alias for mode.\n"
+    "@item other\n"
+    "Other knob.\n"
+    "@end table\n"
+)
+DOC_MODE_FOO_DUAL_OMIT = (
+    "@table @option\n"
+    "@item foo\n"
+    "Enable the foo flag.\n"
+    "Coupled with mode selection.\n"
+    "@item foo\n"
+    "Enable the foo flag.\n"
+    "Skip extra header packets.\n"
+    "@item mode\n"
+    "Select mode.\n"
+    "@item mode_alias\n"
+    "Alias for mode.\n"
+    "@item other\n"
+    "Other knob.\n"
+    "@end table\n"
+)
+DASHENC_IGNORE_TEST_SPACED = "    if (!c-> ignore_io_errors && ret >= 0) { ret = 0; }\n"
+DASHENC_T1_SPACED_SOURCE = (
+    DASHENC_OPTIONS
+    + DASHENC_WRITE_HEAD
+    + DASHENC_IGNORE_TEST_SPACED
+    + DASHENC_GAP2
+    + DASHENC_WRITE_TAIL
+)
 
 
 class RulesTest(unittest.TestCase):
@@ -1905,6 +2060,31 @@ class DocTermTest(unittest.TestCase):
         self.assertNotIn("bar", tables[0])
         self.assertNotIn("foo", tables[1])
 
+    def test_avoption_field_map_ignores_block_commented_row(self) -> None:
+        """A block-commented AVOption row does not register its quoted option name."""
+        mapping = upstream_lint.avoption_field_map(AVOPTION_COMMENT_BAR_BLOCK)
+        self.assertEqual(mapping.get("foo"), ["foo"])
+        self.assertNotIn("bar", mapping)
+
+    def test_avoption_field_map_ignores_line_commented_row(self) -> None:
+        """A line-commented AVOption row does not register its quoted option name."""
+        mapping = upstream_lint.avoption_field_map(AVOPTION_COMMENT_BAR_LINE)
+        self.assertEqual(mapping.get("foo"), ["foo"])
+        self.assertNotIn("bar", mapping)
+
+    def test_avoption_field_map_keeps_help_literals_with_comment_markers(self) -> None:
+        """Help strings with slashes or block-comment text stay mapped with their names."""
+        mapping = upstream_lint.avoption_field_map(AVOPTION_HELP_LITERALS)
+        self.assertEqual(mapping.get("a_field"), ["a"])
+        self.assertEqual(mapping.get("b_field"), ["b"])
+
+    def test_avoption_tables_ignores_commented_header_mid_table(self) -> None:
+        """A commented-out AVOption header between live rows keeps one table."""
+        tables = upstream_lint.avoption_tables(AVOPTION_COMMENTED_HEADER_MID)
+        self.assertEqual(len(tables), 1)
+        self.assertEqual(tables[0].get("foo"), ["foo"])
+        self.assertEqual(tables[0].get("baz"), ["baz"])
+
     def test_option_fields_tested_continuation_in_if_condition(self) -> None:
         """A continuation line inside an if condition counts as testing option fields."""
         line = "        !c->ignore_io_errors)"
@@ -1940,6 +2120,24 @@ class DocTermTest(unittest.TestCase):
         line = "    if (c->global_sidx_extra) {"
         tested = upstream_lint._option_fields_tested(line, frozenset({"global_sidx"}))
         self.assertEqual(tested, frozenset())
+
+    def test_option_fields_tested_whitespace_after_arrow(self) -> None:
+        """Spaces or a tab between -> and the member name still count as an option test."""
+        fields = frozenset({"ignore_io_errors"})
+        spaced = upstream_lint._option_fields_tested("    if (c-> ignore_io_errors) {", fields)
+        tabbed = upstream_lint._option_fields_tested("    if (c->\tignore_io_errors) {", fields)
+        self.assertEqual(spaced, frozenset({"ignore_io_errors"}))
+        self.assertEqual(tabbed, frozenset({"ignore_io_errors"}))
+
+    def test_option_fields_tested_whitespace_keeps_member_boundary(self) -> None:
+        """Whitespace after -> still requires an exact member name or indexed match."""
+        fields = frozenset({"ignore_io_errors", "flags[0]"})
+        longer = upstream_lint._option_fields_tested(
+            "    if (c-> ignore_io_errors_extra) {", fields
+        )
+        indexed = upstream_lint._option_fields_tested("    if (c-> flags[0]) {", fields)
+        self.assertEqual(longer, frozenset())
+        self.assertEqual(indexed, frozenset({"flags[0]"}))
 
     def test_option_fields_tested_post_continuation_assign_ignored(self) -> None:
         """An assignment after a multiline condition closes is not an option test."""
@@ -3465,6 +3663,101 @@ class PipelineTest(FixtureTest):
         self.assertEqual(rc, 0, output)
         self.assertIn("step: doc-terms rc: 0", output)
         self.assertNotIn("option interplay:", output)
+
+    def test_doc_terms_option_interplay_commented_avoption_row_passes(self) -> None:
+        """A commented-out AVOption row does not couple a live foo test with bar."""
+        self.write("libavformat/dashenc.c", ONE_TABLE_COMMENT_BAR + MUX_WRITE_BASE)
+        self.write("doc/muxers.texi", DOC_FOO_BAR_BASE)
+        self.commit("libavformat/dashenc: table with commented bar row")
+        self.base = self.git("rev-parse", "HEAD").strip()
+        self.write("libavformat/dashenc.c", ONE_TABLE_COMMENT_BAR + MUX_WRITE_T1)
+        self.write("doc/muxers.texi", DOC_FOO_BAR_T1)
+        self.commit("libavformat/dashenc: guard foo mode")
+        rc, output = self.check()
+        self.assertEqual(rc, 0, output)
+        self.assertIn("step: doc-terms rc: 0", output)
+        self.assertNotIn("option interplay:", output)
+
+    def test_doc_terms_option_interplay_spaced_arrow_fails(self) -> None:
+        """Whitespace after -> still couples ignore_io_errors with global_sidx under doc-terms."""
+        self._write_dashenc_fixture()
+        self.commit("libavformat/dashenc: option table fixture")
+        self.base = self.git("rev-parse", "HEAD").strip()
+        self.write("libavformat/dashenc.c", DASHENC_T1_SPACED_SOURCE)
+        self.write("doc/muxers.texi", DOC_MUXERS_T1)
+        self.commit("libavformat/dashenc: spaced ignore guard")
+        rc, output = self.check()
+        self.assertEqual(rc, 1, output)
+        self.assertIn("step: doc-terms rc: 1", output)
+        self.assertIn("ignore_io_errors near global_sidx", output)
+
+    def test_doc_terms_option_interplay_mode_alias_name_mode_passes(self) -> None:
+        """A foo doc entry naming mode waives interplay with the mode_alias neighbour."""
+        self.write("libavformat/dashenc.c", MODE_ALIAS_OPTIONS + MUX_WRITE_MODE)
+        self.write("doc/muxers.texi", DOC_MODE_BASE)
+        self.commit("libavformat/dashenc: mode alias table")
+        self.base = self.git("rev-parse", "HEAD").strip()
+        self.write("libavformat/dashenc.c", MODE_ALIAS_OPTIONS + MUX_WRITE_MODE_FOO)
+        self.write("doc/muxers.texi", DOC_MODE_FOO_NAMES_MODE)
+        self.commit("libavformat/dashenc: guard foo near mode")
+        rc, output = self.check()
+        self.assertEqual(rc, 0, output)
+        self.assertIn("step: doc-terms rc: 0", output)
+        self.assertNotIn("option interplay:", output)
+
+    def test_doc_terms_option_interplay_mode_alias_name_alias_passes(self) -> None:
+        """A foo doc entry naming mode_alias waives interplay with the mode neighbour."""
+        self.write("libavformat/dashenc.c", MODE_ALIAS_OPTIONS + MUX_WRITE_MODE)
+        self.write("doc/muxers.texi", DOC_MODE_BASE)
+        self.commit("libavformat/dashenc: mode alias table")
+        self.base = self.git("rev-parse", "HEAD").strip()
+        self.write("libavformat/dashenc.c", MODE_ALIAS_OPTIONS + MUX_WRITE_MODE_FOO)
+        self.write("doc/muxers.texi", DOC_MODE_FOO_NAMES_ALIAS)
+        self.commit("libavformat/dashenc: guard foo naming alias")
+        rc, output = self.check()
+        self.assertEqual(rc, 0, output)
+        self.assertIn("step: doc-terms rc: 0", output)
+        self.assertNotIn("option interplay:", output)
+
+    def test_doc_terms_option_interplay_mode_alias_omit_fails(self) -> None:
+        """A foo entry omitting every mode alias still reports foo near mode pairs."""
+        self.write("libavformat/dashenc.c", MODE_ALIAS_OPTIONS + MUX_WRITE_MODE)
+        self.write("doc/muxers.texi", DOC_MODE_BASE)
+        self.commit("libavformat/dashenc: mode alias table")
+        self.base = self.git("rev-parse", "HEAD").strip()
+        self.write("libavformat/dashenc.c", MODE_ALIAS_OPTIONS + MUX_WRITE_MODE_FOO)
+        self.write("doc/muxers.texi", DOC_MODE_FOO_OMIT)
+        self.commit("libavformat/dashenc: guard foo omitting mode")
+        rc, output = self.check()
+        self.assertEqual(rc, 1, output)
+        self.assertIn("foo near mode", output)
+        self.assertIn("foo near mode_alias", output)
+
+    def test_doc_terms_option_interplay_mode_alias_wrong_field_fails(self) -> None:
+        """Naming a third field in the foo entry does not waive mode alias interplay."""
+        self.write("libavformat/dashenc.c", MODE_ALIAS_OPTIONS + MUX_WRITE_MODE)
+        self.write("doc/muxers.texi", DOC_MODE_BASE)
+        self.commit("libavformat/dashenc: mode alias table")
+        self.base = self.git("rev-parse", "HEAD").strip()
+        self.write("libavformat/dashenc.c", MODE_ALIAS_OPTIONS + MUX_WRITE_MODE_FOO)
+        self.write("doc/muxers.texi", DOC_MODE_FOO_NAMES_OTHER)
+        self.commit("libavformat/dashenc: guard foo naming other")
+        rc, output = self.check()
+        self.assertEqual(rc, 1, output)
+        self.assertIn("step: doc-terms rc: 1", output)
+
+    def test_doc_terms_option_interplay_mode_alias_dual_entry_fails(self) -> None:
+        """One foo entry naming mode cannot waive another changed foo entry omitting it."""
+        self.write("libavformat/dashenc.c", MODE_ALIAS_OPTIONS + MUX_WRITE_MODE)
+        self.write("doc/muxers.texi", DOC_MODE_BASE)
+        self.commit("libavformat/dashenc: mode alias table")
+        self.base = self.git("rev-parse", "HEAD").strip()
+        self.write("libavformat/dashenc.c", MODE_ALIAS_OPTIONS + MUX_WRITE_MODE_FOO)
+        self.write("doc/muxers.texi", DOC_MODE_FOO_DUAL_OMIT)
+        self.commit("libavformat/dashenc: dual foo docs")
+        rc, output = self.check()
+        self.assertEqual(rc, 1, output)
+        self.assertIn("step: doc-terms rc: 1", output)
 
     def _write_dashenc_fixture(self) -> None:
         """Write the dashenc and muxers fixture files shared by option-interplay tests."""

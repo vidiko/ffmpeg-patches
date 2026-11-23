@@ -1744,6 +1744,39 @@ class ErrorScopeClaimTest(unittest.TestCase):
         )
         self.assertEqual(upstream_lint.error_scope_claim(split_semicolon), "propagate write errors")
 
+    def test_exclamation_question_split_flags_unqualified_claim(self) -> None:
+        """Exclamation and question marks split sentences so missing qualification is flagged."""
+        for body in (
+            "Errors are reported! Output remains unchanged.",
+            "Errors are reported? Output remains unchanged.",
+        ):
+            with self.subTest(body=body):
+                message = f"avfilter/vf_x: propagate write errors\n\n{body}\n"
+                self.assertEqual(upstream_lint.error_scope_claim(message), "propagate write errors")
+
+    def test_exclamation_question_split_qualifies_error_scope(self) -> None:
+        """Split qualification sentences after exclamation or question marks qualify the claim."""
+        for body in (
+            "Is this right? Other error paths remain outside this change.",
+            "Errors are reported! Other error paths remain outside this change.",
+            "Other error paths remain outside this change!",
+        ):
+            with self.subTest(body=body):
+                message = f"avfilter/vf_x: propagate write errors\n\n{body}\n"
+                self.assertIsNone(upstream_lint.error_scope_claim(message))
+
+    def test_in_word_exclamation_question_do_not_split(self) -> None:
+        """In-word exclamation and question marks do not split qualification sentences."""
+        body = "Other error paths in a?b and x!=y remain outside this change."
+        sentences = upstream_lint._qualification_sentences(body)
+        self.assertEqual(len(sentences), 1)
+        self.assertEqual(
+            sentences[0],
+            "Other error paths in a?b and x!=y remain outside this change",
+        )
+        message = f"avfilter/vf_x: propagate write errors\n\n{body}\n"
+        self.assertIsNone(upstream_lint.error_scope_claim(message))
+
     def test_bare_unchanged_without_other_marker_does_not_qualify(self) -> None:
         """Bare unchanged, as-before and as-on-master phrases require an other-scope word."""
         for body in (

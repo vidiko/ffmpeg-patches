@@ -112,7 +112,7 @@ three words by error, errors, failure or failures and later in the same
 sentence by remain, remains or is left, or is unchanged, are unchanged, as on
 master or as before when the same sentence also holds other, remaining, rest or
 existing, or one of the ERROR_SCOPE_BEHAVIOUR_NOUNS nouns (behavior, behaviour,
-path, paths, case, cases, site, sites). Sentences split on ";" or "." at the
+path, paths, case, cases, site, sites). Sentences split on ";", "?", "!" or "." at the
 end of the body or before whitespace, not on ":", and a period inside a number,
 inside an identifier such as pkg.dash_free(), or before whitespace after e.g,
 i.e, cf, vs or etc does not end a sentence. --claim-reason TEXT does not waive
@@ -1742,7 +1742,7 @@ def _period_splits_sentence(text: str, index: int) -> bool:
 def _sentence_breaks_at(text: str, index: int) -> bool:
     """Return whether character index ends a qualification sentence."""
     char = text[index]
-    if char == ";":
+    if char in ";?!":
         return index + 1 >= len(text) or text[index + 1].isspace()
     return char == "." and _period_splits_sentence(text, index)
 

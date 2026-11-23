@@ -491,25 +491,21 @@ def branch_update(line: str) -> tuple[str, str, str] | None:
     return remote_ref.removeprefix("refs/heads/"), local_sha, remote_sha
 
 
-def signoff_considered_remotes(remote_name: str, cwd: str | None) -> list[str] | None:
-    """Return destination-only remotes, an empty list for an unconfigured name, or None."""
-    try:
-        names = signoff.configured_remotes(cwd)
-    except ValueError:
-        names = []
+def signoff_considered_remotes(remote_name: str, cwd: str | None) -> list[str]:
+    """Return the push destination alone when it is configured, otherwise an empty list."""
+    names = signoff.configured_remotes(cwd)
     if remote_name in names:
         return [remote_name]
     return []
 
 
-def check_signoff_update(line: str, considered_remotes: list[str] | None | object = ...) -> int:
+def check_signoff_update(line: str, considered_remotes: list[str] | None = None) -> int:
     """Check sign-offs once per branch update, independently of remote hosting."""
     update = branch_update(line)
     if update is None:
         return 0
     branch, local_sha, remote_sha = update
-    kwargs = {} if considered_remotes is ... else {"considered_remotes": considered_remotes}
-    reason = signoff.check_commits(local_sha, remote_sha, **kwargs)
+    reason = signoff.check_commits(local_sha, remote_sha, considered_remotes=considered_remotes)
     if reason:
         print(f"push_guard: refusing branch {branch}: {reason}; {signoff.FIX}", file=sys.stderr)
         return 1
@@ -616,7 +612,7 @@ def check_updates(
     reader: APIReader,
     clock: Callable[[], float] = time.monotonic,
     activity: ActivityReader = read_review_activity,
-    considered_remotes: list[str] | None | object = ...,
+    considered_remotes: list[str] | None = None,
 ) -> int:
     """Check at most MAX_UPDATES ref updates, failing closed on input or API errors."""
     start = clock()
@@ -668,9 +664,16 @@ def main(
         return 2
     if not repositories:
         print("push_guard: non-GitHub remote; skipping pull request checks", file=sys.stderr)
-    considered: list[str] | None | object = ...
+    considered: list[str] | None = None
     if not args.from_config:
-        considered = signoff_considered_remotes(args.remote_name, None)
+        try:
+            considered = signoff_considered_remotes(args.remote_name, None)
+        except ValueError as exc:
+            print(
+                f"push_guard: cannot read configured remotes: {exc}; refusing (fail closed)",
+                file=sys.stderr,
+            )
+            return 2
     return check_updates(
         repositories, reader, activity=activity_reader, considered_remotes=considered
     )

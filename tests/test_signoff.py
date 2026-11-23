@@ -266,6 +266,7 @@ class CommitRangeTest(GitFixture):
             )
         logs = [call for call in git.call_args_list if call.args[0][0] == "log"]
         self.assertEqual(len(logs), 1)
+        self.git("remote", "add", "origin", "https://example.invalid/origin.git")
         self.git("update-ref", "refs/remotes/origin/main", sha)
         with unittest.mock.patch.object(signoff, "git", wraps=signoff.git) as git:
             self.assertIsNone(signoff.check_commits(sha, ZERO, str(self.root)))
@@ -296,7 +297,7 @@ class CommitRangeTest(GitFixture):
 class MessagePathStdinTest(GitFixture):
     """Exercise the hook message-path channel that reads one path line from stdin."""
 
-    def _run_signoff_stdin(self, path_line: str, message: Path) -> subprocess.CompletedProcess[str]:
+    def _run_signoff_stdin(self, path_line: str) -> subprocess.CompletedProcess[str]:
         """Run signoff with --message-path-stdin and the given path line on stdin."""
         return subprocess.run(  # nosec B603 - fixed Python argv, fixture paths, no shell.
             [sys.executable, "-B", str(ROOT / "scripts/signoff.py"), "--message-path-stdin"],
@@ -313,10 +314,10 @@ class MessagePathStdinTest(GitFixture):
         """Accept a signed message file path and refuse an unsigned one through stdin."""
         message = self.root / "hook-message.txt"
         message.write_text(f"Subject\n\n{TRAILER}\n", encoding="utf-8")
-        signed = self._run_signoff_stdin(str(message) + "\n", message)
+        signed = self._run_signoff_stdin(str(message) + "\n")
         self.assertEqual(signed.returncode, 0, signed.stderr)
         message.write_text("Subject without trailer\n", encoding="utf-8")
-        refused = self._run_signoff_stdin(str(message) + "\n", message)
+        refused = self._run_signoff_stdin(str(message) + "\n")
         self.assertEqual(refused.returncode, 1, refused.stderr)
         self.assertIn("no Signed-off-by", refused.stderr)
 
@@ -330,7 +331,7 @@ class MessagePathStdinTest(GitFixture):
             (str(self.root / "absent.txt") + "\n", "missing file"),
         ):
             with self.subTest(label=label):
-                result = self._run_signoff_stdin(path_line, message)
+                result = self._run_signoff_stdin(path_line)
                 self.assertEqual(result.returncode, 2, result.stderr)
                 self.assertIn("cannot decide", result.stderr)
 
@@ -402,14 +403,27 @@ class ConsideredRemotesTest(GitFixture):
         """Refuse when the considered-remote list exceeds the fixed remote cap."""
         cap = signoff.MAX_REMOTES
         names = [f"r{index}" for index in range(cap + 1)]
-        for _index, name in enumerate(names):
-            self.git(
-                "config",
-                f"remote.{name}.url",
-                f"https://example.invalid/{name}.git",
-            )
         with self.assertRaisesRegex(ValueError, str(cap)):
             signoff.check_commits(self.commit(), ZERO, str(self.root), considered_remotes=names)
+
+    def test_configured_remotes_list_refuses_above_cap_without_git_config(self) -> None:
+        """Raise from configured_remotes when a mocked remote list exceeds MAX_REMOTES."""
+        cap = signoff.MAX_REMOTES
+        output = "\n".join(f"r{index}" for index in range(cap + 1))
+        with (
+            unittest.mock.patch.object(signoff, "git", return_value=output + "\n"),
+            self.assertRaisesRegex(ValueError, str(cap)),
+        ):
+            signoff.configured_remotes(str(self.root))
+
+    def test_leftover_remote_tracking_ref_refused_without_configured_remote(self) -> None:
+        """Refuse an unsigned commit hidden only by a stale remote-tracking ref."""
+        unsigned = self.commit("stale unsigned", signed=False)
+        self.git("update-ref", "refs/remotes/gone/main", unsigned)
+        signed_sha = self.commit("signed tip", signed=True)
+        refused = signoff.check_commits(signed_sha, ZERO, str(self.root))
+        self.assertIsNotNone(refused)
+        self.assertIn(unsigned, refused)
 
 
 if __name__ == "__main__":

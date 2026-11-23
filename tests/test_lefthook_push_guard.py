@@ -29,7 +29,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SERIES_INSTALL_COMMAND = "python3 -m pip install --require-hashes -r requirements-dev.txt"
 COMMIT_MSG_SIGNOFF_RUN = (
     "sh .config/lefthook/python.sh scripts/signoff.py --message-path-stdin "
-    "<<'SIGNOFF_HOOK_PATH '\n{1}\nSIGNOFF_HOOK_PATH"
+    "<<'SIGNOFF_HOOK_PATH'\n{1}\nSIGNOFF_HOOK_PATH\n"
 )
 
 
@@ -780,6 +780,61 @@ class LefthookPushGuardTest(unittest.TestCase):
                 )
 
 
+class CommitMsgRunTextTest(GitFixture):
+    """Run the production commit-msg shell text outside lefthook."""
+
+    def _install_signoff_fixture(self) -> None:
+        """Copy signoff and the python selector into the isolated fixture repository."""
+        (self.root / "scripts").mkdir()
+        shutil.copyfile(ROOT / "scripts/signoff.py", self.root / "scripts/signoff.py")
+        wrapper = self.root / ".config/lefthook/python.sh"
+        wrapper.parent.mkdir(parents=True)
+        wrapper.write_text('#!/bin/sh\nexec "' + sys.executable + '" "$@"\n', encoding="utf-8")
+        wrapper.chmod(0o755)
+
+    def _run_commit_msg_job_text(
+        self, run_text: str, message: Path, *, append_space: bool
+    ) -> subprocess.CompletedProcess[str]:
+        """Execute the commit-msg job run string through sh -c with one message path line."""
+        command = run_text.replace("{1}", str(message))
+        if append_space:
+            command += " "
+        return subprocess.run(  # nosec B603 - fixture sh -c text from production lefthook.yml.
+            ["sh", "-c", command],
+            cwd=self.root,
+            env=self.env,
+            capture_output=True,
+            encoding="utf-8",
+            check=False,
+            timeout=30,
+        )
+
+    def test_commit_msg_run_text_tolerates_trailing_shell_space(self) -> None:
+        """Match signed and unsigned results with and without lefthook's trailing shell space."""
+        config = yaml.safe_load((ROOT / "lefthook.yml").read_text(encoding="utf-8"))
+        run_text = config["commit-msg"]["jobs"][0]["run"]
+        self._install_signoff_fixture()
+        message = self.root / "msg's path.txt"
+        message.write_text(
+            "Subject\n\nSigned-off-by: Signoff Fixture <signoff@example.invalid>\n",
+            encoding="utf-8",
+        )
+        for append_space in (False, True):
+            with self.subTest(append_space=append_space):
+                signed = self._run_commit_msg_job_text(run_text, message, append_space=append_space)
+                self.assertEqual(signed.returncode, 0, signed.stderr)
+                self.assertNotIn("here-document", signed.stderr.casefold())
+        unsigned_path = self.root / "msg's unsigned.txt"
+        unsigned_path.write_text("Subject without trailer\n", encoding="utf-8")
+        for append_space in (False, True):
+            with self.subTest(unsigned=True, append_space=append_space):
+                refused = self._run_commit_msg_job_text(
+                    run_text, unsigned_path, append_space=append_space
+                )
+                self.assertEqual(refused.returncode, 1, refused.stderr)
+                self.assertNotIn("here-document", refused.stderr.casefold())
+
+
 class LefthookSignoffTest(GitFixture):
     """Exercise an installed lefthook commit-msg hook with actual two-parent merges."""
 
@@ -897,11 +952,15 @@ class LefthookSignoffTest(GitFixture):
 
     def install_message_hook(self, lefthook: str) -> None:
         """Install only the production commit-msg job in a disposable fixture repository."""
-        root_config = (ROOT / "lefthook.yml").read_text(encoding="utf-8")
-        start = root_config.index("commit-msg:")
-        end = root_config.index("\n\npost-commit:")
-        block = root_config[start:end]
-        (self.root / "lefthook.yml").write_text(block, encoding="utf-8")
+        root_config = yaml.safe_load((ROOT / "lefthook.yml").read_text(encoding="utf-8"))
+        commit_msg = {"commit-msg": root_config["commit-msg"]}
+        dumped = yaml.safe_dump(commit_msg, default_flow_style=False)
+        roundtrip = yaml.safe_load(dumped)
+        self.assertEqual(
+            roundtrip["commit-msg"]["jobs"][0]["run"],
+            root_config["commit-msg"]["jobs"][0]["run"],
+        )
+        (self.root / "lefthook.yml").write_text(dumped, encoding="utf-8")
         (self.root / "scripts").mkdir()
         shutil.copyfile(ROOT / "scripts/signoff.py", self.root / "scripts/signoff.py")
         # Test the job wiring; interpreter selection is outside this unit.

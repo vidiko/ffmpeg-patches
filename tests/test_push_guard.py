@@ -1296,6 +1296,11 @@ class APIReaderTest(unittest.TestCase):
         checker = unittest.mock.patch.object(push_guard.signoff, "check_commits", return_value=None)
         checker.start()
         self.addCleanup(checker.stop)
+        remotes = unittest.mock.patch.object(
+            push_guard.signoff, "configured_remotes", return_value=["origin"]
+        )
+        remotes.start()
+        self.addCleanup(remotes.stop)
 
     def test_newest_head_query_hostname_and_timeout(self) -> None:
         """The API reader queries repository metadata and newest head pull requests."""
@@ -1545,6 +1550,49 @@ class APIReaderTest(unittest.TestCase):
                 self.assertLessEqual(t, 20)
 
 
+class RemoteReadFailClosedTest(unittest.TestCase):
+    """Refuse before sign-off checks when configured remotes cannot be read."""
+
+    def test_configured_remotes_error_refuses_before_signoff(self) -> None:
+        """Return exit two and skip sign-off when git remote fails in named-remote mode."""
+        with (
+            unittest.mock.patch.object(
+                push_guard.signoff,
+                "configured_remotes",
+                side_effect=ValueError("git remote failed: TimeoutExpired"),
+            ),
+            unittest.mock.patch.object(
+                push_guard.signoff, "check_commits", side_effect=AssertionError("unexpected")
+            ) as checker,
+            unittest.mock.patch("sys.stdin", io.StringIO(update())),
+        ):
+            status, _, err = guard(unittest.mock.Mock(return_value="[]"), update())
+        self.assertEqual(status, 2)
+        self.assertIn("push_guard: cannot read configured remotes:", err)
+        self.assertIn("refusing (fail closed)", err)
+        checker.assert_not_called()
+
+    def test_configured_remotes_over_cap_refuses_before_signoff(self) -> None:
+        """Return exit two and skip sign-off when configured remotes exceed the cap."""
+        cap = push_guard.signoff.MAX_REMOTES
+        with (
+            unittest.mock.patch.object(
+                push_guard.signoff,
+                "configured_remotes",
+                side_effect=ValueError(f"more than {cap} remotes"),
+            ),
+            unittest.mock.patch.object(
+                push_guard.signoff, "check_commits", side_effect=AssertionError("unexpected")
+            ) as checker,
+            unittest.mock.patch("sys.stdin", io.StringIO(update())),
+        ):
+            status, _, err = guard(unittest.mock.Mock(return_value="[]"), update())
+        self.assertEqual(status, 2)
+        self.assertIn("push_guard: cannot read configured remotes:", err)
+        self.assertIn("refusing (fail closed)", err)
+        checker.assert_not_called()
+
+
 class SignoffConsideredRemotesTest(unittest.TestCase):
     """Record which remote scope push_guard passes to the sign-off reader."""
 
@@ -1586,7 +1634,7 @@ class SignoffConsideredRemotesTest(unittest.TestCase):
         self.assertEqual(checker.call_args.kwargs.get("considered_remotes"), [])
 
     def test_from_config_passes_no_considered_remote_list(self) -> None:
-        """Omit the considered-remote keyword in --from-config mode."""
+        """Pass None as considered_remotes in --from-config mode."""
         with unittest.mock.patch.object(
             push_guard.signoff, "check_commits", return_value=None
         ) as checker:
@@ -1594,7 +1642,7 @@ class SignoffConsideredRemotesTest(unittest.TestCase):
                 unittest.mock.Mock(return_value="[]"), lambda: {"origin": [REMOTE]}, update()
             )
         self.assertEqual(status, 0)
-        self.assertNotIn("considered_remotes", checker.call_args.kwargs)
+        self.assertIsNone(checker.call_args.kwargs.get("considered_remotes"))
 
 
 class SignoffPushTest(GitFixture):
@@ -1670,7 +1718,10 @@ class SignoffPushTest(GitFixture):
             push_guard.signoff, "check_commits", return_value=None
         ) as checker:
             self.assertEqual(config_guard(self.reader, config, update(local_sha=sha) * 2)[0], 0)
-        self.assertEqual(checker.call_args_list, [unittest.mock.call(sha, ZERO)] * 2)
+        self.assertEqual(
+            checker.call_args_list,
+            [unittest.mock.call(sha, ZERO, considered_remotes=None)] * 2,
+        )
         self.assertEqual(self.reader.call_count, 4)
 
     def test_non_github_invalid_input_fails_closed(self) -> None:

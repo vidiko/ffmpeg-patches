@@ -8,8 +8,8 @@ Git parses trailers for both message files and introduced commits, including mer
 
 A commit counts as introduced when it is not reachable from every considered
 remote's tracking references and from the locally known advertised remote head.
-When no remote is considered, only the advertised head limits history. Passing
-no considered-remote list checks against every configured remote (config mode);
+When no remote is considered, only the known advertised head limits history.
+Passing no considered-remote list checks against every configured remote;
 a stale remote missing origin history can refuse until that remote is fetched
 or removed.
 """
@@ -122,7 +122,7 @@ def _rev_list_introduced(
     exclusions: list[str] = []
     if not_remotes is not None:
         for remote in not_remotes:
-            exclusions.append(f"--remotes={remote}" if remote else "--remotes")
+            exclusions.append(f"--remotes={remote}")
     if set(remote_sha) != {"0"}:
         known = git(
             ["rev-parse", "--verify", "--quiet", f"{remote_sha}^{{commit}}"],
@@ -151,9 +151,7 @@ def introduced_commits(
     if len(remotes) > MAX_REMOTES:
         raise ValueError(f"more than {MAX_REMOTES} remotes")
     if not remotes:
-        return _rev_list_introduced(
-            local_sha, remote_sha, [""] if considered_remotes is None else None, cwd
-        )
+        return _rev_list_introduced(local_sha, remote_sha, None, cwd)
     union: list[str] = []
     seen: set[str] = set()
     for remote in remotes:

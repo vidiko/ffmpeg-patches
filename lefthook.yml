@@ -51,11 +51,11 @@ pre-commit:
 
 commit-msg:
   jobs:
-    # Lefthook 2.2.2 does not escape {N} hook arguments (replacer.go); a quoted path
-    # breaks on apostrophes, so the path is one literal line in a quoted heredoc.
+    # Lefthook 2.2.2 does not escape {N} hook arguments; a quoted here-document
+    # keeps the path literal, and | preserves the newline so a trailing space cannot break the delimiter.
     - name: signoff
-      run: |-
-        sh .config/lefthook/python.sh scripts/signoff.py --message-path-stdin <<'SIGNOFF_HOOK_PATH '
+      run: |
+        sh .config/lefthook/python.sh scripts/signoff.py --message-path-stdin <<'SIGNOFF_HOOK_PATH'
         {1}
         SIGNOFF_HOOK_PATH
 

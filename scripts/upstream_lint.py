@@ -99,6 +99,9 @@ the neighbour field (underscore in the name may match a hyphen or space).
 Commented-out AVOption table headers and entry rows are ignored, whitespace
 after -> is allowed in option tests, and naming any alias of the neighbour
 field in a table that holds both options on different fields satisfies the entry.
+Texinfo @c and @comment text in an entry does not name a neighbour option.
+An explicit array bound in an AVOption table header still starts a new table.
+A structure field on the left of an assignment on a line is not an option test there.
 Entry scope is the nearest preceding
 @item or @itemx through the line before the next @item, @itemx or @end; the full
 entry text at head is used, not added lines alone. Only structure member access
@@ -1779,7 +1782,10 @@ AVOPTION_FIELD = (
     r"offsetof\s*\(\s*\w+\s*,\s*(\w+(?:\[[^\]]*\])?)\s*\))"
 )
 AVOPTION_ENTRY = re.compile(rf"\{{\s*\"([^\"]+)\"\s*,\s*{AVOPTION_HELP}\s*,\s*{AVOPTION_FIELD}")
-AVOPTION_TABLE_HEAD = re.compile(r"\bAVOption\s+[A-Za-z_]\w*\s*\[\s*\]\s*=\s*\{")
+AVOPTION_TABLE_HEAD = re.compile(r"\bAVOption\s+[A-Za-z_]\w*\s*\[\s*[^\]\n]*\s*\]\s*=\s*\{")
+FIELD_ASSIGN_TARGET = re.compile(
+    r"->\s*\w+(?:\[[^\]]*\])?\s*(?:=(?!=)|\+=|-=|\*=|/=|%=|&=|\|=|\^=|<<=|>>=)"
+)
 CONDITION_HEAD = re.compile(r"\b(?:if|while)\s*\(")
 TEXI_ITEM_HEAD = re.compile(r"^@itemx?\s+(\S+)")
 TEXI_ENTRY_BOUNDARY = re.compile(r"^@(?:itemx?|end)\b")
@@ -1884,6 +1890,47 @@ def _outside_spans(line: str, spans: SpanList) -> str:
     return " ".join(parts)
 
 
+def _texi_comment_command_at(line: str, at: int) -> int | None:
+    """Return the index of a Texinfo @c or @comment command, or None."""
+    if at > 0 and line[at - 1] == "@":
+        return None
+    if line.startswith("@comment", at):
+        tail = at + 8
+        if tail == len(line) or line[tail] in " \t":
+            return at
+        return None
+    if line.startswith("@c", at):
+        tail = at + 2
+        if tail == len(line) or line[tail] in " \t":
+            return at
+        return None
+    return None
+
+
+def _texi_strip_comments_line(line: str) -> str:
+    """Return one Texinfo line with @c and @comment suffix text removed."""
+    pos = 0
+    while pos < len(line):
+        at = line.find("@", pos)
+        if at < 0:
+            break
+        command = _texi_comment_command_at(line, at)
+        if command is not None:
+            return line[:command].rstrip()
+        pos = at + 1
+    return line
+
+
+def texi_strip_comments(text: str) -> str:
+    """Return Texinfo text with @c and @comment command text removed from each line."""
+    return "\n".join(_texi_strip_comments_line(line) for line in text.split("\n"))
+
+
+def _text_without_assignment_targets(text: str) -> str:
+    """Return text with structure-member assignment targets replaced by blanks."""
+    return FIELD_ASSIGN_TARGET.sub(lambda match: " " * len(match.group(0)), text)
+
+
 def _option_fields_tested(
     line: str,
     fields: frozenset[str],
@@ -1895,9 +1942,9 @@ def _option_fields_tested(
         targets = [line[start:end] for start, end in spans]
         outside = _outside_spans(line, spans)
         if any(marker in outside for marker in OUTSIDE_TEST_MARKERS):
-            targets.append(outside)
+            targets.append(_text_without_assignment_targets(outside))
     elif any(marker in line for marker in OPTION_TEST_MARKERS):
-        targets = [line]
+        targets = [_text_without_assignment_targets(line)]
     else:
         return frozenset()
     found: set[str] = set()
@@ -2075,7 +2122,8 @@ def _interplay_findings_one_path(
         if entry_texts is None:
             continue
         group = _neighbour_alias_group_for_pair(tables, option_a, option_b)
-        if all(any(option_named_in_text(alias, text) for alias in group) for text in entry_texts):
+        stripped = [texi_strip_comments(text) for text in entry_texts]
+        if all(any(option_named_in_text(alias, text) for alias in group) for text in stripped):
             continue
         snippet = raw_lines[number - 1].strip()
         findings.append(

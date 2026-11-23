@@ -344,6 +344,78 @@ DOC_FOO_BAR_T1 = (
     "Enable bar mode.\n"
     "@end table\n"
 )
+DOC_FOO_BAR_COMMENT_ONLY_BAR = (
+    "@table @option\n"
+    "@item foo\n"
+    "Enable foo mode.\n"
+    "@c Also depends on bar when muxing.\n"
+    "Skip extra header packets.\n"
+    "@item bar\n"
+    "Enable bar mode.\n"
+    "@end table\n"
+)
+DOC_FOO_BAR_COMMENT_AND_PLAIN_BAR = (
+    "@table @option\n"
+    "@item foo\n"
+    "Enable foo mode.\n"
+    "@c Also depends on bar when muxing.\n"
+    "Depends on bar when muxing.\n"
+    "Skip extra header packets.\n"
+    "@item bar\n"
+    "Enable bar mode.\n"
+    "@end table\n"
+)
+BOUNDED_TWO_TABLES_OPTIONS = (
+    "#define OFFSET(x) offsetof(MuxContext, x)\n"
+    "#define NB_OPTS 2\n"
+    "typedef struct MuxContext {\n"
+    "    int foo;\n"
+    "    int bar;\n"
+    "} MuxContext;\n"
+    "static const AVOption a_options[] = {\n"
+    '    { "foo", "foo", OFFSET(foo), 0 },\n'
+    "};\n"
+    "static const AVOption b_options[2] = {\n"
+    '    { "bar", "bar", OFFSET(bar), 0 },\n'
+    "};\n"
+)
+BOUNDED_NB_TWO_TABLES_OPTIONS = (
+    "#define OFFSET(x) offsetof(MuxContext, x)\n"
+    "#define NB_OPTS 2\n"
+    "typedef struct MuxContext {\n"
+    "    int foo;\n"
+    "    int bar;\n"
+    "} MuxContext;\n"
+    "static const AVOption a_options[] = {\n"
+    '    { "foo", "foo", OFFSET(foo), 0 },\n'
+    "};\n"
+    "static const AVOption b_options[NB_OPTS] = {\n"
+    '    { "bar", "bar", OFFSET(bar), 0 },\n'
+    "};\n"
+)
+BOUNDED_EXPR_TWO_TABLES_OPTIONS = (
+    "#define OFFSET(x) offsetof(MuxContext, x)\n"
+    "typedef struct MuxContext {\n"
+    "    int foo;\n"
+    "    int bar;\n"
+    "} MuxContext;\n"
+    "static const AVOption a_options[] = {\n"
+    '    { "foo", "foo", OFFSET(foo), 0 },\n'
+    "};\n"
+    "static const AVOption b_options[2 + 1] = {\n"
+    '    { "bar", "bar", OFFSET(bar), 0 },\n'
+    "};\n"
+)
+MUX_WRITE_MODE_ASSIGN = (
+    "int mux_write(MuxContext *c)\n{\n"
+    "    if (c->mode) {\n        return 2;\n    }\n    return 0;\n}\n"
+)
+MUX_WRITE_MODE_ASSIGN_FOO = (
+    "int mux_write(MuxContext *c)\n{\n"
+    "    int ready = 1, enabled = 1, available = 1;\n"
+    "    if (ready) c->foo = enabled && available;\n"
+    "    if (c->mode) {\n        return 2;\n    }\n    return 0;\n}\n"
+)
 AVOPTION_COMMENT_BAR_BLOCK = (
     "#define OFFSET(x) offsetof(Ctx, x)\n"
     "typedef struct Ctx { int foo, bar; } Ctx;\n"
@@ -2115,6 +2187,74 @@ class DocTermTest(unittest.TestCase):
         self.assertNotIn("bar", tables[0])
         self.assertNotIn("foo", tables[1])
 
+    def test_texi_strip_comments_whole_line(self) -> None:
+        """A whole-line @c comment naming mode is removed."""
+        self.assertEqual(upstream_lint.texi_strip_comments("@c mode controls output"), "")
+
+    def test_texi_strip_comments_trailing_comment(self) -> None:
+        """A trailing @c comment is removed and preceding text is kept."""
+        text = "\\input texinfo @c -*- texinfo -*-"
+        self.assertEqual(upstream_lint.texi_strip_comments(text), "\\input texinfo")
+
+    def test_texi_strip_comments_at_comment_command(self) -> None:
+        """A whole-line @comment command is removed."""
+        self.assertEqual(upstream_lint.texi_strip_comments("@comment mode is internal only"), "")
+
+    def test_texi_strip_comments_doubled_at_sign(self) -> None:
+        """@@c keeps the mode token because the at-sign is escaped."""
+        self.assertEqual(upstream_lint.texi_strip_comments("@@c mode"), "@@c mode")
+
+    def test_texi_strip_comments_inline_commands_preserved(self) -> None:
+        """@code and @center lines keep mode because @c is not a comment command."""
+        for text in ("@code{mode}", "@center mode"):
+            with self.subTest(text=text.strip()):
+                self.assertIn("mode", upstream_lint.texi_strip_comments(text))
+
+    def test_avoption_tables_bounded_header_separates_tables(self) -> None:
+        """An explicit array bound on the second table keeps foo and bar apart."""
+        tables = upstream_lint.avoption_tables(BOUNDED_TWO_TABLES_OPTIONS)
+        self.assertEqual(tables, [{"foo": ["foo"]}, {"bar": ["bar"]}])
+        self.assertNotIn("bar", tables[0])
+        self.assertNotIn("foo", tables[1])
+
+    def test_avoption_tables_bounded_macro_and_expr_headers(self) -> None:
+        """Macro and expression array bounds still start separate AVOption tables."""
+        for label, source in (
+            ("nb_opts", BOUNDED_NB_TWO_TABLES_OPTIONS),
+            ("expr", BOUNDED_EXPR_TWO_TABLES_OPTIONS),
+        ):
+            with self.subTest(bound=label):
+                tables = upstream_lint.avoption_tables(source)
+                self.assertEqual(len(tables), 2)
+                self.assertEqual(tables[0].get("foo"), ["foo"])
+                self.assertEqual(tables[1].get("bar"), ["bar"])
+
+    def test_option_fields_tested_assign_in_if_outside_condition(self) -> None:
+        """foo on the left of an assignment after an if condition is not tested."""
+        line = "    if (ready) c->foo = enabled && available;"
+        fields = frozenset({"ready", "foo"})
+        spans = upstream_lint._condition_spans([line])
+        tested = upstream_lint._option_fields_tested(line, fields, spans=spans.get(1, ()))
+        self.assertNotIn("foo", tested)
+
+    def test_option_fields_tested_assign_without_if(self) -> None:
+        """foo on the left of a bare assignment with boolean logic is not tested."""
+        line = "    c->foo = enabled && available;"
+        tested = upstream_lint._option_fields_tested(line, frozenset({"foo"}))
+        self.assertEqual(tested, frozenset())
+
+    def test_option_fields_tested_compound_assign_not_counted(self) -> None:
+        """foo on the left of a compound assignment is not tested."""
+        line = "    c->foo |= a && b;"
+        tested = upstream_lint._option_fields_tested(line, frozenset({"foo"}))
+        self.assertEqual(tested, frozenset())
+
+    def test_option_fields_tested_equality_reads_still_counted(self) -> None:
+        """foo and bar on the right of an assignment with == and && are tested."""
+        line = "    ok = c->foo == 1 && c->bar;"
+        tested = upstream_lint._option_fields_tested(line, frozenset({"foo", "bar"}))
+        self.assertEqual(tested, frozenset({"foo", "bar"}))
+
     def test_avoption_field_map_ignores_block_commented_row(self) -> None:
         """A block-commented AVOption row does not register its quoted option name."""
         mapping = upstream_lint.avoption_field_map(AVOPTION_COMMENT_BAR_BLOCK)
@@ -3720,6 +3860,65 @@ class PipelineTest(FixtureTest):
         self.assertIn("step: doc-terms rc: 1", output)
         self.assertIn("option interplay:", output)
         self.assertIn("foo near bar", output)
+
+    def test_doc_terms_option_interplay_texi_comment_names_neighbour_fails(self) -> None:
+        """A neighbour named only in an entry @c line does not waive interplay."""
+        self.write("libavformat/dashenc.c", ONE_TABLE_OPTIONS + MUX_WRITE_BASE)
+        self.write("doc/muxers.texi", DOC_FOO_BAR_BASE)
+        self.commit("libavformat/dashenc: single option table")
+        self.base = self.git("rev-parse", "HEAD").strip()
+        self.write("libavformat/dashenc.c", ONE_TABLE_OPTIONS + MUX_WRITE_T1)
+        self.write("doc/muxers.texi", DOC_FOO_BAR_COMMENT_ONLY_BAR)
+        self.commit("libavformat/dashenc: foo docs comment bar")
+        rc, output = self.check()
+        self.assertEqual(rc, 1, output)
+        self.assertIn("step: doc-terms rc: 1", output)
+        self.assertIn("foo near bar", output)
+
+    def test_doc_terms_option_interplay_texi_comment_and_plain_passes(self) -> None:
+        """Plain prose naming the neighbour waives interplay when @c also names it."""
+        self.write("libavformat/dashenc.c", ONE_TABLE_OPTIONS + MUX_WRITE_BASE)
+        self.write("doc/muxers.texi", DOC_FOO_BAR_BASE)
+        self.commit("libavformat/dashenc: single option table")
+        self.base = self.git("rev-parse", "HEAD").strip()
+        self.write("libavformat/dashenc.c", ONE_TABLE_OPTIONS + MUX_WRITE_T1)
+        self.write("doc/muxers.texi", DOC_FOO_BAR_COMMENT_AND_PLAIN_BAR)
+        self.commit("libavformat/dashenc: foo docs name bar")
+        rc, output = self.check()
+        self.assertEqual(rc, 0, output)
+        self.assertIn("step: doc-terms rc: 0", output)
+
+    def test_doc_terms_option_interplay_bounded_tables_passes(self) -> None:
+        """Bounded AVOption headers keep foo and bar tests in separate tables."""
+        self.write("libavformat/dashenc.c", BOUNDED_TWO_TABLES_OPTIONS + MUX_WRITE_BASE)
+        self.write("doc/muxers.texi", DOC_FOO_BAR_BASE)
+        self.commit("libavformat/dashenc: bounded option tables")
+        self.base = self.git("rev-parse", "HEAD").strip()
+        self.write("libavformat/dashenc.c", BOUNDED_TWO_TABLES_OPTIONS + MUX_WRITE_T1)
+        self.write("doc/muxers.texi", DOC_FOO_BAR_T1)
+        self.commit("libavformat/dashenc: guard foo mode")
+        rc, output = self.check()
+        self.assertEqual(rc, 0, output)
+        self.assertIn("step: doc-terms rc: 0", output)
+        self.assertNotIn("option interplay:", output)
+
+    def test_doc_terms_option_interplay_assign_near_mode_passes(self) -> None:
+        """Assigning foo near a mode test does not couple them under doc-terms."""
+        self.write("libavformat/dashenc.c", MODE_ALIAS_OPTIONS + MUX_WRITE_MODE_ASSIGN)
+        self.write("doc/muxers.texi", DOC_MODE_BASE)
+        self.commit("libavformat/dashenc: mode assign base")
+        self.base = self.git("rev-parse", "HEAD").strip()
+        self.write("libavformat/dashenc.c", MODE_ALIAS_OPTIONS + MUX_WRITE_MODE_ASSIGN_FOO)
+        self.write(
+            "doc/muxers.texi",
+            DOC_MODE_BASE.replace(
+                "Enable the foo flag.\n", "Enable the foo flag.\nExtra guard text.\n"
+            ),
+        )
+        self.commit("libavformat/dashenc: assign foo near mode")
+        rc, output = self.check()
+        self.assertEqual(rc, 0, output)
+        self.assertNotIn("option interplay:", output)
 
     def test_doc_terms_option_interplay_post_continuation_assign_passes(self) -> None:
         """An assignment after a continued condition closes does not trigger interplay."""

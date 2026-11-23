@@ -12,6 +12,7 @@ import shutil
 import subprocess  # nosec B404 - subprocess run for semgrep CLI tool.
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 
 from scripts import upstream_lint
@@ -754,7 +755,56 @@ def _flagged_in_fixture(source: str, rule_id: str) -> set[str]:
         return _flagged_functions(data.get("results", []), source, rule_id=rule_id)
 
 
-@unittest.skipUnless(shutil.which("semgrep"), "semgrep not installed; make semgrep needs it")
+def _should_run_semgrep_fixtures() -> bool:
+    """Run fixtures when semgrep is required or available."""
+    return os.environ.get("SEMGREP_FIXTURES_REQUIRED") == "1" or shutil.which("semgrep") is not None
+
+
+class SemgrepFixtureAvailabilityTest(unittest.TestCase):
+    """Verify when the semgrep fixture classes run."""
+
+    def test_unset_switch_skips_when_semgrep_is_missing(self) -> None:
+        """Skip fixtures when the switch is unset and semgrep is missing."""
+        with (
+            unittest.mock.patch.object(os, "environ", {}),
+            unittest.mock.patch.object(shutil, "which", return_value=None),
+        ):
+            self.assertFalse(_should_run_semgrep_fixtures())
+
+    def test_required_switch_runs_when_semgrep_is_missing(self) -> None:
+        """Run fixtures when the switch requires semgrep and it is missing."""
+        with (
+            unittest.mock.patch.object(os, "environ", {"SEMGREP_FIXTURES_REQUIRED": "1"}),
+            unittest.mock.patch.object(shutil, "which", return_value=None),
+        ):
+            self.assertTrue(_should_run_semgrep_fixtures())
+
+    def test_required_switch_runs_when_semgrep_is_present(self) -> None:
+        """Run fixtures when the switch requires semgrep and it is available."""
+        with (
+            unittest.mock.patch.object(os, "environ", {"SEMGREP_FIXTURES_REQUIRED": "1"}),
+            unittest.mock.patch.object(shutil, "which", return_value="/fixture/bin/semgrep"),
+        ):
+            self.assertTrue(_should_run_semgrep_fixtures())
+
+    def test_zero_switch_skips_when_semgrep_is_missing(self) -> None:
+        """Treat zero as optional when semgrep is missing."""
+        with (
+            unittest.mock.patch.object(os, "environ", {"SEMGREP_FIXTURES_REQUIRED": "0"}),
+            unittest.mock.patch.object(shutil, "which", return_value=None),
+        ):
+            self.assertFalse(_should_run_semgrep_fixtures())
+
+    def test_unset_switch_runs_when_semgrep_is_present(self) -> None:
+        """Run fixtures when semgrep is available and the switch is unset."""
+        with (
+            unittest.mock.patch.object(os, "environ", {}),
+            unittest.mock.patch.object(shutil, "which", return_value="/fixture/bin/semgrep"),
+        ):
+            self.assertTrue(_should_run_semgrep_fixtures())
+
+
+@unittest.skipUnless(_should_run_semgrep_fixtures(), "semgrep not installed; make semgrep needs it")
 class SemgrepRulesTest(unittest.TestCase):
     """Verify repository semgrep rule behavior against test fixtures."""
 
@@ -998,7 +1048,7 @@ class FfmpegRuleIdTest(unittest.TestCase):
         self.assertEqual([rule_id for rule_id in ids if "." in rule_id], [])
 
 
-@unittest.skipUnless(shutil.which("semgrep"), "semgrep not installed; make semgrep needs it")
+@unittest.skipUnless(_should_run_semgrep_fixtures(), "semgrep not installed; make semgrep needs it")
 class FfmpegSemgrepRulesTest(unittest.TestCase):
     """Verify .semgrep-ffmpeg.yml C rules against synthetic FFmpeg call fixtures."""
 

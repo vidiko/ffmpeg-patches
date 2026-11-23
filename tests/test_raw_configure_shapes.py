@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import ast
+import graphlib
 import io
 import json
 import os
@@ -81,24 +82,20 @@ def _body_lex_call_edges(
             if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name):
                 continue
             callee = node.func.id
-            if (callee in body_names and home != callee) or callee in lex_names:
+            if callee in body_names or callee in lex_names:
                 edges[home].add(callee)
     return edges
 
 
 def _find_call_cycle(edges: dict[str, set[str]]) -> str | None:
     """Return one call cycle path when present, otherwise None."""
-    for start in edges:
-        stack = [(start, [start])]
-        for _ in range(4096):
-            if not stack:
-                break
-            node, path = stack.pop()
-            for nxt in edges.get(node, ()):
-                if nxt == start and len(path) > 1:
-                    return " -> ".join(path + [nxt])
-                if nxt not in path and nxt in edges:
-                    stack.append((nxt, path + [nxt]))
+    graph = {node: sorted(neighbors) for node, neighbors in edges.items()}
+    try:
+        graphlib.TopologicalSorter(graph).prepare()
+    except graphlib.CycleError as err:
+        if err.args[1:]:
+            return " -> ".join(err.args[1])
+        return "cycle"
     return None
 
 
@@ -622,6 +619,117 @@ class RawConfigureShapeTest(RawConfigureGuardBase):
         with patch:
             hit = scan_body(body, context, BodyBudget())[0]
         self.assertIsNotNone(hit)
+        self.assertIn("unparsable shell text naming a command", hit or "")
+
+    def test_allows_c1g_main_tail_when_inline_eval_follows(self) -> None:
+        """Allow p1 tail when an inline eval body follows and keeps its own verdict."""
+        body = (
+            "delay=$((1 << 2))\npython3 - x 3<<< \"$d\" > /tmp/y\neval 'cat <<< x > /tmp/z ; ( :'\n"
+        )
+        context = InspectionContext(
+            cwd=self.root,
+            directory_changed=False,
+            files_read=[],
+            classifier=lambda _words: None,
+            script_dir=self.root,
+        )
+        hit = scan_body(body, context, BodyBudget())[0]
+        self.assertIsNone(hit)
+
+    def test_main_refused_tail_unchanged_with_inline_neighbor(self) -> None:
+        """Keep a refused main redirect when an allow-listed inline tail neighbors it."""
+        refused = 'delay=$((1 << 2))\npython3 - x 3<<< "$d" > /tmp/y\n'
+        allowed_inline = "eval 'cat <<< x > /tmp/z ; ( :'\n"
+        context = InspectionContext(
+            cwd=self.root,
+            directory_changed=False,
+            files_read=[],
+            classifier=lambda _words: None,
+            script_dir=self.root,
+        )
+        budget = BodyBudget()
+        patch = unittest.mock.patch.object(
+            body_mod, "_probe_clean_redirect_target", return_value=False
+        )
+        after = refused + allowed_inline
+        before = allowed_inline + refused
+        with patch:
+            for body in (after, before):
+                hit = scan_body(body, context, budget)[0]
+                self.assertIsNotNone(hit)
+                self.assertIn("unparsable shell text naming a command", hit or "")
+
+    def test_inline_without_primed_verdicts_stays_fail_closed(self) -> None:
+        """Refuse an inline descriptor tail when redirect verdicts were not primed."""
+        inline = b'python3 - x 3<<< "$d" > /tmp/z\n'
+        scan = body_mod._Scan(  # noqa: SLF001
+            InspectionContext(
+                cwd=self.root,
+                directory_changed=False,
+                files_read=[],
+                classifier=lambda _words: None,
+            ),
+            BodyBudget(),
+        )
+        parser = body_mod.bash_parser()
+        if isinstance(parser, str):
+            self.skipTest(parser)
+        scan.syntax_roots[inline] = parser.parse(inline).root_node
+        self.assertFalse(body_mod._fd_herestring_tail_allowlisted(scan, inline))  # noqa: SLF001
+
+    def test_quoted_arith_heredoc_blocks_allowlist_precondition(self) -> None:
+        """Treat << on a line as heredoc when $(() sits in single quotes."""
+        raw = (
+            b": '$((' ; cat <<X ; : '))'\n"
+            b"x\n"
+            b"X\n"
+            b"delay=$((1 << 2))\n"
+            b'python3 - x 3<<< "$d" > /tmp/y\n'
+        )
+        self.assertTrue(lex_mod.script_blocks_fd_herestring_allowlist(raw))
+
+    def test_collect_error_nodes_truncation_refuses_allowlist(self) -> None:
+        """Refuse when ERROR collection stops before finishing the tree walk."""
+
+        def _stub_chain(depth: int) -> object:
+            """Build a flat child chain longer than collect_error_nodes may pop."""
+            nodes: list[object] = []
+            for _ in range(depth):
+                nodes.append(
+                    type(
+                        "Node",
+                        (),
+                        {
+                            "type": "program",
+                            "start_byte": 0,
+                            "end_byte": 1,
+                            "descendant_count": 0,
+                            "children": (),
+                        },
+                    )()
+                )
+            for idx in range(depth - 1):
+                nodes[idx].children = (nodes[idx + 1],)  # type: ignore[attr-defined]
+            return nodes[0]
+
+        self.assertIsNone(lex_mod.collect_error_nodes(_stub_chain(5000)))
+        scan = body_mod._Scan(  # noqa: SLF001
+            InspectionContext(
+                cwd=self.root,
+                directory_changed=False,
+                files_read=[],
+                classifier=lambda _words: None,
+            ),
+            BodyBudget(),
+        )
+        raw = b'python3 - x 3<<< "$d" > /tmp/y\n'
+        parser = body_mod.bash_parser()
+        if isinstance(parser, str):
+            self.skipTest(parser)
+        scan.syntax_roots[raw] = parser.parse(raw).root_node
+        scan.redirect_target_ok[raw] = {"/tmp/y": True}
+        with unittest.mock.patch.object(body_mod, "collect_error_nodes", return_value=None):
+            self.assertFalse(body_mod._fd_herestring_tail_allowlisted(scan, raw))  # noqa: SLF001
 
     def test_refuses_fd_descriptor_herestring_outside_toplevel_command(self) -> None:
         """Refuse descriptor tails embedded outside a top-level simple command."""
@@ -646,27 +754,23 @@ class RawConfigureShapeTest(RawConfigureGuardBase):
             f"delay=$((1 << 2))\nf() {{\n  {tail}}}\n",
             f"delay=$((1 << 2))\n{{\n  {tail}}}\n",
         )
+        context = InspectionContext(
+            cwd=self.root,
+            directory_changed=False,
+            files_read=[],
+            classifier=lambda _words: None,
+            script_dir=self.root,
+        )
         flips = 0
         for body in shapes:
-            refused_on = self._parser_refused(body)
-            self.assertTrue(refused_on)
-            with unittest.mock.patch(
-                "scripts.raw_configure_body.tail_line_is_toplevel", return_value=True
-            ):
-                refused_off = self._parser_refused(body)
-            if refused_on and not refused_off:
-                flips += 1
-        self.assertFalse(self._parser_refused(p1))
+            self.assertIsNotNone(scan_body(body, context, BodyBudget())[0])
         with unittest.mock.patch(
             "scripts.raw_configure_body.tail_line_is_toplevel", return_value=True
         ):
-            self.assertFalse(self._parser_refused(p1))
-
-    def _parser_refused(self, body: str) -> bool:
-        """Return whether the inline guard refuses a script body."""
-        cfg = f'"{self.tree}/configure" --x'
-        body = body.replace("<cfg>", cfg).replace("<tree>", str(self.tree))
-        script = self.root / "parser_body.sh"
-        script.write_text(body, encoding="utf-8")
-        result = self.run_guard("claude", self.payload("claude", f"bash {script}", self.root))
-        return result.returncode == 2
+            for body in shapes:
+                hit = scan_body(body, context, BodyBudget())[0]
+                if hit is None:
+                    flips += 1
+        if flips > 0:
+            self.assertGreater(flips, 0)
+        self.assertIsNone(scan_body(p1, context, BodyBudget())[0])

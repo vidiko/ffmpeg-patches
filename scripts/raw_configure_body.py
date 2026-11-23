@@ -593,9 +593,9 @@ class _Scan:
     prefix: str | None = None
     stack: list[tuple[Any, bytes, bool]] = field(default_factory=list)
     refusal: str | None = None
-    fd_tail_allow: bool | None = None
-    redirect_target_ok: dict[str, bool] = field(default_factory=dict)
-    syntax_root: Any | None = None
+    fd_tail_allow: dict[bytes, bool | None] = field(default_factory=dict)
+    redirect_target_ok: dict[bytes, dict[str, bool]] = field(default_factory=dict)
+    syntax_roots: dict[bytes, Any] = field(default_factory=dict)
 
 
 def bash_parser() -> Any | str:
@@ -763,8 +763,7 @@ def _queue_inline(body: str, scan: _Scan, *, source: bool = False) -> None:
     if hit is not None:
         scan.refusal = hit
         return
-    scan.syntax_root = root
-    scan.fd_tail_allow = None
+    scan.syntax_roots[raw] = root
     if source:
         watched = set(scan.literals) | {o for o in scan.script_dirs.values() if o is not None}
         names = _assignment_texts(root, raw, scan.budget, scan.var_scope)
@@ -1401,43 +1400,46 @@ def _prime_fd_tail_verdicts(
     for target in tail[3]:
         text = target.decode("utf-8", "surrogateescape")
         verdicts[text] = _probe_clean_redirect_target(text, context, budget)
-    scan.redirect_target_ok = verdicts
+    scan.redirect_target_ok[raw] = verdicts
 
 
 def _fd_herestring_tail_allowlisted(scan: _Scan, raw: bytes) -> bool:
     """Return whether descriptor here-string ERROR spans match the narrow allow-list."""
     if scan.budget.suppress_fd_tail_allow:
         return False
-    if scan.fd_tail_allow is not None:
-        return scan.fd_tail_allow
+    cached = scan.fd_tail_allow.get(raw)
+    if cached is not None:
+        return cached
     allowed = False
-    root = scan.syntax_root
+    root = scan.syntax_roots.get(raw)
     tail = find_descriptor_herestring_tail(raw) if root is not None else None
     if root is not None and tail is not None:
         digit_byte, _line_start, line_end, targets = tail
         errors = collect_error_nodes(root)
-        spans_ok = not errors or errors_within_tail_span(errors, digit_byte, line_end, len(raw))
-        targets_ok = spans_ok and tail_line_is_toplevel(root, digit_byte)
-        for target in targets:
-            text = target.decode("utf-8", "surrogateescape")
-            targets_ok = targets_ok and scan.redirect_target_ok.get(text, False)
-        allowed = targets_ok
-    scan.fd_tail_allow = allowed
+        if errors is None:
+            allowed = False
+        else:
+            spans_ok = not errors or errors_within_tail_span(errors, digit_byte, line_end, len(raw))
+            verdicts = scan.redirect_target_ok.get(raw, {})
+            targets_ok = spans_ok and tail_line_is_toplevel(root, digit_byte)
+            for target in targets:
+                text = target.decode("utf-8", "surrogateescape")
+                targets_ok = targets_ok and verdicts.get(text, False)
+            allowed = targets_ok
+    scan.fd_tail_allow[raw] = allowed
     return allowed
 
 
 def _unterminated_heredoc_refusal(root: Any, raw: bytes) -> str | None:
     """Refuse when a missing heredoc end leaves dangerous bytes after the opener line."""
     stack = [root]
-    seen: set[int] = set()
     for _ in range(MAX_BODY_NODES):
         if not stack:
             break
         node = stack.pop()
-        if node.type != "heredoc_redirect" or id(node) in seen:
+        if node.type != "heredoc_redirect":
             stack.extend(node.children)
             continue
-        seen.add(id(node))
         missing_end = any(
             child.type == "heredoc_end" and child.is_missing for child in node.children
         )
@@ -1445,10 +1447,25 @@ def _unterminated_heredoc_refusal(root: Any, raw: bytes) -> str | None:
             stack.extend(node.children)
             continue
         start_byte = node.start_byte
+        line_stop = raw.find(b"\n", start_byte)
+        if line_stop < 0:
+            line_stop = len(raw)
+        tail = find_descriptor_herestring_tail(raw)
         line_end = raw.find(b"\n", start_byte)
         if line_end < 0:
             line_end = len(raw)
-        tail = raw[line_end + 1 :]
+        after_opener = raw[line_end + 1 :]
+        after_text = after_opener.decode("utf-8", "surrogateescape") if after_opener else ""
+        if (
+            tail is not None
+            and tail[3]
+            and tail[1] <= start_byte <= tail[2]
+            and b"<<<" in raw[start_byte:line_stop]
+            and not CONFIGURE_WORD.search(after_text)
+        ):
+            stack.extend(node.children)
+            continue
+        tail = after_opener
         if not tail:
             stack.extend(node.children)
             continue
@@ -1464,15 +1481,17 @@ def _error_hit(node: Any, raw: bytes, scan: _Scan) -> str | None:
     """Refuse malformed spans that can name commands and leave other spans as data."""
     if _fd_herestring_tail_allowlisted(scan, raw):
         return None
-    root = scan.syntax_root
+    root = scan.syntax_roots.get(raw)
     tail = find_descriptor_herestring_tail(raw) if root is not None else None
-    if tail is not None and scan.redirect_target_ok:
+    verdicts = scan.redirect_target_ok.get(raw, {})
+    if tail is not None and verdicts:
         digit_byte, _, line_end, targets = tail
         errors = collect_error_nodes(root)
-        spans_ok = not errors or errors_within_tail_span(errors, digit_byte, line_end, len(raw))
+        spans_ok = errors is not None and (
+            not errors or errors_within_tail_span(errors, digit_byte, line_end, len(raw))
+        )
         blocked = spans_ok and any(
-            not scan.redirect_target_ok.get(piece.decode("utf-8", "surrogateescape"), False)
-            for piece in targets
+            not verdicts.get(piece.decode("utf-8", "surrogateescape"), False) for piece in targets
         )
         if blocked:
             row = node.start_point.row + 1
@@ -3407,8 +3426,8 @@ def _run_scan_walk(
     directory_state: list[bool] | None,
 ) -> tuple[str | None, list[tuple[str, bool, bool]], list[str], list[tuple[str, bool, bool]]]:
     """Drive the bounded syntax walk after a parsed root is accepted."""
-    scan.syntax_root = root
-    scan.fd_tail_allow = None
+    scan.syntax_roots[raw] = root
+    scan.fd_tail_allow.pop(raw, None)
     _prime_names(scan, _assignment_texts(root, raw, budget), raw)
     if scan.context.script_dir is not None:
         scan.rebound = _environment_rebinds(scan.context, budget)

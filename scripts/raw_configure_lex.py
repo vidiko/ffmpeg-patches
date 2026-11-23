@@ -387,28 +387,54 @@ def _strip_redirections(tokens: list[str]) -> tuple[list[str], list[str]]:
     return words, attached
 
 
-def _line_arith_spans(line: bytes) -> list[tuple[int, int]]:
-    """Return byte spans of one-line arithmetic expansions on a line."""
-    spans: list[tuple[int, int]] = []
-    start = 0
-    for _ in range(16):
-        idx = line.find(b"$((", start)
-        if idx < 0:
-            break
-        depth = 1
-        pos = idx + 3
-        while pos < len(line) and depth:
-            if line[pos : pos + 2] == b"((":
-                depth += 1
-                pos += 2
-            elif line[pos : pos + 2] == b"))":
-                depth -= 1
-                pos += 2
-            else:
-                pos += 1
+def _close_arith_span(line: bytes, start: int) -> int | None:
+    """Return the end byte index after one arithmetic expansion or None when unclosed."""
+    depth = 1
+    pos = start + 3
+    for _ in range(len(line) - pos + 8):
+        if pos >= len(line):
+            return None
+        if line[pos : pos + 2] == b"((":
+            depth += 1
+            pos += 2
+        elif line[pos : pos + 2] == b"))":
+            depth -= 1
+            pos += 2
+        else:
+            pos += 1
         if depth == 0:
-            spans.append((idx, pos))
-        start = idx + 3
+            return pos
+    return None
+
+
+def _line_arith_spans(line: bytes) -> list[tuple[int, int]]:
+    """Return byte spans of one-line arithmetic expansions outside single quotes."""
+    spans: list[tuple[int, int]] = []
+    in_single = False
+    in_double = False
+    pos = 0
+    for _ in range(len(line) + 16):
+        if pos >= len(line):
+            break
+        byte = line[pos : pos + 1]
+        if not in_double and byte == b"'":
+            in_single = not in_single
+            pos += 1
+            continue
+        if not in_single and byte == b'"':
+            in_double = not in_double
+            pos += 1
+            continue
+        if in_single:
+            pos += 1
+            continue
+        if pos + 3 <= len(line) and line[pos : pos + 3] == b"$((":
+            end = _close_arith_span(line, pos)
+            if end is not None:
+                spans.append((pos, end))
+                pos = end
+                continue
+        pos += 1
     return spans
 
 
@@ -426,7 +452,7 @@ def script_blocks_fd_herestring_allowlist(raw: bytes) -> bool:
     if b"\r" in raw or b"\\\n" in raw or b"`" in raw:
         return True
     offset = 0
-    while offset < len(raw):
+    for _ in range(4096):
         pos = raw.find(b"<<", offset)
         if pos < 0:
             break
@@ -439,6 +465,8 @@ def script_blocks_fd_herestring_allowlist(raw: bytes) -> bool:
         if not _shift_allowed(line, local):
             return True
         offset = pos + 2
+        if offset > len(raw):
+            break
     return False
 
 
@@ -460,10 +488,21 @@ def _parse_herestring_word(line: bytes, pos: int) -> int | None:
     return end
 
 
+def _skip_spaces_tabs(line: bytes, pos: int) -> int:
+    """Return the index after horizontal whitespace at pos."""
+    tail = line[pos:]
+    return pos + (len(tail) - len(tail.lstrip(b" \t")))
+
+
+def _skip_spaces(line: bytes, pos: int) -> int:
+    """Return the index after space characters at pos."""
+    tail = line[pos:]
+    return pos + (len(tail) - len(tail.lstrip(b" ")))
+
+
 def _redirect_target_slice(line: bytes, pos: int) -> tuple[int, bytes] | None:
     """Return the index after one redirect target word and the target bytes."""
-    while pos < len(line) and line[pos : pos + 1] in (b" ", b"\t"):
-        pos += 1
+    pos = _skip_spaces_tabs(line, pos)
     word_end = _parse_herestring_word(line, pos)
     if word_end is not None:
         return word_end, line[pos:word_end]
@@ -497,8 +536,7 @@ def _parse_digit_redirect(line: bytes, pos: int, targets: list[bytes]) -> int | 
 
 def _parse_tail_redirect(line: bytes, pos: int, targets: list[bytes]) -> int | None:
     """Parse one redirection starting at pos or return None on rejection."""
-    while pos < len(line) and line[pos : pos + 1] in (b" ", b"\t"):
-        pos += 1
+    pos = _skip_spaces_tabs(line, pos)
     if pos >= len(line):
         return len(line)
     next_pos: int | None = None
@@ -519,9 +557,7 @@ def _tail_line_suffix_valid(line: bytes, digit: int) -> tuple[bool, list[bytes]]
     """Validate the tail suffix from a descriptor digit through end of line."""
     if line[digit + 1 : digit + 4] != b"<<<":
         return False, []
-    pos = digit + 4
-    while pos < len(line) and line[pos : pos + 1] == b" ":
-        pos += 1
+    pos = _skip_spaces(line, digit + 4)
     word_end = _parse_herestring_word(line, pos)
     if word_end is None:
         return False, []
@@ -534,8 +570,7 @@ def _tail_line_suffix_valid(line: bytes, digit: int) -> tuple[bool, list[bytes]]
         pos = nxt
         if pos >= len(line):
             break
-    while pos < len(line) and line[pos : pos + 1] == b" ":
-        pos += 1
+    pos = _skip_spaces(line, pos)
     return pos >= len(line), targets
 
 
@@ -580,18 +615,22 @@ def find_descriptor_herestring_tail(raw: bytes) -> tuple[int, int, int, list[byt
     return line_start + digit, line_start, line_end, targets
 
 
-def collect_error_nodes(root: object) -> list[tuple[int, int]]:
-    """Collect ERROR node byte spans from a syntax tree with a bounded walk."""
+_ERROR_COLLECT_CEILING = 4096
+
+
+def collect_error_nodes(root: object) -> list[tuple[int, int]] | None:
+    """Collect ERROR spans or None when the walk stops before the stack empties."""
     stack = [root]
     spans: list[tuple[int, int]] = []
-    for _ in range(4096):
+    bound = getattr(root, "descendant_count", 0) + _ERROR_COLLECT_CEILING
+    for _ in range(bound):
         if not stack:
-            break
+            return spans
         node = stack.pop()
         if node.type == "ERROR":
             spans.append((node.start_byte, node.end_byte))
         stack.extend(node.children)
-    return spans
+    return None
 
 
 _BLOCKED_ANCESTORS = frozenset(

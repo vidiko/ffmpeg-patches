@@ -1907,6 +1907,122 @@ class VulkanSweepTest(unittest.TestCase):
         self.assertEqual(sites[0].feature, "shaderInt64")
         self.assertIn("feats.shaderInt64", source.splitlines()[sites[0].line - 1])
 
+    def test_cr17_f1_inner_block_shadow_expires_before_outer_read(self) -> None:
+        """CR17 F1: a read after an inner block resolves the outer parameter declaration."""
+        self.addCleanup(reset_vulkan_maps)
+        ensure_maps_fixture()
+        source = (
+            "void gate(VkPhysicalDeviceFeatures *p) {\n"
+            "    {\n"
+            "        VkPhysicalDeviceProperties *p = 0;\n"
+            "        (void)p;\n"
+            "    }\n"
+            "    if (p->shaderInt64) {}\n"
+            "}\n"
+        )
+        pairs = [(s.feature, s.line) for s in sweep_vulkan_features.c_feature_reads(source)]
+        self.assertEqual(pairs, [("shaderInt64", 6)])
+
+    def test_cr17_f2_inner_local_shadow_expires_before_outer_read(self) -> None:
+        """CR17 F2: a read after an inner block resolves the outer local declaration."""
+        self.addCleanup(reset_vulkan_maps)
+        ensure_maps_fixture()
+        source = (
+            "void gate(void) {\n"
+            "    VkPhysicalDeviceFeatures feats;\n"
+            "    { VkPhysicalDeviceProperties feats; (void)feats; }\n"
+            "    if (feats.shaderInt64) {}\n"
+            "}\n"
+        )
+        pairs = [(s.feature, s.line) for s in sweep_vulkan_features.c_feature_reads(source)]
+        self.assertEqual(pairs, [("shaderInt64", 4)])
+
+    def test_cr17_f3_reverse_inner_features_shadow_expires(self) -> None:
+        """CR17 F3: inner Features param shadow does not hide outer Properties after the block."""
+        self.addCleanup(reset_vulkan_maps)
+        ensure_maps_fixture()
+        source = (
+            "void gate(VkPhysicalDeviceProperties *p) {\n"
+            "    {\n"
+            "        VkPhysicalDeviceFeatures *p = 0;\n"
+            "        (void)p;\n"
+            "    }\n"
+            "    if (p->shaderInt64) {}\n"
+            "}\n"
+        )
+        self.assertEqual(sweep_vulkan_features.c_feature_reads(source), [])
+
+    def test_cr17_f4_nested_two_level_shadow_expiry(self) -> None:
+        """CR17 F4: nested block shadows expire; the function-local decl wins after outer blocks."""
+        self.addCleanup(reset_vulkan_maps)
+        ensure_maps_fixture()
+        nested = (
+            "void gate(void) {\n"
+            "    VkPhysicalDeviceFeatures feats;\n"
+            "    {\n"
+            "        VkPhysicalDeviceProperties feats;\n"
+            "        {\n"
+            "            VkPhysicalDeviceFeatures feats;\n"
+            "            (void)feats;\n"
+            "        }\n"
+            "        if (feats.shaderInt64) {}\n"
+            "    }\n"
+            "    if (feats.shaderInt64) {}\n"
+            "}\n"
+        )
+        pairs = [(s.feature, s.line) for s in sweep_vulkan_features.c_feature_reads(nested)]
+        with self.subTest(which="inner_block_read"):
+            self.assertNotIn(("shaderInt64", 9), pairs)
+            self.assertEqual([p for p in pairs if p[1] == 9], [])
+        with self.subTest(which="after_outer_block"):
+            self.assertEqual([p for p in pairs if p[1] == 11], [("shaderInt64", 11)])
+
+    def test_cr17_f3_regression_sibling_and_no_inner_block(self) -> None:
+        """CR17 F3: inner-block, sibling-block, and no-inner-block cases keep expected reads."""
+        self.addCleanup(reset_vulkan_maps)
+        ensure_maps_fixture()
+        cases = (
+            (
+                "read_inside_inner",
+                (
+                    "void gate(void) {\n"
+                    "    VkPhysicalDeviceFeatures feats;\n"
+                    "    { VkPhysicalDeviceProperties feats; if (feats.shaderInt64) {} }\n"
+                    "}\n"
+                ),
+                [],
+            ),
+            (
+                "sibling_blocks",
+                (
+                    "void gate(void) {\n"
+                    "    { VkPhysicalDeviceFeatures feats; }\n"
+                    "    { VkPhysicalDeviceProperties feats; if (feats.shaderInt64) {} }\n"
+                    "}\n"
+                ),
+                [],
+            ),
+            (
+                "param_no_inner",
+                ("void gate(VkPhysicalDeviceFeatures *p) {\n    if (p->shaderInt64) {}\n}\n"),
+                [("shaderInt64", 2)],
+            ),
+            (
+                "local_no_inner",
+                (
+                    "void gate(void) {\n"
+                    "    VkPhysicalDeviceFeatures feats;\n"
+                    "    if (feats.shaderInt64) {}\n"
+                    "}\n"
+                ),
+                [("shaderInt64", 3)],
+            ),
+        )
+        for label, source, expected in cases:
+            with self.subTest(label=label):
+                pairs = [(s.feature, s.line) for s in sweep_vulkan_features.c_feature_reads(source)]
+                self.assertEqual(pairs, expected)
+
     def test_cr15b_inner_arrow_ineligible_properties_excluded(self) -> None:
         """An inner-arrow chain ending at VkPhysicalDeviceProperties yields no feature site."""
         self.addCleanup(reset_vulkan_maps)

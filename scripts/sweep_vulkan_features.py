@@ -76,8 +76,8 @@ class FeatureScopeContext(NamedTuple):
     """Hold scoped declaration maps for resolving one feature read receiver."""
 
     bounds: list[tuple[int, int]]
-    region_decls: list[list[tuple[int, str, str | None]]]
-    file_decls: list[tuple[int, str, str | None]]
+    region_decls: list[list[tuple[int, str, str | None, int]]]
+    file_decls: list[tuple[int, str, str | None, int]]
     member_types: dict[str, dict[str, tuple[str, bool]]]
     typedef_aliases: dict[str, str]
 
@@ -592,6 +592,80 @@ def c_depths_before_positions(masked: str, positions: list[int]) -> dict[int, tu
     return depths
 
 
+def c_brace_open_to_close(masked: str) -> dict[int, int]:
+    """Map each opening brace index to its matching closing brace index."""
+    limit = min(len(masked), MAX_MASK_BYTES)
+    stack: list[int] = []
+    pairs: dict[int, int] = {}
+    for index in range(limit):
+        ch = masked[index]
+        if ch == "{":
+            stack.append(index)
+        elif ch == "}" and stack:
+            pairs[stack.pop()] = index
+    return pairs
+
+
+def _scoped_decl_visibility_end(
+    brace: int,
+    region_end: int,
+    text_end: int,
+    brace_stack: list[int],
+    pairs: dict[int, int],
+) -> int:
+    """Return the source offset where a scoped declaration stops being visible."""
+    if brace == 0:
+        return region_end
+    if not brace_stack:
+        return text_end
+    close = pairs.get(brace_stack[-1])
+    if close is None:
+        return text_end
+    return close
+
+
+def _advance_brace_stack_to(
+    masked: str, brace_stack: list[int], scan: int, position: int, limit: int
+) -> int:
+    """Update brace_stack for masked indices in [scan, position) and return position."""
+    for index in range(scan, min(position, limit)):
+        ch = masked[index]
+        if ch == "{":
+            brace_stack.append(index)
+        elif ch == "}" and brace_stack:
+            brace_stack.pop()
+    return position
+
+
+class _ScopedDeclSink(NamedTuple):
+    """Hold mutable declaration maps while collecting scoped C bindings."""
+
+    masked: str
+    bounds: list[tuple[int, int]]
+    pairs: dict[int, int]
+    region_decls: list[list[tuple[int, str, str | None, int]]]
+    file_decls: list[tuple[int, str, str | None, int]]
+    brace_stack: list[int]
+
+
+def _record_scoped_var_decl(
+    sink: _ScopedDeclSink,
+    position: int,
+    name: str,
+    kind: str | None,
+    brace_paren: tuple[int, int],
+) -> None:
+    """Append one scoped declaration with its visibility end to the region maps."""
+    brace, paren = brace_paren
+    region = _region_index_for(sink.bounds, position)
+    vis_end = _scoped_decl_visibility_end(
+        brace, sink.bounds[region][1], len(sink.masked), sink.brace_stack, sink.pairs
+    )
+    sink.region_decls[region].append((position, name, kind, vis_end))
+    if brace == 0 and paren == 0:
+        sink.file_decls.append((position, name, kind, len(sink.masked)))
+
+
 def _region_index_for(bounds: list[tuple[int, int]], position: int) -> int:
     """Return the region index containing position."""
     for index, (start, end) in enumerate(bounds):
@@ -609,14 +683,18 @@ def c_collect_scoped_var_decls(
     masked: str,
 ) -> tuple[
     list[tuple[int, int]],
-    list[list[tuple[int, str, str | None]]],
-    list[tuple[int, str, str | None]],
+    list[list[tuple[int, str, str | None, int]]],
+    list[tuple[int, str, str | None, int]],
 ]:
     """Collect per-region and file-scope identifier declarations for feature reads."""
     allowed = MAP_STATE.feature_struct_names
     bounds = c_top_level_region_bounds(masked)
-    region_decls: list[list[tuple[int, str, str | None]]] = [[] for _ in bounds]
-    file_decls: list[tuple[int, str, str | None]] = []
+    region_decls: list[list[tuple[int, str, str | None, int]]] = [[] for _ in bounds]
+    file_decls: list[tuple[int, str, str | None, int]] = []
+    pairs = c_brace_open_to_close(masked)
+    brace_stack: list[int] = []
+    scan = 0
+    limit = min(len(masked), MAX_MASK_BYTES)
     events: list[tuple[int, str, str | None]] = []
     for match in FEATURE_STRUCT_DECL.finditer(masked):
         events.append((match.start(3), match.group(3), _vk_decl_kind(match.group(1), allowed)))
@@ -633,12 +711,11 @@ def c_collect_scoped_var_decls(
         events.append((match.start(1), match.group(1), match.group(1)))
     events.sort(key=lambda item: item[0])
     depth_map = c_depths_before_positions(masked, [item[0] for item in events])
+    sink = _ScopedDeclSink(masked, bounds, pairs, region_decls, file_decls, brace_stack)
     for position, name, kind in events:
-        region = _region_index_for(bounds, position)
-        region_decls[region].append((position, name, kind))
+        scan = _advance_brace_stack_to(masked, brace_stack, scan, position, limit)
         brace, paren = depth_map.get(position, (0, 0))
-        if brace == 0 and paren == 0:
-            file_decls.append((position, name, kind))
+        _record_scoped_var_decl(sink, position, name, kind, (brace, paren))
     return bounds, region_decls, file_decls
 
 
@@ -745,15 +822,18 @@ def c_struct_member_types(masked: str) -> dict[str, dict[str, tuple[str, bool]]]
 
 
 def _last_decl_before(
-    declarations: list[tuple[int, str, str | None]], position: int, name: str
-) -> tuple[int, str, str | None] | None:
-    """Return the last declaration of name strictly before position."""
-    found: tuple[int, str, str | None] | None = None
+    declarations: list[tuple[int, str, str | None, int]], position: int, name: str
+) -> tuple[int, str, str | None, int] | None:
+    """Return the last same-name declaration still visible strictly before position."""
+    found: tuple[int, str, str | None, int] | None = None
     for item in declarations:
         if item[0] >= position:
             break
-        if item[1] == name:
-            found = item
+        if item[1] != name:
+            continue
+        if item[3] <= position:
+            continue
+        found = item
     return found
 
 
@@ -761,8 +841,8 @@ def resolve_var_kind(
     position: int,
     name: str,
     bounds: list[tuple[int, int]],
-    region_decls: list[list[tuple[int, str, str | None]]],
-    file_decls: list[tuple[int, str, str | None]],
+    region_decls: list[list[tuple[int, str, str | None, int]]],
+    file_decls: list[tuple[int, str, str | None, int]],
 ) -> tuple[bool, str | None]:
     """Return whether name is unknown at position and its resolved struct tag if known."""
     region = _region_index_for(bounds, position)

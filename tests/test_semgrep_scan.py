@@ -11,6 +11,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import yaml
+
 ROOT = Path(__file__).resolve().parent.parent
 SCRIPT = ROOT / "scripts" / "semgrep_scan.sh"
 STUB = """#!/bin/sh
@@ -171,6 +173,28 @@ class SemgrepScanTest(unittest.TestCase):
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(argv, [*SCAN_ARGS, "--json-output=out.json", "--rules=other.yml"])
+
+
+class SemgrepWorkflowTest(unittest.TestCase):
+    """Verify the scanners workflow exercises the rule fixtures."""
+
+    def test_semgrep_job_requires_rule_fixtures(self) -> None:
+        """Run the rule fixtures with semgrep required in the pinned scanner container."""
+        workflow = yaml.safe_load(
+            (ROOT / ".github/workflows/scanners.yml").read_text(encoding="utf-8")
+        )
+        job = workflow["jobs"]["semgrep"]
+        self.assertRegex(job["container"]["image"], r"/semgrep/semgrep:[^@]+@sha256:[0-9a-f]{64}$")
+        fixture_steps = [
+            step
+            for step in job["steps"]
+            if "-m unittest" in step.get("run", "") and "tests.test_semgrep_rules" in step["run"]
+        ]
+        self.assertTrue(fixture_steps, "semgrep job must run tests.test_semgrep_rules")
+        required_values = [
+            step.get("env", {}).get("SEMGREP_FIXTURES_REQUIRED") for step in fixture_steps
+        ]
+        self.assertIn("1", required_values)
 
 
 if __name__ == "__main__":

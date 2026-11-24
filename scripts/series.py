@@ -45,6 +45,9 @@
 Exit status: 0 on success, 1 on findings or a failed apply, 2 when the
 tool cannot run (unreadable series files, unusable checkout).
 
+MAX_RELATED_AUTHOR_CHARS bounds related authors to 256 nonblank printable
+characters; controls and line separators are rejected.
+
 Every git call runs without global or system configuration, so user
 settings (apply.whitespace, am.keepcr, format.*, hooks) cannot change what
 is applied or exported.
@@ -129,6 +132,13 @@ CONTRIBUTION_KEYS = (
     "project",
     "note",
 )
+OPTIONAL_CONTRIBUTION_KEYS = ("fixes_issues", "related")
+RELATED_KEYS = ("number", "kind", "author", "reason", "state", "seen")
+RELATED_KINDS = ("pull", "issue")
+RELATED_REASONS = ("same-files", "same-patch-id", "same-subject")
+MAX_FIXES_ISSUES = 64
+MAX_RELATED_AUTHOR_CHARS = 256
+MAX_RELATED = 256
 # Patch status in the metadata -> state of its pull request on the forge.
 FORGE_STATES = {"submitted": "open", "merged": "merged", "rejected": "closed"}
 DAY = re.compile(r"^\d{4}-\d{2}-\d{2}$")
@@ -143,6 +153,11 @@ GIT_IDENTITY = ("-c", "user.name=ffmpeg-patches", "-c", "user.email=ffmpeg-patch
 GIT_TIMEOUT = 600
 FETCH_TIMEOUT = 300
 GIT_POLICY = ("-c", "core.hooksPath=/dev/null", "-c", "commit.gpgsign=false")
+# Allow-list of exact paths (never a pattern) where a master form conflict may be
+# union-merged: both sides add filter test program lines after the same base line.
+UNION_MERGE_PATHS = frozenset({"libavfilter/Makefile"})
+UNION_MARKER_SIZE = 32
+UNION_MARKERS = tuple(char * UNION_MARKER_SIZE for char in "<|=>")
 FORMAT_PATCH = (
     "format-patch",
     "--zero-commit",
@@ -661,14 +676,125 @@ def read_contributions(root: Path, findings: Findings) -> dict | None:
     return data
 
 
+def _valid_day(raw: object) -> bool:
+    """Return True when raw is a calendar YYYY-MM-DD date string."""
+    if not isinstance(raw, str) or not DAY.fullmatch(raw):
+        return False
+    try:
+        date.fromisoformat(raw)
+    except ValueError:
+        return False
+    return True
+
+
+def check_fixes_issues(entry: dict, where: str, findings: Findings) -> None:
+    """Validate the optional fixes_issues list on a contribution record."""
+    if "fixes_issues" not in entry:
+        return
+    issues = entry["fixes_issues"]
+    if not isinstance(issues, list):
+        findings.error(where, "'fixes_issues' must be a list")
+        return
+    if len(issues) > MAX_FIXES_ISSUES:
+        findings.error(where, f"'fixes_issues' exceeds cap of {MAX_FIXES_ISSUES}")
+        return
+    for item in issues[:MAX_FIXES_ISSUES]:
+        if not isinstance(item, int) or isinstance(item, bool) or item <= 0:
+            findings.error(where, "'fixes_issues' items must be positive integers")
+            return
+    if len(set(issues)) != len(issues):
+        findings.error(where, "'fixes_issues' must not contain duplicates")
+    if issues != sorted(issues):
+        findings.error(where, "'fixes_issues' must be sorted by number")
+
+
+def valid_related_author(raw: object) -> bool:
+    """Allow bounded nonblank printable account text, excluding controls and line separators."""
+    return (
+        isinstance(raw, str)
+        and 0 < len(raw) <= MAX_RELATED_AUTHOR_CHARS
+        and bool(raw.strip())
+        and all(char.isprintable() for char in raw[:MAX_RELATED_AUTHOR_CHARS])
+    )
+
+
+def _check_related_fields(item: dict, where: str, findings: Findings) -> None:
+    """Validate the field values of a related object whose required keys are present."""
+    for field_name, allowed in (
+        ("kind", RELATED_KINDS),
+        ("reason", RELATED_REASONS),
+        ("state", tuple(FORGE_STATES.values())),
+    ):
+        value = item[field_name]
+        if not isinstance(value, str) or value not in allowed:
+            findings.error(
+                where, f"'related' field {field_name!r} must be one of {', '.join(allowed)}"
+            )
+    author = item["author"]
+    if not valid_related_author(author):
+        findings.error(
+            where,
+            f"'related' field 'author' must be nonblank printable text of at most "
+            f"{MAX_RELATED_AUTHOR_CHARS} characters",
+        )
+    if not _valid_day(item["seen"]):
+        findings.error(where, "'related' field 'seen' must be a YYYY-MM-DD date")
+
+
+def check_related_item(item: object, where: str, findings: Findings) -> int | None:
+    """Validate one object of a contribution's related list and return its number."""
+    if not isinstance(item, dict):
+        findings.error(where, "'related' items must be objects")
+        return None
+    before = len(findings.errors)
+    for key in sorted(set(item) - set(RELATED_KEYS))[:MAX_RELATED]:
+        findings.error(where, f"'related' has unknown key {key!r}")
+    for key in RELATED_KEYS:
+        if key not in item:
+            findings.error(where, f"'related' lacks key {key!r}")
+    if len(findings.errors) != before:
+        return None
+    number = item["number"]
+    if not isinstance(number, int) or isinstance(number, bool) or number <= 0:
+        findings.error(where, "'related' field 'number' must be a positive integer")
+    _check_related_fields(item, where, findings)
+    return (
+        number if isinstance(number, int) and not isinstance(number, bool) and number > 0 else None
+    )
+
+
+def check_related(entry: dict, where: str, findings: Findings) -> None:
+    """Validate the optional related list on a contribution record."""
+    if "related" not in entry:
+        return
+    related = entry["related"]
+    if not isinstance(related, list):
+        findings.error(where, "'related' must be a list")
+        return
+    if len(related) > MAX_RELATED:
+        findings.error(where, f"'related' exceeds cap of {MAX_RELATED}")
+        return
+    numbers: list[int] = []
+    for item in related[:MAX_RELATED]:
+        num = check_related_item(item, where, findings)
+        if num is not None:
+            numbers.append(num)
+    if len(numbers) == len(related):
+        if len(set(numbers)) != len(numbers):
+            findings.error(where, "'related' must not contain duplicate numbers")
+        if numbers != sorted(numbers):
+            findings.error(where, "'related' must be sorted by number")
+
+
 def entry_shape_ok(entry: object, position: int, findings: Findings) -> bool:
-    """Exactly the known keys, `number` an integer, every other value a string."""
+    """Validate required and optional contribution keys, types and list invariants."""
     where = f"{CONTRIBUTIONS}: entry {position}"
     if not isinstance(entry, dict):
         findings.error(where, "is not an object")
         return False
     before = len(findings.errors)
-    for key in sorted(set(entry) - set(CONTRIBUTION_KEYS)):
+    allowed = set(CONTRIBUTION_KEYS) | set(OPTIONAL_CONTRIBUTION_KEYS)
+    for key in sorted(set(entry) - allowed)[:MAX_RELATED]:
         findings.error(where, f"unknown key {key!r}")
     for key in CONTRIBUTION_KEYS:
         if key not in entry:
@@ -677,6 +803,8 @@ def entry_shape_ok(entry: object, position: int, findings: Findings) -> bool:
             findings.error(where, "'number' must be an integer")
         elif key != "number" and not isinstance(entry[key], str):
             findings.error(where, f"{key!r} must be a string")
+    check_fixes_issues(entry, where, findings)
+    check_related(entry, where, findings)
     return len(findings.errors) == before
 
 
@@ -1052,11 +1180,154 @@ def apply_master_form(tree: Path, patch: Path, url: str, form: dict[str, str]) -
         path = Path(scratch) / "master.patch"
         path.write_text(diff, encoding="utf-8")
         applied = git(tree, "apply", "--3way", "--index", str(path), check=False)
-    if applied.returncode:
+    subject = f"{patch.name}: master form {base[:12]}..{head[:12]}"
+    if not applied.returncode:
+        git(tree, "commit", "-q", "-m", subject)
+        return "master-form"
+    try:
+        unioned = union_conflicts(tree, patch, applied)
+    except (SeriesError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        reset_failed_union(tree, patch)
+        raise
+    if unioned is None:
         git(tree, "reset", "-q", "--hard", "HEAD")
         return "conflict"
-    git(tree, "commit", "-q", "-m", f"{patch.name}: master form {base[:12]}..{head[:12]}")
+    body = "\n".join(f"union merge: {name} ({hunks} append-only hunks)" for name, hunks in unioned)
+    git(tree, "commit", "-q", "-m", f"{subject}\n\n{body}")
+    for name, hunks in unioned:
+        print(
+            f"note: {patch.name}: master form union merge in {name}: {hunks} append-only hunks",
+            file=sys.stderr,
+        )
     return "master-form"
+
+
+def reset_failed_union(tree: Path, patch: Path) -> None:
+    """Reset the checkout to HEAD after a failed union merge, warning on reset failure."""
+    try:
+        result = git(tree, "reset", "-q", "--hard", "HEAD", check=False)
+    except subprocess.TimeoutExpired:
+        outcome = "timed out"
+    else:
+        if not result.returncode:
+            return
+        outcome = f"failed (return code {result.returncode})"
+    print(
+        f"warning: {patch.name}: reset to HEAD after the failed union {outcome}; "
+        "the checkout may still hold conflict stages and patch changes",
+        file=sys.stderr,
+    )
+
+
+def union_conflicts(
+    tree: Path, patch: Path, applied: subprocess.CompletedProcess[str]
+) -> list[tuple[str, int]] | None:
+    """Union-merge every conflicted path of a 3-way apply; None when one path refuses."""
+    unmerged = read_unmerged(tree)
+    if not unmerged:
+        first = next(iter(applied.stderr.splitlines()), "")
+        reason = f"3-way apply failed without a conflict entry: {first}"
+        print(f"note: {patch.name}: master form conflict: {reason}", file=sys.stderr)
+        return None
+    checked = [(name, *union_eligible(tree, name, unmerged[name])) for name in sorted(unmerged)]
+    refused = [(name, reason) for name, reason, _ in checked if reason]
+    for name, reason in refused:
+        print(f"note: {patch.name}: master form conflict in {name}: {reason}", file=sys.stderr)
+    if refused:
+        return None
+    for name, _, _ in checked:
+        stage_union(tree, name, unmerged[name])
+    return [(name, hunks) for name, _, hunks in checked]
+
+
+def read_unmerged(tree: Path) -> dict[str, dict[int, tuple[str, str]]]:
+    """Map each unmerged index path to its stages: stage number to (mode, blob)."""
+    entries: dict[str, dict[int, tuple[str, str]]] = {}
+    for record in git(tree, "ls-files", "-u", "-z").stdout.split("\0"):
+        if not record:
+            continue
+        meta, _, name = record.partition("\t")
+        fields = meta.split(" ")
+        if len(fields) != 3 or fields[2] not in {"1", "2", "3"} or not name:
+            raise SeriesError(f"unexpected ls-files -u record: {record!r}")
+        entries.setdefault(name, {})[int(fields[2])] = (fields[0], fields[1])
+    return entries
+
+
+def union_eligible(tree: Path, name: str, stages: dict[int, tuple[str, str]]) -> tuple[str, int]:
+    """Return (refusal reason or "", append-only hunk count) for one conflicted path."""
+    if name not in UNION_MERGE_PATHS:
+        return "not in the union allow-list", 0
+    if sorted(stages) != [1, 2, 3] or any(mode != "100644" for mode, _ in stages.values()):
+        return "add, delete or mode conflict", 0
+    blobs = (stages[2][1], stages[1][1], stages[3][1])
+    if marker_collision(tree, blobs):
+        return "marker collision", 0
+    return append_only_hunks(tree, blobs)
+
+
+def marker_collision(tree: Path, blobs: tuple[str, ...]) -> bool:
+    """Whether any side has a line starting with a union merge conflict marker run."""
+    for blob in blobs:
+        text = git(tree, "cat-file", "blob", blob).stdout
+        if any(line.startswith(UNION_MARKERS) for line in text.splitlines()):
+            return True
+    return False
+
+
+def append_only_hunks(tree: Path, blobs: tuple[str, ...]) -> tuple[str, int]:
+    """Return (refusal reason or "", hunk count) from the diff3 merge of ours, base, theirs."""
+    merged = git(
+        tree,
+        "merge-file",
+        "--object-id",
+        "-p",
+        "--diff3",
+        f"--marker-size={UNION_MARKER_SIZE}",
+        *blobs,
+        check=False,
+    )
+    regions = conflict_regions(merged.stdout)
+    if not regions or merged.returncode != len(regions) or any(len(r) != 3 for r in regions):
+        return "diff3 output does not match its conflict count", 0
+    if any(base for _, base, _ in regions):
+        return "hunk changes base lines (not append-only)", 0
+    return "", len(regions)
+
+
+def conflict_regions(text: str) -> list[list[list[str]]]:
+    """Split diff3 output into [ours, base, theirs] line lists, one per conflict region."""
+    regions: list[list[list[str]]] = []
+    sections: list[list[str]] = []
+    for line in text.splitlines():
+        run = line[:UNION_MARKER_SIZE]
+        if run == UNION_MARKERS[0]:
+            sections = [[]]
+        elif not sections:
+            continue
+        elif run in UNION_MARKERS[1:3]:
+            sections.append([])
+        elif run == UNION_MARKERS[3]:
+            regions.append(sections)
+            sections = []
+        else:
+            sections[-1].append(line)
+    return regions
+
+
+def stage_union(tree: Path, name: str, stages: dict[int, tuple[str, str]]) -> None:
+    """Stage the union merge of one conflicted path and write it to the work tree."""
+    blobs = (stages[2][1], stages[1][1], stages[3][1])
+    union = (
+        "merge-file",
+        "--object-id",
+        "--zdiff3",
+        "--union",
+        f"--marker-size={UNION_MARKER_SIZE}",
+    )
+    blob = git(tree, *union, *blobs).stdout.strip()
+    git(tree, "update-index", "--cacheinfo", f"100644,{blob},{name}")
+    git(tree, "checkout-index", "-f", "--", name)
 
 
 def apply_for_master(tree: Path, patch: Path, url: str) -> str:

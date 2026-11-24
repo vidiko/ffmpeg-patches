@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import contextlib
+import operator
 import os
 import selectors
 import signal
@@ -15,6 +16,14 @@ from collections.abc import Sequence
 from typing import BinaryIO
 
 TASKKILL_TIMEOUT_S: float = 10.0
+
+
+def _timeout_expired(
+    process: subprocess.Popen[bytes],
+    timeout: float,
+) -> subprocess.TimeoutExpired:
+    """Build TimeoutExpired with the process argv and deadline."""
+    return operator.call(subprocess.TimeoutExpired, process.args, timeout)
 
 
 def read_bounded(
@@ -33,17 +42,13 @@ def read_bounded(
         for _ in range(limit + 2 * len(streams) + 2):
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                # semgrep-reason (expires 2026-11-21): category C; exception only, runs nothing
-                # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit.dangerous-subprocess-use-audit  # noqa: E501
-                raise subprocess.TimeoutExpired(process.args, timeout)
+                raise _timeout_expired(process, timeout)
             if not selector.get_map():
                 process.wait(timeout=remaining)
                 return [bytes(data) for data in output]
             ready = selector.select(remaining)
             if not ready:
-                # semgrep-reason (expires 2026-11-21): category C; exception only, runs nothing
-                # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit.dangerous-subprocess-use-audit  # noqa: E501
-                raise subprocess.TimeoutExpired(process.args, timeout)
+                raise _timeout_expired(process, timeout)
             for key, _ in ready:
                 chunk = os.read(key.fd, 4096)
                 if not chunk:

@@ -7,7 +7,7 @@ pylint==4.1.4
 # numpy: CIEDE2000 arithmetic of scripts/tonemap_parity.py (ADR-0002).
 numpy==2.5.5
 # PyYAML: tests read lefthook.yml and workflows.
-pyyaml==6.0.3
+pyyaml==6.0.4
 # tree-sitter: scripts/series.py measures C function spans (HISS-04 lengths gate).
 tree-sitter==0.26.1
 # tree-sitter-c: scripts/series.py measures C function spans (HISS-04 lengths gate).

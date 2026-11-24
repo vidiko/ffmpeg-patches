@@ -514,6 +514,38 @@ MAKE_BAN_CASES: tuple[tuple[str, bool], ...] = (
     ("Never run push.\n- `make fate-x`\n", False),
     ("Never run make or praetorctl.\n- `make fate-x`\n", True),
     ("Never run praetorctl.\n- `make fate-x`\n", True),
+    ("Never run make verify-all.\n- `make fate-x`\n", False),
+    (
+        (
+            "- `# Why: in a make recipe, column 1 is the recipe prefix, not a shell boundary.`\n"
+            "never run `make verify-all`, `make lint-all` or any whole-repository gate.\n"
+        ),
+        False,
+    ),
+    (
+        (
+            '- `self.skipTest("no cc or Vulkan headers; '
+            'VK_FFMPEG and VK_DEVICE make the build mandatory")`\n'
+            "Never run make, pre-commit, lefthook, praetorctl, semgrep, uv or pip; no network.\n"
+        ),
+        False,
+    ),
+    ("- `the make step`\nNever run make.\n", False),
+    (
+        (
+            "5. Planted cases: `make verify` with verify depending on test.\n"
+            "- never run a make target of a real repository.\n"
+        ),
+        True,
+    ),
+    ("- `cd tests && make fate-x`\nNever run make.\n", True),
+    ("- `FOO=1 make fate-x`\nNever run make.\n", True),
+    ("- `timeout 600 make fate-x`\nNever run make.\n", True),
+    ("Never run scripts that make network calls.\n- `make fate-x`\n", False),
+    ("Never run steps that make commits.\n- `make fate-x`\n", False),
+    ("Never run pre-commit, make or lefthook.\n- `make fate-x`\n", True),
+    ("never run a make target of a real repository.\n- `make fate-x`\n", True),
+    ("Never run make.\n- `praetorctl admit -- make fate-x`\n", True),
 )
 
 
@@ -1816,6 +1848,12 @@ class LaneBriefTest(unittest.TestCase):
                 else:
                     self.assertEqual(rc, 0, error)
                     self.assertNotIn("conflict:", error)
+
+    def test_make_and_praetorctl_ban_uses_praetorctl_message(self) -> None:
+        """Refuse row 8 banning make and praetorctl with the praetorctl admit message."""
+        rc, error = self.check_snippet(MAKE_BAN_CASES[7][0])
+        self.assertEqual(rc, 1, error)
+        self.assertIn("allow praetorctl admit", error)
 
     def test_conflict_alternate_forms_refused(self) -> None:
         """Refuse alternate column-limit, one-line join, and ERE grep length forms."""

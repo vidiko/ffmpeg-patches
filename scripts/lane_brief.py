@@ -54,6 +54,21 @@ ALLOWED_ADMIT = re.compile(r"\bexcept\b[^.;\n]*\badmit\b", re.IGNORECASE)
 FORBIDDEN_MAKE = re.compile(r"\bmake\b(?!\s+verify-all\b)", re.IGNORECASE)
 BACKTICK_SPAN = re.compile(r"(?<!`)`([^`]+)`(?!`)")
 MAKE_INVOCATION = re.compile(r"(?<![.-])\bmake\b(?![/.-])(?!\s+(?i:verify-all)\b)")
+MAKE_COMMAND = re.compile(
+    r"(?:\A|&&|\|\||;|\||\$\(|\(|(?<!\S)--(?=\s))\s*"
+    r"(?:(?:"
+    r"""[A-Za-z_][A-Za-z0-9_]*=(?:[^\s;|()`&'"]|"[^"]*"|'[^']*')*"""
+    r"|timeout\s+\d+(?:\.\d+)?[smhd]?"
+    r"|nice(?:\s+-n\s*[+-]?\d+)?"
+    r"|env|nohup|command|exec"
+    r")\s+)*"
+    r"(?<![.-])\bmake\b(?![/.-])(?!\s+(?i:verify-all)\b)"
+)
+CLAUSE_MAKE_BAN = re.compile(
+    r"(?:\bnever\s+run\b|,|\b(?:or|and|nor)\b)\s*(?:\b(?:a|an|any)\b\s+)?`?\bmake\b"
+    r"(?!\s+verify-all\b)",
+    re.IGNORECASE,
+)
 COLUMN_LIMIT = re.compile(
     r"(?:\b(?:(?:longer|more)\s+than|over|at\s+most)\s+|<=\s*)\d{2,3}\s+col(?:umn)?s\b",
     re.IGNORECASE,
@@ -378,21 +393,21 @@ def non_clause_spans(content: str) -> list[re.Match[str]]:
 
 
 def active_make_span(content: str) -> str:
-    """Return the first non-clause, non-host-ran backtick span invoking make."""
+    """Return the first non-clause, non-host-ran backtick span with make in command position."""
     return next(
         (
             match.group(1)
             for match in non_clause_spans(content)
             if "host ran" not in line_slice(content, match.start(), match.end()).lower()
-            and MAKE_INVOCATION.search(match.group(1))
+            and MAKE_COMMAND.search(match.group(1))
         ),
         "",
     )
 
 
 def conflict_forbidden_make(content: str, clauses: list[str]) -> str:
-    """Report a brief that runs make while forbidding make in Never run."""
-    make_clause = next((clause for clause in clauses if FORBIDDEN_MAKE.search(clause)), "")
+    """Report a brief with a make command span and a Never run clause banning make."""
+    make_clause = next((clause for clause in clauses if CLAUSE_MAKE_BAN.search(clause)), "")
     if not make_clause:
         return ""
     make_span = active_make_span(content)
@@ -407,7 +422,7 @@ def conflict_forbidden_make(content: str, clauses: list[str]) -> str:
 
 
 def conflict_make_without_praetorctl(content: str) -> str:
-    """Report a brief that runs make while forbidding praetorctl or make in Never run."""
+    """Report a brief with a make command span while Never run bans praetorctl or make."""
     clauses = [match.group(0) for match in NEVER_RUN_CLAUSE.finditer(content)]
     praetor_clause = next(
         (

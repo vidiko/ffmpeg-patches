@@ -504,6 +504,18 @@ CLI_THREAD_CASES: tuple[tuple[str, bool], ...] = (
     ("git diff -- scripts/a.py | grep '^+' | awk 'length > 72'", False),
 )
 
+MAKE_BAN_CASES: tuple[tuple[str, bool], ...] = (
+    ("Never run make.\n- `make fate-x`\n", True),
+    ("limits: Never run make or pre-commit.\n- `make -j4 fate-x`\n", True),
+    ("Never run make or praetorctl except praetorctl admit.\n- `make fate-x`\n", True),
+    ("Never run make.\n- host ran `make fate-x` (rc 0)\n", False),
+    ("Never run make.\nSee `make verify-all`.\n", False),
+    ("Never run `make` or `praetorctl`.\n", False),
+    ("Never run push.\n- `make fate-x`\n", False),
+    ("Never run make or praetorctl.\n- `make fate-x`\n", True),
+    ("Never run praetorctl.\n- `make fate-x`\n", True),
+)
+
 
 def _signal_probe(pid: int) -> bool:
     """Return whether the signal probe finds the process."""
@@ -1789,6 +1801,18 @@ class LaneBriefTest(unittest.TestCase):
                 if refused:
                     self.assertEqual(rc, 1, error)
                     self.assertIn(span, error)
+                else:
+                    self.assertEqual(rc, 0, error)
+                    self.assertNotIn("conflict:", error)
+
+    def test_make_ban_cases_table(self) -> None:
+        """Check make-ban and praetorctl-ban conflict cases through the check command."""
+        for row, (snippet, refused) in enumerate(MAKE_BAN_CASES, start=1):
+            with self.subTest(row=row, snippet=snippet):
+                rc, error = self.check_snippet(snippet)
+                if refused:
+                    self.assertEqual(rc, 1, error)
+                    self.assertIn("conflict:", error)
                 else:
                     self.assertEqual(rc, 0, error)
                     self.assertNotIn("conflict:", error)

@@ -377,8 +377,37 @@ def non_clause_spans(content: str) -> list[re.Match[str]]:
     return outside
 
 
+def active_make_span(content: str) -> str:
+    """Return the first non-clause, non-host-ran backtick span invoking make."""
+    return next(
+        (
+            match.group(1)
+            for match in non_clause_spans(content)
+            if "host ran" not in line_slice(content, match.start(), match.end()).lower()
+            and MAKE_INVOCATION.search(match.group(1))
+        ),
+        "",
+    )
+
+
+def conflict_forbidden_make(content: str, clauses: list[str]) -> str:
+    """Report a brief that runs make while forbidding make in Never run."""
+    make_clause = next((clause for clause in clauses if FORBIDDEN_MAKE.search(clause)), "")
+    if not make_clause:
+        return ""
+    make_span = active_make_span(content)
+    if not make_span:
+        return ""
+    span_text = " ".join(make_span.split())
+    clause_text = " ".join(make_clause.split())
+    return (
+        f"`{span_text}` with `{clause_text}`: "
+        "move the build to the host and record it as host ran, or drop make from Never run"
+    )
+
+
 def conflict_make_without_praetorctl(content: str) -> str:
-    """Report a brief that runs make while forbidding praetorctl in Never run."""
+    """Report a brief that runs make while forbidding praetorctl or make in Never run."""
     clauses = [match.group(0) for match in NEVER_RUN_CLAUSE.finditer(content)]
     praetor_clause = next(
         (
@@ -389,16 +418,8 @@ def conflict_make_without_praetorctl(content: str) -> str:
         "",
     )
     if not praetor_clause:
-        return ""
-    make_span = next(
-        (
-            match.group(1)
-            for match in non_clause_spans(content)
-            if "host ran" not in line_slice(content, match.start(), match.end()).lower()
-            and MAKE_INVOCATION.search(match.group(1))
-        ),
-        "",
-    )
+        return conflict_forbidden_make(content, clauses)
+    make_span = active_make_span(content)
     if not make_span:
         return ""
     span_text = " ".join(make_span.split())

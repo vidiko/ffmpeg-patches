@@ -575,6 +575,21 @@ def _run_output(
     return output.decode("utf-8", errors="replace")
 
 
+def _compose_argv(
+    argv: list[str], git_attr_source: str | None, git_settings: tuple[str, ...]
+) -> list[str]:
+    """Build a fresh command argv with optional Git -c and attr-source globals."""
+    if not argv:
+        return []
+    settings = [item for setting in git_settings for item in ("-c", setting)]
+    attr_options = (
+        ["--no-replace-objects", f"--attr-source={git_attr_source}"]
+        if git_attr_source is not None
+        else []
+    )
+    return [argv[0], *settings, *attr_options, *argv[1:]]
+
+
 def _run(  # noqa: PLR0913 - keep the optional Git attribute source explicit.
     argv: list[str],
     cwd: Path,
@@ -583,15 +598,15 @@ def _run(  # noqa: PLR0913 - keep the optional Git attribute source explicit.
     *,
     allow_any_executable: bool = False,
     git_attr_source: str | None = None,
+    git_settings: tuple[str, ...] = (),
 ) -> RunResult:
-    """Run a bounded isolated tool, keeping successful Git stdout free of stderr."""
-    if git_attr_source is not None:
-        argv = [argv[0], "--no-replace-objects", f"--attr-source={git_attr_source}", *argv[1:]]
+    """Run a bounded isolated tool; optional git_settings insert -c pairs after the executable."""
     if not allow_any_executable:
         try:
             _validate_executable(argv)
         except ValueError as error:
             return RunResult(tuple(argv), 2, str(error), started=False)
+    argv = _compose_argv(argv, git_attr_source, git_settings)
     if _DEADLINE.get() is not None:
         timeout = min(timeout, _remaining(timeout + REAP_TIMEOUT) - REAP_TIMEOUT)
         if timeout <= 0:

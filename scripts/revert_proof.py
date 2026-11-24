@@ -22,8 +22,9 @@ publication with exit 2. An older record is removed before runs
 start, output must be outside the caller work tree and Git administration, and
 the temporary parent must be outside the caller work tree, selected without probe writes.
 Ancestry, caller HEAD checks and scratch checkout read stored objects without replace refs.
-Scratch checkout populates all committed
-paths even for sparse callers, and suppresses setup hooks only; test commands keep hooks.
+Scratch checkout populates all committed paths even for sparse callers,
+and suppresses setup hooks (scratch registration, hard reset, reverse apply,
+and index reset) only; test commands keep hooks.
 Root fix commits are compared against the empty tree; reversing their source
 patch removes the added source files in scratch; conflicts or pathspecs selecting
 non-source paths exit 4. Only sha1 and sha256 object formats are accepted in preflight.
@@ -538,8 +539,10 @@ def measure_reverted(
     head: str,
     commit: str,
     source_paths: list[str],
+    hooks: Path,
 ) -> int | str:
     """Validate the exact reverse patch path set, apply it and run the same command."""
+    hooks_config = f"core.hooksPath={hooks}"
     patch = _source_patch(config, commit, source_paths)
     applied = upstream_lint._run(
         [
@@ -555,11 +558,21 @@ def measure_reverted(
         data=patch.stdout_bytes,
         timeout=GIT_TIMEOUT,
         git_attr_source=head,
+        git_settings=(hooks_config,),
     )
     if applied.returncode != 0 or applied.timed_out:
         raise _ReverseApplyError(f"reverse apply failed for {commit}: {applied.stdout.strip()}")
     # Pinned attribute reads need an initialized index. Leave the reverted patch unstaged.
-    git_out(config.tree, f"--attr-source={head}", "read-tree", "-i", "--reset", head)
+    git_out(
+        config.tree,
+        "-c",
+        hooks_config,
+        f"--attr-source={head}",
+        "read-tree",
+        "-i",
+        "--reset",
+        head,
+    )
     result = run_test_command(config.command, config.tree, config.timeout)
     if result == "launch-error":
         raise _HeadTestError("test launch-error on reverted checkout (no verdict)")
@@ -585,7 +598,7 @@ def measure_scratch(
     commit: str | None = None,
     source_paths: list[str] | None = None,
 ) -> int | str:
-    """Disable hooks for scratch registration and reset, measure stored objects, then clean up."""
+    """Disable hooks for registration, reset and reverse measurement, then clean up."""
     directory = Path(
         tempfile.mkdtemp(prefix="ffmpeg-revert-proof-", dir=scratch_parent(config.tree))
     )
@@ -627,7 +640,7 @@ def measure_scratch(
             head,
         )
         if commit is not None:
-            return measure_reverted(scratch_config, head, commit, paths)
+            return measure_reverted(scratch_config, head, commit, paths, hooks)
         result = run_test_command(config.command, scratch, config.timeout)
         return verify_head_run(scratch, result, head)
     finally:

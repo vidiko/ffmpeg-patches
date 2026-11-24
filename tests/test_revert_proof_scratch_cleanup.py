@@ -412,6 +412,89 @@ class ScratchReviewRegressionTest(RevertProofFixture):
         self.assertEqual(rc, 0, error)
         self.assertEqual(marker.read_text(encoding="ascii"), "hookhook")
 
+    def test_setup_index_writes_do_not_run_hooks(self) -> None:
+        """Reverse apply and index reset suppress hooks; test command keeps caller hooks."""
+        fix = self.make_fix()
+        marker = self.root / "index-hook-marker"
+        hooks = self.root / "hooks"
+        hooks.mkdir()
+        hook = hooks / "post-index-change"
+        hook.write_text(f"#!/bin/sh\nprintf x >> '{marker}'\n", encoding="ascii")
+        hook.chmod(0o755)
+        run_git(self.tree, "config", "core.hooksPath", str(hooks), preserve_config=True)
+        program = (
+            "from pathlib import Path; import sys\n"
+            f"if Path({str(marker)!r}).exists():\n"
+            "    raise SystemExit(9)\n"
+            "text = Path('libavfilter/vf_x.c').read_text()\n"
+            "raise SystemExit(0 if 'return 2;' in text else 7)"
+        )
+        rc, _, error = self.run_cli(fix, [sys.executable, "-c", program])
+        self.assertEqual(rc, 0, error)
+        self.assertTrue(self.record_path.is_file())
+        payload = json.loads(self.record_path.read_text(encoding="utf-8"))
+        self.assertEqual((payload["rc_head"], payload["rc_reverted"]), (0, 7))
+        self.assertFalse(marker.exists())
+
+    def test_test_commands_keep_index_hooks(self) -> None:
+        """Measured test commands that write the index still run caller post-index-change hooks."""
+        fix = self.make_fix()
+        marker = self.root / "index-hook-marker"
+        hooks = self.root / "hooks"
+        hooks.mkdir()
+        hook = hooks / "post-index-change"
+        hook.write_text(f"#!/bin/sh\nprintf x >> '{marker}'\n", encoding="ascii")
+        hook.chmod(0o755)
+        run_git(self.tree, "config", "core.hooksPath", str(hooks), preserve_config=True)
+        rc, _, error = self.run_cli(fix, ["git", "read-tree", "HEAD"])
+        self.assertEqual(rc, 0, error)
+        self.assertTrue(self.record_path.is_file())
+        self.assertEqual(marker.read_text(encoding="ascii"), "xx")
+
+    def test_review_post_index_change_before_reverted_command(self) -> None:
+        """Scratch-tree hook file from setup must not exist before the reverted test command."""
+        fix = self.make_fix()
+        hooks = self.root / "hooks"
+        hooks.mkdir()
+        hook = hooks / "post-index-change"
+        hook.write_text("#!/bin/sh\necho wrote > hook-wrote.txt\n", encoding="ascii")
+        hook.chmod(0o755)
+        run_git(self.tree, "config", "core.hooksPath", str(hooks), preserve_config=True)
+        program = (
+            "from pathlib import Path; import sys\n"
+            "if Path('hook-wrote.txt').exists():\n"
+            "    raise SystemExit(9)\n"
+            "text = Path('libavfilter/vf_x.c').read_text()\n"
+            "raise SystemExit(0 if 'return 2;' in text else 7)"
+        )
+        rc, _, error = self.run_cli(fix, [sys.executable, "-c", program])
+        self.assertEqual(rc, 0, error)
+        self.assertTrue(self.record_path.is_file())
+        payload = json.loads(self.record_path.read_text(encoding="utf-8"))
+        self.assertEqual((payload["rc_head"], payload["rc_reverted"]), (0, 7))
+
+    def test_caller_common_config_unmodified_during_reverse_setup(self) -> None:
+        """Scratch reverse setup must not rewrite bytes or inode of the caller config file."""
+        fix = self.make_fix()
+        hooks = self.root / "hooks"
+        hooks.mkdir()
+        hook = hooks / "post-index-change"
+        hook.write_text("#!/bin/sh\ntrue\n", encoding="ascii")
+        hook.chmod(0o755)
+        run_git(self.tree, "config", "core.hooksPath", str(hooks), preserve_config=True)
+        common = (
+            self.tree / run_git(self.tree, "rev-parse", "--git-common-dir", preserve_config=True)
+        ).resolve()
+        config_path = common / "config"
+        before_bytes = config_path.read_bytes()
+        before_stat = config_path.stat()
+        rc, _, error = self.run_cli(fix, [sys.executable, "-c", "pass"])
+        self.assertEqual(rc, 0, error)
+        after_stat = config_path.stat()
+        self.assertEqual(config_path.read_bytes(), before_bytes)
+        self.assertEqual(after_stat.st_ino, before_stat.st_ino)
+        self.assertEqual(after_stat.st_mtime_ns, before_stat.st_mtime_ns)
+
     def test_sparse_caller_gets_full_scratch_without_config_changes(self) -> None:
         """Per-command sparse overrides populate excluded files without caller writes."""
         self.write("excluded/data.txt", "committed data\n")

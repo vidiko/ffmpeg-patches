@@ -3599,6 +3599,51 @@ class RunnerTest(unittest.TestCase):
             )
         self.assertEqual(result.stdout, "line\r\n")
 
+    def test_git_settings_applies_command_line_config(self) -> None:
+        """Per-invocation -c settings expose values without persisting repository config."""
+        with tempfile.TemporaryDirectory() as directory:
+            tree = Path(directory)
+            run_git(tree, "init", "-q", preserve_config=True)
+            hooks = tree / "hooks-empty"
+            hooks.mkdir()
+            setting = f"core.hooksPath={hooks}"
+            result = upstream_lint._run(
+                ["git", "config", "--get", "core.hooksPath"],
+                tree,
+                git_settings=(setting,),
+            )
+            self.assertEqual(result.returncode, 0)
+            self.assertEqual(result.stdout.strip(), str(hooks))
+            missing = upstream_lint._run(["git", "config", "--get", "core.hooksPath"], tree)
+            self.assertEqual(missing.returncode, 1)
+
+    def test_git_settings_with_attr_source_prepend_globals(self) -> None:
+        """Both keywords insert globals before the subcommand and leave the input argv intact."""
+        argv = ["git", "status", "--porcelain"]
+        original = list(argv)
+        process = unittest.mock.MagicMock()
+        process.communicate.return_value = (b"", None)
+        process.returncode = 0
+        with unittest.mock.patch.object(upstream_lint.subprocess, "Popen") as popen:
+            popen.return_value.__enter__.return_value = process
+            result = upstream_lint._run(
+                argv,
+                Path.cwd(),
+                git_attr_source="deadbeef",
+                git_settings=("core.hooksPath=/tmp/empty",),
+            )
+        self.assertEqual(argv, original)
+        self.assertEqual(result.args[0], "git")
+        status_index = result.args.index("status")
+        for prefix in ("-c", "core.hooksPath=/tmp/empty", "--no-replace-objects"):
+            self.assertIn(prefix, result.args)
+        config_index = result.args.index("-c")
+        attr_index = next(
+            index for index, value in enumerate(result.args) if value.startswith("--attr-source=")
+        )
+        self.assertLess(config_index, status_index)
+        self.assertLess(attr_index, status_index)
+
     def test_reap_timeout_pid_guards(self) -> None:
         """Prove _reap_timeout guards against invalid and current-group PIDs."""
 

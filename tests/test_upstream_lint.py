@@ -192,6 +192,73 @@ DOC_MUXERS_T2 = (
     "Write one output file.\n"
     "@end table\n"
 )
+DOC_MUXERS_ITEMX_BASE = (
+    "@table @option\n"
+    "@item ignore_io_errors\n"
+    "@itemx ignore_errors\n"
+    "Ignore I/O errors.\n"
+    "@item global_sidx\n"
+    "Write a global sidx.\n"
+    "@item single_file\n"
+    "Write one output file.\n"
+    "@end table\n"
+)
+DOC_MUXERS_ITEMX_OMIT_GLOBAL_SIDX = (
+    "@table @option\n"
+    "@item ignore_io_errors\n"
+    "@itemx ignore_errors\n"
+    "Ignore I/O errors.\n"
+    "Skip flush failures when the output is not writable.\n"
+    "@item global_sidx\n"
+    "Write a global sidx.\n"
+    "@item single_file\n"
+    "Write one output file.\n"
+    "@end table\n"
+)
+DOC_MUXERS_AFTER_EXAMPLE_NAMES_GLOBAL_SIDX = (
+    "@table @option\n"
+    "@item ignore_io_errors\n"
+    "Ignore I/O errors.\n"
+    "Skip flush failures when the output is not writable.\n"
+    "@example\n"
+    "ffmpeg -i in -ignore_io_errors 1 out.mpd\n"
+    "@end example\n"
+    "Respect @option{global_sidx} when inserting index ranges.\n"
+    "@item global_sidx\n"
+    "Write a global sidx.\n"
+    "@item single_file\n"
+    "Write one output file.\n"
+    "@end table\n"
+)
+DOC_MUXERS_EXAMPLE_BASE = (
+    "@table @option\n"
+    "@item ignore_io_errors\n"
+    "Ignore I/O errors.\n"
+    "@example\n"
+    "ffmpeg -i in -ignore_io_errors 1 out.mpd\n"
+    "@end example\n"
+    "Keep segment output running.\n"
+    "@item global_sidx\n"
+    "Write a global sidx.\n"
+    "@item single_file\n"
+    "Write one output file.\n"
+    "@end table\n"
+)
+DOC_MUXERS_AFTER_EXAMPLE_OMIT_GLOBAL_SIDX = (
+    "@table @option\n"
+    "@item ignore_io_errors\n"
+    "Ignore I/O errors.\n"
+    "@example\n"
+    "ffmpeg -i in -ignore_io_errors 1 out.mpd\n"
+    "@end example\n"
+    "Keep segment output running.\n"
+    "Skip flush failures when the output is not writable.\n"
+    "@item global_sidx\n"
+    "Write a global sidx.\n"
+    "@item single_file\n"
+    "Write one output file.\n"
+    "@end table\n"
+)
 DOC_MUXERS_T3 = (
     "@table @option\n"
     "@item ignore_io_errors\n"
@@ -2398,6 +2465,48 @@ class DocTermTest(unittest.TestCase):
         tested = upstream_lint._option_fields_tested(line, fields, spans=spans.get(1, ()))
         self.assertEqual(tested, frozenset({"ignore_io_errors"}))
 
+    def test_option_fields_tested_assign_inside_condition_span(self) -> None:
+        """An assignment target inside an if condition span is not an option test."""
+        line = "if ((c->foo = enabled) && ready)"
+        fields = frozenset({"foo", "bar", "mode"})
+        spans = upstream_lint._condition_spans([line]).get(1, ())
+        self.assertEqual(spans, [(4, 31)])
+        self.assertEqual(
+            upstream_lint._option_fields_tested(line, fields, spans=spans),
+            frozenset(),
+        )
+
+    def test_option_fields_tested_assign_in_condition_keeps_rhs_read(self) -> None:
+        """A right-hand field read inside a condition assignment still counts as tested."""
+        line = "if ((c->foo = c->bar) && ready)"
+        fields = frozenset({"foo", "bar", "mode"})
+        spans = upstream_lint._condition_spans([line]).get(1, ())
+        self.assertEqual(
+            upstream_lint._option_fields_tested(line, fields, spans=spans),
+            frozenset({"bar"}),
+        )
+
+    def test_option_fields_tested_equality_inside_condition_span(self) -> None:
+        """An equality comparison inside an if condition span stays an option test."""
+        line = "if (c->foo == 1 && ready)"
+        fields = frozenset({"foo", "bar", "mode"})
+        spans = upstream_lint._condition_spans([line]).get(1, ())
+        self.assertEqual(
+            upstream_lint._option_fields_tested(line, fields, spans=spans),
+            frozenset({"foo"}),
+        )
+
+    def test_option_fields_tested_outside_only_boolean_assign_filtered(self) -> None:
+        """A bare assignment with boolean operators outside conditions is not a test."""
+        line = "c->foo = enabled && ready;"
+        fields = frozenset({"foo", "bar", "mode"})
+        spans = upstream_lint._condition_spans([line]).get(1, ())
+        self.assertEqual(spans, ())
+        self.assertEqual(
+            upstream_lint._option_fields_tested(line, fields, spans=spans),
+            frozenset(),
+        )
+
     def test_option_pairs_between_skips_same_field_aliases(self) -> None:
         """No option name pair is formed between two names of the same OFFSET field."""
         field_map = {
@@ -2441,6 +2550,144 @@ class DocTermTest(unittest.TestCase):
         self.assertEqual(len(ranges), 2)
         self.assertEqual(ranges[0][2], "a")
         self.assertEqual(ranges[1][2], "b")
+
+    def test_texi_entry_ranges_consecutive_itemx_shares_entry(self) -> None:
+        """Consecutive @item and @itemx headings share start, end and entry text."""
+        lines = [
+            "@table @option",
+            "@item foo",
+            "@itemx foo_alias",
+            "Sets the frame rate.",
+            "@end table",
+        ]
+        expected_text = "@item foo\n@itemx foo_alias\nSets the frame rate."
+        self.assertEqual(
+            upstream_lint.texi_entry_ranges(lines),
+            [
+                (2, 4, "foo", expected_text),
+                (2, 4, "foo_alias", expected_text),
+            ],
+        )
+
+    def test_texi_entry_ranges_three_consecutive_headings_share_entry(self) -> None:
+        """Three consecutive @item and @itemx headings share one range and description."""
+        lines = ["@table @option", "@item a", "@itemx b", "@itemx c", "Shared.", "@end table"]
+        expected_text = "@item a\n@itemx b\n@itemx c\nShared."
+        self.assertEqual(
+            upstream_lint.texi_entry_ranges(lines),
+            [
+                (2, 5, "a", expected_text),
+                (2, 5, "b", expected_text),
+                (2, 5, "c", expected_text),
+            ],
+        )
+
+    def test_texi_entry_ranges_itemx_after_prose_keeps_distinct_ranges(self) -> None:
+        """An @itemx line after body text starts a separate range and text."""
+        lines = ["@item a", "text", "@itemx b", "more", "@end table"]
+        self.assertEqual(
+            upstream_lint.texi_entry_ranges(lines),
+            [
+                (1, 2, "a", "@item a\ntext"),
+                (3, 4, "b", "@itemx b\nmore"),
+            ],
+        )
+
+    def test_texi_entry_ranges_inner_example_end_stays_in_entry(self) -> None:
+        """An inner @end example line keeps the example and following prose in the entry."""
+        lines = [
+            "@table @option",
+            "@item foo",
+            "Sets the frame rate.",
+            "@example",
+            "ffmpeg -i in -foo 2 out",
+            "@end example",
+            "Depends on mode.",
+            "@item bar",
+            "Other.",
+            "@end table",
+        ]
+        foo_text = (
+            "@item foo\nSets the frame rate.\n@example\n"
+            "ffmpeg -i in -foo 2 out\n@end example\nDepends on mode."
+        )
+        self.assertEqual(
+            upstream_lint.texi_entry_ranges(lines),
+            [
+                (2, 7, "foo", foo_text),
+                (8, 9, "bar", "@item bar\nOther."),
+            ],
+        )
+
+    def test_texi_entry_ranges_nested_itemize_items_stay_in_entry(self) -> None:
+        """@item lines inside an @itemize block stay inside the enclosing option entry."""
+        lines = [
+            "@table @option",
+            "@item foo",
+            "Modes:",
+            "@itemize",
+            "@item fast",
+            "@item slow",
+            "@end itemize",
+            "Depends on mode.",
+            "@item bar",
+            "Other.",
+            "@end table",
+        ]
+        foo_text = (
+            "@item foo\nModes:\n@itemize\n@item fast\n@item slow\n@end itemize\nDepends on mode."
+        )
+        self.assertEqual(
+            upstream_lint.texi_entry_ranges(lines),
+            [
+                (2, 8, "foo", foo_text),
+                (9, 10, "bar", "@item bar\nOther."),
+            ],
+        )
+
+    def test_texi_entry_ranges_nested_table_items_stay_in_entry(self) -> None:
+        """@item and @end table of a nested @table stay inside the outer option entry."""
+        lines = [
+            "@table @option",
+            "@item foo",
+            "Values:",
+            "@table @samp",
+            "@item auto",
+            "Pick one.",
+            "@end table",
+            "Depends on mode.",
+            "@item bar",
+            "Other.",
+            "@end table",
+        ]
+        foo_text = (
+            "@item foo\nValues:\n@table @samp\n@item auto\nPick one.\n@end table\nDepends on mode."
+        )
+        self.assertEqual(
+            upstream_lint.texi_entry_ranges(lines),
+            [
+                (2, 8, "foo", foo_text),
+                (9, 10, "bar", "@item bar\nOther."),
+            ],
+        )
+
+    def test_texi_entry_ranges_raw_block_commands_stay_literal(self) -> None:
+        """@item and @end table lines inside @verbatim stay literal entry text."""
+        lines = [
+            "@table @option",
+            "@item foo",
+            "@verbatim",
+            "@item fake",
+            "@end table",
+            "@end verbatim",
+            "Depends on mode.",
+            "@end table",
+        ]
+        foo_text = "@item foo\n@verbatim\n@item fake\n@end table\n@end verbatim\nDepends on mode."
+        self.assertEqual(
+            upstream_lint.texi_entry_ranges(lines),
+            [(2, 7, "foo", foo_text)],
+        )
 
     def test_option_named_in_text_underscore_matches_hyphen(self) -> None:
         """Underscores in the option name may match hyphenated Texinfo wording."""
@@ -4099,6 +4346,46 @@ class PipelineTest(FixtureTest):
         self.assertEqual(rc, 1, output)
         self.assertIn("step: doc-terms rc: 1", output)
         self.assertIn("foo near mode", output)
+
+    def test_doc_terms_option_interplay_shared_itemx_description_fails(self) -> None:
+        """Editing only the shared description of an @item/@itemx group checks the first name."""
+        self.write("libavformat/dashenc.c", DASHENC_BASE)
+        self.write("doc/muxers.texi", DOC_MUXERS_ITEMX_BASE)
+        self.commit("libavformat/dashenc: itemx option fixture")
+        self.base = self.git("rev-parse", "HEAD").strip()
+        self.write("libavformat/dashenc.c", DASHENC_T1_SOURCE)
+        self.write("doc/muxers.texi", DOC_MUXERS_ITEMX_OMIT_GLOBAL_SIDX)
+        self.commit("libavformat/dashenc: ignore I/O errors")
+        rc, output = self.check()
+        self.assertEqual(rc, 1, output)
+        self.assertIn("step: doc-terms rc: 1", output)
+        self.assertIn("added code tests ignore_io_errors near global_sidx", output)
+
+    def test_doc_terms_option_interplay_prose_after_example_named_passes(self) -> None:
+        """Naming global_sidx in prose after an @example block satisfies option interplay."""
+        self._write_dashenc_fixture()
+        self.commit("libavformat/dashenc: option table fixture")
+        self.base = self.git("rev-parse", "HEAD").strip()
+        self.write("libavformat/dashenc.c", DASHENC_T1_SOURCE)
+        self.write("doc/muxers.texi", DOC_MUXERS_AFTER_EXAMPLE_NAMES_GLOBAL_SIDX)
+        self.commit("libavformat/dashenc: ignore I/O errors")
+        rc, output = self.check()
+        self.assertEqual(rc, 0, output)
+        self.assertIn("step: doc-terms rc: 0", output)
+
+    def test_doc_terms_option_interplay_edit_after_example_omit_fails(self) -> None:
+        """Editing only prose after an @example block while omitting global_sidx fails."""
+        self.write("libavformat/dashenc.c", DASHENC_BASE)
+        self.write("doc/muxers.texi", DOC_MUXERS_EXAMPLE_BASE)
+        self.commit("libavformat/dashenc: option table with example")
+        self.base = self.git("rev-parse", "HEAD").strip()
+        self.write("libavformat/dashenc.c", DASHENC_T1_SOURCE)
+        self.write("doc/muxers.texi", DOC_MUXERS_AFTER_EXAMPLE_OMIT_GLOBAL_SIDX)
+        self.commit("libavformat/dashenc: ignore I/O errors")
+        rc, output = self.check()
+        self.assertEqual(rc, 1, output)
+        self.assertIn("step: doc-terms rc: 1", output)
+        self.assertIn("added code tests ignore_io_errors near global_sidx", output)
 
     def _write_dashenc_fixture(self) -> None:
         """Write the dashenc and muxers fixture files shared by option-interplay tests."""

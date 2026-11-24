@@ -101,10 +101,10 @@ after -> is allowed in option tests, and naming any alias of the neighbour
 field in a table that holds both options on different fields satisfies the entry.
 Texinfo @c and @comment text in an entry does not name a neighbour option.
 An explicit array bound in an AVOption table header still starts a new table.
-A structure field on the left of an assignment on a line is not an option test there.
-Entry scope is the nearest preceding
-@item or @itemx through the line before the next @item, @itemx or @end; the full
-entry text at head is used, not added lines alone. Only structure member access
+A structure field on the left of an assignment, in or outside a condition, is not a test.
+Consecutive @item and @itemx headings share one entry, running to the line before the next
+heading of the same table or that table's @end with inner blocks and raw blocks included;
+the full entry text at head is used, not added lines alone. Only structure member access
 with -> is treated as an option test, and inside an if or while condition only
 the condition text counts, so a field assigned after the condition closes is not
 an option test; interplay beyond the window of three head lines or across files
@@ -1789,6 +1789,7 @@ FIELD_ASSIGN_TARGET = re.compile(
 CONDITION_HEAD = re.compile(r"\b(?:if|while)\s*\(")
 TEXI_ITEM_HEAD = re.compile(r"^@itemx?\s+(\S+)")
 TEXI_ENTRY_BOUNDARY = re.compile(r"^@(?:itemx?|end)\b")
+TEXI_ENTRY_TABLES = frozenset(("ftable", "table", "vtable"))
 OPTION_TEST_MARKERS = ("if (", "while (", "&&", "||", "?")
 OUTSIDE_TEST_MARKERS = ("&&", "||", "?")
 SpanList = tuple[tuple[int, int], ...] | list[tuple[int, int]]
@@ -1943,7 +1944,7 @@ def _option_fields_tested(
 ) -> frozenset[str]:
     """Return option structure fields tested on one blanked source line."""
     if spans:
-        targets = [line[start:end] for start, end in spans]
+        targets = [_text_without_assignment_targets(line[start:end]) for start, end in spans]
         outside = _outside_spans(line, spans)
         if any(marker in outside for marker in OUTSIDE_TEST_MARKERS):
             targets.append(_text_without_assignment_targets(outside))
@@ -1968,21 +1969,62 @@ def texi_option_name(token: str) -> str:
     return token
 
 
+def _is_texi_entry_head(stack: list[str], has_open_entry: bool, entry_depth: int) -> bool:
+    """Return whether an @item or @itemx line at stack is a table entry head."""
+    if not stack:
+        return True
+    if stack[-1] not in TEXI_ENTRY_TABLES:
+        return False
+    return not (has_open_entry and len(stack) > entry_depth)
+
+
+def _append_texi_entry(
+    entries: list[tuple[int, int, str, str]],
+    lines: list[str],
+    start: int,
+    end: int,
+    names: list[str],
+) -> None:
+    """Append one 1-based range, name and text tuple per heading in an entry group."""
+    text = "\n".join(lines[start:end])
+    for name in names:
+        entries.append((start + 1, end, name, text))
+
+
 def texi_entry_ranges(lines: list[str]) -> list[tuple[int, int, str, str]]:
     """Return 1-based line ranges, option names and text for each @item entry."""
+    blocks = _texi_blocks(lines)
+    stack: list[str] = []
     entries: list[tuple[int, int, str, str]] = []
-    index = 0
-    while index < len(lines):
-        match = TEXI_ITEM_HEAD.match(lines[index])
-        if not match:
-            index += 1
+    names: list[str] = []
+    start = 0
+    entry_depth = 0
+    in_headings = False
+    for index, line in enumerate(lines):
+        depth_before = len(stack)
+        kind = _texi_block_step(line, blocks, stack)
+        if kind == "end" and names and (len(stack) < entry_depth or depth_before == 0):
+            _append_texi_entry(entries, lines, start, index, names)
+            names = []
+        if kind is not None:
+            in_headings = False
+            continue
+        match = TEXI_ITEM_HEAD.match(line)
+        if not match or not _is_texi_entry_head(stack, bool(names), entry_depth):
+            in_headings = False
             continue
         name = texi_option_name(match[1])
+        if names and in_headings and line.startswith("@itemx"):
+            names.append(name)
+            continue
+        if names:
+            _append_texi_entry(entries, lines, start, index, names)
+        names = [name]
         start = index
-        index += 1
-        while index < len(lines) and not TEXI_ENTRY_BOUNDARY.match(lines[index]):
-            index += 1
-        entries.append((start + 1, index, name, "\n".join(lines[start:index])))
+        entry_depth = len(stack)
+        in_headings = True
+    if names:
+        _append_texi_entry(entries, lines, start, len(lines), names)
     return entries
 
 
@@ -2214,20 +2256,26 @@ def _texi_raw_line(line: str, stack: list[str]) -> None:
         stack.pop()
 
 
-def _texi_prose_line(line: str, blocks: frozenset[str], stack: list[str]) -> bool:
-    """Track the open Texinfo blocks for one line and return whether it is filled prose."""
+def _texi_block_step(line: str, blocks: frozenset[str], stack: list[str]) -> str | None:
+    """Update open Texinfo blocks for one line and return the transition kind, or None."""
     if stack and stack[-1] in TEXI_RAW:
         _texi_raw_line(line, stack)
-        return False
-    end = TEXI_END.match(line)
-    if end:
+        return "raw"
+    if end := TEXI_END.match(line):
         if end[1] in stack:
             del stack[len(stack) - 1 - stack[::-1].index(end[1]) :]
+        return "end"
+    if (command := TEXI_COMMAND.match(line)) and command[1] in blocks:
+        stack.append(command[1])
+        return "open"
+    return None
+
+
+def _texi_prose_line(line: str, blocks: frozenset[str], stack: list[str]) -> bool:
+    """Track the open Texinfo blocks for one line and return whether it is filled prose."""
+    if _texi_block_step(line, blocks, stack) is not None:
         return False
     command = TEXI_COMMAND.match(line)
-    if command and command[1] in blocks:
-        stack.append(command[1])
-        return False
     if command and not (command[1] in TEXI_INLINE and line[command.end() :].startswith("{")):
         return False
     return bool(line.strip()) and all(name in TEXI_FILLED for name in stack)

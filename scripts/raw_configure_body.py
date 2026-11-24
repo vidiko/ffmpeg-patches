@@ -1409,15 +1409,21 @@ def _probe_clean_redirect_target(
     return hit is None
 
 
+def _merge_unique(first: list[Any], second: list[Any]) -> list[Any]:
+    """Combine two lists preserving first-seen order without duplicates."""
+    return list(dict.fromkeys([*first, *second]))
+
+
 def _descriptor_plain_twin_refusal(
     body: str,
     context: InspectionContext,
     budget: BodyBudget,
-) -> str | None:
-    """Refuse descriptor tails when the digit-stripped twin body is refused."""
+) -> tuple[str | None, list[tuple[str, bool, bool]], list[str], list[tuple[str, bool, bool]]]:
+    """Inspect the digit-stripped twin body and return its refusal and candidate lists."""
+    empty: list[Any] = []
     raw = body.encode("utf-8", "surrogateescape")
     if not descriptor_tail_marks_present(raw):
-        return None
+        return None, empty, empty, empty
     twin_raw = strip_descriptor_tail_marks(rewrite_descriptor_dups(raw))
     parser = bash_parser()
     prefix = (
@@ -1425,6 +1431,9 @@ def _descriptor_plain_twin_refusal(
         "without the descriptor digit is refused"
     )
     reason: str | None
+    twin_nested: list[tuple[str, bool, bool]] = []
+    twin_cd: list[str] = []
+    twin_filtered: list[tuple[str, bool, bool]] = []
     if isinstance(parser, str):
         reason = parser
     else:
@@ -1445,11 +1454,17 @@ def _descriptor_plain_twin_refusal(
         if prelude is not None:
             reason = prelude
         else:
-            hit, *_ = _run_scan_walk(root, twin_raw, scan, probe, twin_directory_state)
+            hit, twin_nested, twin_cd, twin_filtered = _run_scan_walk(
+                root, twin_raw, scan, probe, twin_directory_state
+            )
             reason = hit if hit is not None else scan.refusal
+            if reason is None:
+                twin_errors = collect_error_nodes(root)
+                if twin_errors is None or twin_errors:
+                    reason = "plain twin still contains unparsable shell syntax"
     if reason is None:
-        return None
-    return f"{prefix}: {reason}"
+        return None, twin_nested, twin_cd, twin_filtered
+    return f"{prefix}: {reason}", empty, empty, empty
 
 
 def _prime_fd_tail_verdicts(
@@ -3538,8 +3553,20 @@ def scan_body(
             empty,
             empty,
         )
-    twin_refusal = _descriptor_plain_twin_refusal(body, context, budget)
+    twin_refusal, twin_nested, twin_cd, twin_filtered = _descriptor_plain_twin_refusal(
+        body, context, budget
+    )
     if twin_refusal is not None:
         return twin_refusal, empty, empty, empty
     _prime_fd_tail_verdicts(scan, context, budget, raw)
-    return _run_scan_walk(root, raw, scan, budget, directory_state)
+    hit, nested, cd_targets, filtered = _run_scan_walk(root, raw, scan, budget, directory_state)
+    return (
+        (hit, empty, empty, empty)
+        if hit is not None
+        else (
+            None,
+            _merge_unique(nested, twin_nested),
+            _merge_unique(cd_targets, twin_cd),
+            _merge_unique(filtered, twin_filtered),
+        )
+    )

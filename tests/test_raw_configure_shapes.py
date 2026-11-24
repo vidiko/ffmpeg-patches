@@ -143,6 +143,122 @@ _GRAMMAR_CASES = (
     ("echo '3<<<'\n", 6, 0, "echo '3<<<'\n", 0),
     ("cat {1fd}<<< x\n", 4, 0, "cat {1fd}<<< x\n", 0),
 )
+_R10_PROBES = (
+    ("p00_control_plain_payload", "body", 'bash <<< "./helper.sh"\n'),
+    ("p01_dup_stdin_fd3_payload", "body", 'bash 0<&3 3<<< "./helper.sh"\n'),
+    ("p02_fd3_then_dup", "body", 'bash 3<<< "./helper.sh" 0<&3\n'),
+    ("p03_exec_bind_then_dup", "body", 'exec 3<<< "./helper.sh"\nbash 0<&3\n'),
+    ("p04_dup_payload_unquoted", "body", "bash 0<&3 3<<< ./helper.sh\n"),
+    ("p05_dup_payload_sub_helper", "body", 'bash 0<&3 3<<< "sub/helper.sh"\n'),
+    ("p06_dup_payload_source", "body", 'bash 0<&3 3<<< ". ./helper.sh"\n'),
+    ("p07_cat_tail_payload_pipe", "body", 'cat 0<&3 3<<< "./helper.sh" | bash\n'),
+    ("p08_sh_dup_payload", "body", 'sh 0<&3 3<<< "./helper.sh"\n'),
+    ("q00_cmd_control", "cmd", 'bash <<< "./helper.sh"'),
+    ("q01_cmd_dup_payload", "cmd", 'bash 0<&3 3<<< "./helper.sh"'),
+    ("q02_cmd_fd3_then_dup", "cmd", 'bash 3<<< "./helper.sh" 0<&3'),
+    ("q03_cmd_exec_then_dup", "cmd", 'exec 3<<< "./helper.sh"; bash 0<&3'),
+    (
+        "rq2_exec_copy_fd4_then_dup",
+        "body",
+        'exec 4<<< "./helper.sh"\nexec 3<<< x\nexec 3<&4\nbash 0<&3\n',
+    ),
+    ("rx1_dup_before_later_hs", "body", 'exec 3<<< "./helper.sh"\nbash 0<&3 3<<< x\n'),
+    ("rx2_two_hs_later_wins", "body", 'bash 3<<< x 3<<< "./helper.sh" 0<&3\n'),
+    ("rx3_dup_between_hs", "body", 'bash 3<<< "./helper.sh" 0<&3 3<<< x\n'),
+    (
+        "rd1_tail_then_mark_past_256",
+        "body",
+        'cat 3<<< "$d" > /tmp/y\n' + _R9_PAD + 'bash 0<&3 3<<< "./helper.sh"\n',
+    ),
+    (
+        "rd2_tail_then_cfg_past_256",
+        "body",
+        'cat 3<<< "$d" > /tmp/y\n' + _R9_PAD + f'bash 3<<< "{_PARITY_CFG}" 0<&3\n',
+    ),
+    ("q61_hyphen_digit_word", "body", "./helper-3<<< x\n"),
+    ("rk1_escaped_quote_then_dup", "body", "printf '%s' \\\" 3<<< x; bash 0<&3 3<<< ./helper.sh\n"),
+    (
+        "hk1_cmd_escaped_quote_then_dup",
+        "cmd",
+        "printf '%s' \\\" 3<<< x; bash 0<&3 3<<< ./helper.sh",
+    ),
+    ("hk2_cmd_escaped_quote_then_plain", "cmd", "printf '%s' \\\" 3<<< x; bash <<< ./helper.sh"),
+    (
+        "hk3_body_escaped_quote_then_plain",
+        "body",
+        "printf '%s' \\\" 3<<< x\nbash <<< ./helper.sh\n",
+    ),
+    ("hx1_cmd_dup_before_later_hs", "cmd", 'exec 3<<< "./helper.sh"; bash 0<&3 3<<< x'),
+    ("hx2_cmd_two_hs_later_wins", "cmd", 'bash 3<<< x 3<<< "./helper.sh" 0<&3'),
+    ("hx3_cmd_dup_between_hs", "cmd", 'bash 3<<< "./helper.sh" 0<&3 3<<< x'),
+    ("hc1_cmd_exec_copy_then_dup", "cmd", 'exec 4<<< "./helper.sh"; exec 3<&4; bash 0<&3'),
+    ("hc2_body_exec_copy_then_dup", "body", 'exec 4<<< "./helper.sh"\nexec 3<&4\nbash 0<&3\n'),
+    ("hc3_body_exec_copy_one_line", "body", 'exec 4<<< "./helper.sh" 3<&4\nbash 0<&3\n'),
+    (
+        "hc4_cmd_close_copy_rebind",
+        "cmd",
+        'exec 3<<< x; exec 3<&-; exec 4<<< "./helper.sh"; exec 3<&4; bash 0<&3',
+    ),
+    ("i01_body_dash_s_glued_dup", "body", 'bash -s<&3 3<<< "./helper.sh"\n'),
+    ("i02_body_dash_s_digit_glued_dup", "body", 'bash -s5<&3 3<<< "./helper.sh"\n'),
+    ("i03_body_fd_then_glued_dup", "body", 'bash 3<<< "./helper.sh" -s<&3\n'),
+    ("i04_body_dash_glued_dup", "body", 'sh -<&3 3<<< "./helper.sh"\n'),
+    ("i05_cmd_dash_s_glued_dup", "cmd", 'bash -s<&3 3<<< "./helper.sh"'),
+    ("i06_cmd_dash_s_digit_glued_dup", "cmd", 'bash -s5<&3 3<<< "./helper.sh"'),
+    ("i07_body_exec_then_glued_dup", "body", 'exec 3<<< "./helper.sh"\nbash -s<&3\n'),
+)
+_R10_BOUNDARIES = (
+    ("b01", "echo item-3<<<x", False),
+    ("b02", "echo item.3<<<x", False),
+    ("b03", "echo item/3<<<x", False),
+    ("b04", "echo item=3<<<x", False),
+    ("b05", "echo item+3<<<x", False),
+    ("b06", "echo item:3<<<x", False),
+    ("b07", "echo item,3<<<x", False),
+    ("b08", "echo item@3<<<x", False),
+    ("b09", "echo item%3<<<x", False),
+    ("b10", "echo item~3<<<x", False),
+    ("b11", "echo a;3<<<x; echo rc=$?", True),
+    ("b12", "echo a|3<<<x; echo rc=$?", True),
+    ("b13", "cat 3<<<x 0<&3", True),
+    ("b14", "echo b >3<<<x; cat 3", False),
+    ("b15", "exec 3>e3; echo d >&3<<<x; cat e3", False),
+    ("b16", "(3<<<x cat 0<&3)", True),
+    ("b17", "true &3<<<x cat 0<&3; wait", True),
+    ("b18", "echo item-{fd}<<<x", False),
+    ("r01", "(cat 0<&3)3<<<x; echo rc=$?", True),
+    ("r02", "{ cat 0<&3; }3<<<x; echo rc=$?", False),
+    ("r03", "true&&3<<<x cat 0<&3", True),
+    ("r04", "false||3<<<x cat 0<&3", True),
+    ("r05", "echo a|&3<<<x cat 0<&3", True),
+    ("r06", 'echo "item"3<<<x', False),
+    ("r07", "cat\t3<<<x 0<&3", True),
+    ("r08", "true\n3<<<x cat 0<&3", True),
+    ("r09", "echo $3<<<x", False),
+    ("r10", "(cat 0<&3) 3<<<x", True),
+    ("r11", "echo b &>3<<<x; cat 3", False),
+    ("r12", "echo b >&33<<<x; echo rc=$?", False),
+)
+_R10_DUP_ROWS = (
+    ("0<&3", True),
+    ("<&3", True),
+    ("-s<&3", True),
+    ("-s5<&3", True),
+    ("x-5<&3", True),
+    ("5<&3", False),
+)
+_R10_DESCRIPTOR_ROWS = (
+    ("c01", "exec 3<<<first; exec 3<&-; cat 0<&3; echo rc=$?", None),
+    ("c02", "exec 3<<<first; exec 3>&-; cat 0<&3; echo rc=$?", None),
+    ("c03", "exec 3<<<first; exec 3</dev/null; cat 0<&3; echo rc=$?", None),
+    ("c04", "exec 4<<<four; exec 3<<<first; exec 3<&4; cat 0<&3", "four"),
+    ("c05", "exec 3<<<first; true 3<&-; cat 0<&3", "first"),
+    ("c06", "exec 3<<<first; cat 3<&- 0<&3; echo rc=$?", None),
+    ("o01", "exec 3<<<first; cat 0<&3 3<<<second", "first"),
+    ("o02", "exec 3<<<first; cat 3<<<second 0<&3", "second"),
+    ("o03", "cat 3<<<one 3<<<two 0<&3", "two"),
+    ("o04", "cat 3<<<one 0<&3 3<<<two", "one"),
+)
 
 
 def _ast_module_funcs(path: Path) -> dict[str, ast.FunctionDef]:
@@ -679,10 +795,9 @@ class RawConfigureShapeTest(RawConfigureGuardBase):
             for word in _PARITY_WORDS:
                 for tail in _PARITY_TAILS:
                     plain = f"{cmd} <<< {word}{tail}"
-                    plain_rc = self.run_guard(
-                        client, self.payload(client, plain, self.tree)
-                    ).returncode
-                    if plain_rc != 2:
+                    plain_res = self.run_guard(client, self.payload(client, plain, self.tree))
+                    self.assertIn(plain_res.returncode, (0, 2), plain_res.stderr)
+                    if plain_res.returncode != 2:
                         continue
                     for fd in ("0", "3"):
                         desc = f"{cmd} {fd}<<< {word}{tail}"
@@ -734,7 +849,8 @@ class RawConfigureShapeTest(RawConfigureGuardBase):
 
     def test_descriptor_twin_refuses_when_plain_twin_parser_unavailable(self) -> None:
         """Refuse descriptor tails when the plain-twin side scan cannot parse."""
-        body = f'bash 0<<< "{_PARITY_CFG}"\n'
+        body = 'd=x\ncat 3<<< "$d"\n'
+        self.assertIsNone(scan_body(body, self._shape_context(), BodyBudget())[0])
         calls: list[int] = []
         real_parser = body_mod.bash_parser
 
@@ -749,6 +865,7 @@ class RawConfigureShapeTest(RawConfigureGuardBase):
             hit = scan_body(body, self._shape_context(), BodyBudget())[0]
         self.assertIsNotNone(hit)
         self.assertIn("without the descriptor digit is refused", hit or "")
+        self.assertIn("simulated parser unavailable", hit or "")
 
     def _shape_context(self) -> InspectionContext:
         """Build the inspection context shared by in-process shape probes."""
@@ -1036,7 +1153,7 @@ class RawConfigureShapeTest(RawConfigureGuardBase):
         ctx_patched = ctx_real._replace(files_read=[0])
         self.assertIsNone(scan_body(sourced_body, ctx_real, BodyBudget())[0])
         with unittest.mock.patch.object(
-            body_mod, "_descriptor_plain_twin_refusal", return_value=None
+            body_mod, "_descriptor_plain_twin_refusal", return_value=(None, [], [], [])
         ):
             self.assertIsNone(scan_body(sourced_body, ctx_patched, BodyBudget())[0])
         self.assertEqual(ctx_real.files_read[0], 1)
@@ -1073,3 +1190,106 @@ class RawConfigureShapeTest(RawConfigureGuardBase):
         for body in body_cases:
             with self.subTest(surface="body", body=body):
                 self.assertIsNotNone(scan_body(body, self._shape_context(), BodyBudget())[0])
+
+    def test_refuses_r10_probe_table(self) -> None:
+        """Refuse every in-scope r10 probe case across command and script-body surfaces."""
+        (self.tree / "sub").mkdir(exist_ok=True)
+        helper_text = f"{_PARITY_CFG} --help\n"
+        for name in ("helper.sh", "sub/helper.sh", "helper-3"):
+            target = self.tree / name
+            target.write_text(helper_text, encoding="utf-8")
+            target.chmod(0o755)
+        script = self.tree / "s.sh"
+        for label, kind, text in _R10_PROBES:
+            command = text
+            if kind == "body":
+                script.write_text(text, encoding="utf-8")
+                command = "bash ./s.sh"
+            with self.subTest(label=label, kind=kind):
+                self.assertIsNotNone(GUARD_MOD._inspect_with_deadline(command, self.tree))
+
+    def test_r10_boundary_and_dup_grammar_table(self) -> None:
+        """Match token-boundary descriptor marks and fd 0 dup recognition against bash."""
+        for label, text, want_mark in _R10_BOUNDARIES:
+            masked = lex_mod._mask_quoted_bytes(text.encode("utf-8"))
+            with self.subTest(label=label):
+                self.assertEqual(lex_mod._TAIL_MARK.search(masked) is not None, want_mark)
+        for dup_text, want_dup in _R10_DUP_ROWS:
+            with self.subTest(dup=dup_text):
+                self.assertEqual(lex_mod._dup_stdin_source(dup_text) == 3, want_dup)
+                bmatch = lex_mod._DUP_STDIN_BYTES.search(dup_text.encode("ascii"))
+                got_bytes = (
+                    bmatch is not None
+                    and lex_mod._dup_stdin_fd(bmatch.group(1), bmatch.group(2)) == 3
+                )
+                self.assertEqual(got_bytes, want_dup)
+
+    def _cat_stdin_from_tokens(self, command: str) -> str | None:
+        """Return the here-string word attached to cat fd 0 on the lexer surface."""
+        scanned, herestrings, _ = lex_mod._scan_herestrings(command)
+        tokens = lex_mod._tokens(scanned) or []
+        stages: list[list[str]] = [[]]
+        for tok in tokens:
+            if tok == ";":
+                stages.append([])
+            else:
+                stages[-1].append(tok)
+        for stage in stages:
+            words, attached = lex_mod._strip_redirections(stage)
+            if words and words[0] == "cat":
+                if attached and attached[0].startswith("__RCG_HS_0_"):
+                    return herestrings.get(attached[0])
+                return None
+        return None
+
+    def _cat_stdin_from_bytes(self, command: str) -> str | None:
+        """Return the plain here-string word rewritten onto cat fd 0 on the byte surface."""
+        rewritten = lex_mod.rewrite_descriptor_dups(command.encode("utf-8"))
+        for seg in rewritten.split(b";"):
+            if not seg.strip().startswith(b"cat "):
+                continue
+            masked = lex_mod._mask_quoted_bytes(seg)
+            mark_ends = {m.end() for m in lex_mod._TAIL_MARK.finditer(masked)}
+            words: list[str] = []
+            for idx in range(len(masked) - 2):
+                if masked[idx : idx + 3] == b"<<<" and idx + 3 not in mark_ends:
+                    span = lex_mod._herestring_word_end_bytes(seg, masked, idx + 3)
+                    if span is not None:
+                        words.append(seg[span[0] : span[1]].decode("utf-8"))
+            return words[-1] if words else None
+        return None
+
+    def test_r10_descriptor_table_both_surfaces(self) -> None:
+        """Match close, copy, rebind, and source-order descriptor resolution to bash."""
+        for label, command, want in _R10_DESCRIPTOR_ROWS:
+            with self.subTest(label=label, surface="tokens"):
+                self.assertEqual(self._cat_stdin_from_tokens(command), want)
+            with self.subTest(label=label, surface="bytes"):
+                self.assertEqual(self._cat_stdin_from_bytes(command), want)
+
+    def test_whole_body_descriptor_marks_past_256_lines(self) -> None:
+        """Count marks and reject qualification across lines beyond the former 256-line cap."""
+        two_marks = 'cat 3<<< "$d" > /tmp/y\n' + (":\n" * 298) + 'cat 4<<< "$e" > /tmp/z\n'
+        raw_two = two_marks.encode("utf-8")
+        self.assertEqual(lex_mod.descriptor_tail_mark_count(raw_two), 2)
+        self.assertIsNone(lex_mod.find_descriptor_herestring_tail(raw_two))
+        late_single = (":\n" * 299) + 'cat 3<<< "$d" > /tmp/y\n'
+        raw_single = late_single.encode("utf-8")
+        self.assertEqual(lex_mod.descriptor_tail_mark_count(raw_single), 1)
+        self.assertIsNotNone(lex_mod.find_descriptor_herestring_tail(raw_single))
+
+    def test_char_byte_offsets_and_escaped_quote_herestrings(self) -> None:
+        """Match char-to-byte table entries to UTF-8 prefix lengths and extract q01."""
+        surrogates = b"\x80\xff".decode("utf-8", "surrogateescape")
+        text = "az\u00e9\u00df\u20ac\u2603" + surrogates + " 3<<< x"
+        raw = text.encode("utf-8", "surrogatepass")
+        table = lex_mod._char_byte_offsets(text, raw) or ()
+        self.assertEqual(len(table), len(text) + 1)
+        for idx in range(len(text) + 1):
+            want = len(text[:idx].encode("utf-8", "surrogatepass"))
+            self.assertEqual(table[idx], want)
+        q01 = "printf '%s' \\\" 3<<< x; echo; cat 3<<<y 0<&3"
+        _, herestrings, hs_to_scan = lex_mod._scan_herestrings(q01)
+        self.assertEqual(hs_to_scan, ["x", "y"])
+        self.assertEqual(herestrings["__RCG_HS_FD3_0__"], "x")
+        self.assertEqual(herestrings["__RCG_HS_FD3_1__"], "y")

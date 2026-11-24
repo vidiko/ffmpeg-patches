@@ -5074,7 +5074,9 @@ class CRulesBlankingTest(_CRulesBlankingMixin, unittest.TestCase):
         """Precomputed arm joins skip sibling arms and nested conditionals when walking tails."""
         source = b"#if A\n#if B\n#else\n#endif\n#elif C\n#else\n#endif\n#ifdef D\n#else\n"
         lines = source.split(b"\n")
-        code, directives, directive_lines = upstream_lint._c_lex_lines(source.decode("latin-1"))
+        code, directives, directive_lines = upstream_lint._c_lex_lines(
+            source.decode("latin-1"), positions=True
+        )
         mapped = upstream_lint._c_rules_directive_words(lines, code, directives, directive_lines)
         if mapped is None:
             self.fail("directive word map missing for nested conditional fixture")
@@ -5086,7 +5088,9 @@ class CRulesBlankingTest(_CRulesBlankingMixin, unittest.TestCase):
         tail_source = b"#define CALL(x) int x;\n#if A\nCALL(a)\n#else\n{\n#endif\nint b;\n"
         tail_lines = tail_source.split(b"\n")
         tail_decoded = tail_source.decode("latin-1")
-        tail_code, tail_dirs, tail_dir_lines = upstream_lint._c_lex_lines(tail_decoded)
+        tail_code, tail_dirs, tail_dir_lines = upstream_lint._c_lex_lines(
+            tail_decoded, positions=True
+        )
         tail_mapped = upstream_lint._c_rules_directive_words(
             tail_lines, tail_code, tail_dirs, tail_dir_lines
         )
@@ -5119,6 +5123,183 @@ class CRulesBlankingTest(_CRulesBlankingMixin, unittest.TestCase):
                 self.assertEqual(blanked_lines[index], b" " * len(lines[index]))
             else:
                 self.assertEqual(blanked_lines[index], lines[index])
+
+    def test_directive_words_without_positions_fail_closed(self) -> None:
+        """Empty directive line list without positions yields no directive word map."""
+        text = "#if A\nint a;\n#endif\n"
+        lines = text.encode("latin-1").split(b"\n")
+        code, directives, _ = upstream_lint._c_lex_lines(text)
+        self.assertIsNone(upstream_lint._c_rules_directive_words(lines, code, directives, []))
+        code2, directives2, directive_lines2 = upstream_lint._c_lex_lines(text, positions=True)
+        mapped = upstream_lint._c_rules_directive_words(lines, code2, directives2, directive_lines2)
+        if mapped is None:
+            self.fail("expected directive word map with positions=True")
+        self.assertEqual(mapped[0], b"if")
+        self.assertEqual(mapped[2], b"endif")
+
+    def test_directive_positions_counted_once(self) -> None:
+        """Directive physical start lines use one running newline scan over the source."""
+        source = (
+            "int x = 0; \\\n"
+            "tail\n"
+            "#define D0 0\n"
+            "#define D1 \\\n"
+            " 1\n"
+            "#define D2 2\n"
+            "#define D3 \\\n"
+            " 3\n"
+            "#define D4 4\n"
+        )
+        expect = [2, 3, 5, 6, 8]
+        with_pos = upstream_lint._c_lex_lines(source, positions=True)
+        without_pos = upstream_lint._c_lex_lines(source)
+        self.assertEqual(with_pos[2], expect)
+        self.assertEqual(without_pos[2], [])
+        self.assertEqual(with_pos[0], without_pos[0])
+        self.assertEqual(with_pos[1], without_pos[1])
+
+    def test_mechanical_check_skips_directive_positions(self) -> None:
+        """Only c-rules blanking asks the lexer for directive physical positions."""
+        calls: list[bool] = []
+
+        sample = "int a;\n#define M 1\n"
+        original = upstream_lint._c_lex_lines
+
+        def wrapped(*args: object, **kwargs: object) -> tuple[list[str], list[str], list[int]]:
+            calls.append(bool(kwargs.get("positions", False)))
+            return original(*args, **kwargs)
+
+        calls.clear()
+        with unittest.mock.patch.object(upstream_lint, "_c_lex_lines", wraps=wrapped):
+            upstream_lint._code_lines(sample)
+            with tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp) / "t.c"
+                path.write_bytes(b"int x;\n")
+                upstream_lint._c_rules_read_source(path)
+            with tempfile.TemporaryDirectory() as tmp:
+                tree = Path(tmp)
+                (tree / "libavutil").mkdir()
+                (tree / "libavutil" / "attributes.h").write_bytes(b"#define av_cold\n")
+                upstream_lint._c_rules_attributes(tree)
+            self.assertTrue(all(not flag for flag in calls), calls)
+            calls.clear()
+            upstream_lint._c_rules_blank(sample.encode("latin-1"), set())
+            self.assertEqual(sum(calls), 1)
+            self.assertTrue(calls[0])
+
+    def test_macro_call_before_declarator_continuation_is_kept(self) -> None:
+        """Macro invocations kept when the next code continues the declarator."""
+        cases = (
+            b"#define DECL(x) static int x\nDECL(table)\n[4];\n",
+            b"#define DECL(x) static int x\nDECL(value)\n= 0;\n",
+            b"#define DECL(x) static int x\nDECL(a)\n, b;\n",
+            b"#define DECL(x) static int x\nDECL(a)\n;\n",
+            b"#define TYPE(x) x\nTYPE(int)\n*ptr;\n",
+            b"#define DECLARE(x) int x;\nDECLARE(a)\n[[maybe_unused]] int b;\n",
+        )
+        for source in cases:
+            self.assertEqual(upstream_lint._c_rules_blank(source, set()), source)
+        blank_call = b" " * len(b"DECLARE(a)") + b"\n"
+        controls = (
+            (
+                b"#define DECLARE(x) int x;\nDECLARE(a)\nint b;\n",
+                b"#define DECLARE(x) int x;\n" + blank_call + b"int b;\n",
+            ),
+            (
+                b"#define DECLARE(x) int x;\nDECLARE(a)\nstatic const int b = 1;\n",
+                b"#define DECLARE(x) int x;\n" + blank_call + b"static const int b = 1;\n",
+            ),
+            (
+                b'#define DECLARE(x) int x;\nDECLARE(a)\n_Static_assert(1, "x");\n',
+                b"#define DECLARE(x) int x;\n" + blank_call + b'_Static_assert(1, "x");\n',
+            ),
+            (
+                b"#define DECLARE(x) int x;\nDECLARE(a)\n",
+                b"#define DECLARE(x) int x;\n" + blank_call,
+            ),
+        )
+        for source, expected in controls:
+            self.assertEqual(upstream_lint._c_rules_blank(source, set()), expected)
+
+    def test_call_tail_reads_attribute_projection(self) -> None:
+        """Call-tail walks attribute-projected code so attribute-only lines are skipped."""
+        tag = b"av_fixture_tag"
+        sp = b" " * len(tag)
+        reviewer = (
+            b"#define DECL(x) static int x\n"
+            b"#if A\n"
+            b"DECL(f)\n"
+            b"#else\n"
+            b"DECL(g)\n"
+            b"#endif\n" + tag + b"\n"
+            b"(void)\n"
+            b"{ return 0; }\n"
+        )
+        expected_reviewer = (
+            b"#define DECL(x) static int x\n"
+            b"#if A\n"
+            b"DECL(f)\n"
+            b"#else\n"
+            b"DECL(g)\n"
+            b"#endif\n" + sp + b"\n"
+            b"(void)\n"
+            b"{ return 0; }\n"
+        )
+        self.assert_blanked(reviewer, expected_reviewer)
+        plain = b"#define DECL(x) static int x\nDECL(f)\n" + tag + b"\n(void)\n{ return 0; }\n"
+        expected_plain = (
+            b"#define DECL(x) static int x\nDECL(f)\n" + sp + b"\n(void)\n{ return 0; }\n"
+        )
+        self.assert_blanked(plain, expected_plain)
+        inline_attr = b"#define DECL(x) static int x\nDECL(f)\n" + tag + b" (void)\n{ return 0; }\n"
+        expected_inline = (
+            b"#define DECL(x) static int x\nDECL(f)\n" + sp + b" (void)\n{ return 0; }\n"
+        )
+        self.assert_blanked(inline_attr, expected_inline)
+
+    def test_call_tail_attribute_projection_controls(self) -> None:
+        """Declaration macros and unconfigured-attribute calls blank across arms."""
+        tag = b"av_fixture_tag"
+        sp = b" " * len(tag)
+        reviewer = (
+            b"#define DECL(x) static int x\n"
+            b"#if A\n"
+            b"DECL(f)\n"
+            b"#else\n"
+            b"DECL(g)\n"
+            b"#endif\n" + tag + b"\n"
+            b"(void)\n"
+            b"{ return 0; }\n"
+        )
+        declare_control = (
+            b"#define DECLARE(x) int x;\n"
+            b"#if A\n"
+            b"DECLARE(f)\n"
+            b"#else\n"
+            b"DECLARE(g)\n"
+            b"#endif\n" + tag + b"\nint b;\n"
+        )
+        dc_blank = b" " * len(b"DECLARE(f)")
+        dc_blank2 = b" " * len(b"DECLARE(g)")
+        expected_declare = (
+            b"#define DECLARE(x) int x;\n"
+            b"#if A\n" + dc_blank + b"\n"
+            b"#else\n" + dc_blank2 + b"\n"
+            b"#endif\n" + sp + b"\nint b;\n"
+        )
+        self.assert_blanked(declare_control, expected_declare)
+        no_attr = upstream_lint._c_rules_blank(reviewer, set())
+        na_blank_f = b" " * len(b"DECL(f)")
+        na_blank_g = b" " * len(b"DECL(g)")
+        expected_no_attr = (
+            b"#define DECL(x) static int x\n"
+            b"#if A\n" + na_blank_f + b"\n"
+            b"#else\n" + na_blank_g + b"\n"
+            b"#endif\n" + tag + b"\n"
+            b"(void)\n"
+            b"{ return 0; }\n"
+        )
+        self.assertEqual(no_attr, expected_no_attr)
 
 
 class CRulesTest(unittest.TestCase):

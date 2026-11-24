@@ -649,9 +649,9 @@ def _c_code_splices(logical: str, offsets: list[int]) -> set[int]:
 
 
 def _c_lex_lines(
-    source: str, reject_token_splices: bool = False
+    source: str, reject_token_splices: bool = False, positions: bool = False
 ) -> tuple[list[str], list[str], list[int]]:
-    """Project phase-2 code masks onto physical lines and optionally reject code-token splices."""
+    """Project phase-2 code masks; third tuple element lists directive lines only when positions."""
     logical, offsets = _c_splice_lines(source)
     splices = _c_code_splices(logical, offsets) if reject_token_splices else set()
     code, spanning, prefixes = _c_mask_noncode(logical, splices)
@@ -659,6 +659,8 @@ def _c_lex_lines(
     directive_lines: list[int] = []
     continued = False
     offset = 0
+    last_counted = 0
+    line_num = 0
     for index in range(len(code)):
         end = offset + len(code[index])
         starts = code[index].lstrip(" \t\r\v\f").startswith("#") and prefixes[index].lstrip(
@@ -668,7 +670,11 @@ def _c_lex_lines(
             splices.difference_update(range(offset, end + 1))
             if not continued:
                 directives.append(code[index])
-                directive_lines.append(source[: offsets[offset]].count("\n"))
+                if positions:
+                    phys = offsets[offset]
+                    line_num += source.count("\n", last_counted, phys)
+                    directive_lines.append(line_num)
+                    last_counted = phys
             continued = index in spanning
             code[index] = " " * len(code[index])
         offset = end + 1
@@ -683,7 +689,7 @@ def _c_lex_lines(
 
 def _code_lines(source: str) -> list[str]:
     """Return physical C code lines with comments, literals and logical directives masked."""
-    return _c_lex_lines(source)[0]
+    return _c_lex_lines(source, positions=False)[0]
 
 
 def _line_rules(raw: str, code: str, previous: str) -> list[str]:
@@ -2464,7 +2470,7 @@ def _c_rules_read_source(path: Path) -> bytes:
     source = path.read_bytes()
     if re.search(rb"\r(?!\n)", source):
         raise ValueError("bare CR line endings are not supported")
-    _c_lex_lines(source.decode("latin-1"), reject_token_splices=True)
+    _c_lex_lines(source.decode("latin-1"), reject_token_splices=True, positions=False)
     return source
 
 
@@ -2490,7 +2496,7 @@ def _c_rules_attributes(tree: Path) -> tuple[set[bytes], list[str]]:
         ]
     except ValueError as error:
         return set(), [f"informational: libavutil/attributes.h: {error}"]
-    directives = _c_lex_lines(source.decode("latin-1"))[1]
+    directives = _c_lex_lines(source.decode("latin-1"), positions=False)[1]
     names = re.findall(
         r"(?m)^[ \t]*#[ \t]*define[ \t]+((?:av_|attribute_)[A-Za-z0-9_]+)\b(?!\()",
         "\n".join(directives),
@@ -2540,6 +2546,8 @@ def _c_rules_directive_words(
         if word:
             physical_pairs.append((index, word))
     lexed_pairs: list[tuple[int, bytes]] = []
+    if len(directive_lines) != len(directives):
+        return None
     for index in range(len(directives)):
         match = re.match(r"(?a)[ \t]*#[ \t]*([A-Za-z_]\w*)", directives[index])
         if match is None:
@@ -2711,6 +2719,25 @@ def _c_rules_arm_join_next(arm_joins: list[int] | None, index: int) -> int:
     return join + 1 if join >= 0 else -1
 
 
+def _c_rules_blank_call_tail_should_blank(stripped: str) -> bool:
+    """Blank the call when the first remaining code line starts a new declaration."""
+    if not stripped:
+        return False
+    first = stripped[0]
+    return first == "_" or ("a" <= first <= "z") or ("A" <= first <= "Z")
+
+
+def _c_rules_attribute_projection(code: list[str], words: re.Pattern[bytes] | None) -> list[str]:
+    """Return masked code lines with each attribute token replaced by spaces."""
+    if words is None:
+        return code
+    projected: list[str] = []
+    for line in code:
+        raw = line.encode("latin-1")
+        projected.append(_c_rules_blank_words(raw, line, words).decode("latin-1"))
+    return projected
+
+
 def _c_rules_blank_call_tail_skip(
     word: bytes, nest: int, index: int, arm_joins: list[int] | None
 ) -> tuple[int, int, bool]:
@@ -2759,7 +2786,7 @@ def _c_rules_blank_call_tail(
             if word or not stripped:
                 index += 1
                 continue
-            return not (stripped.startswith("{") or stripped.startswith("("))
+            return _c_rules_blank_call_tail_should_blank(stripped)
         index, nest, skip = _c_rules_blank_call_tail_skip(word, nest, index, arm_joins)
     return True
 
@@ -2785,7 +2812,8 @@ def _c_rules_blank_call(
 
 def _c_rules_blank(source: bytes, attributes: set[bytes]) -> bytes:
     """Blank code attributes and file-scope macro calls, preserving all noncode bytes."""
-    code, directives, directive_lines = _c_lex_lines(source.decode("latin-1"))
+    text = source.decode("latin-1")
+    code, directives, directive_lines = _c_lex_lines(text, positions=True)
     names = set(
         re.findall(r"(?m)^[ \t]*#[ \t]*define[ \t]+([A-Za-z_]\w*)\(", "\n".join(directives))
     )
@@ -2794,6 +2822,7 @@ def _c_rules_blank(source: bytes, attributes: set[bytes]) -> bytes:
     mapped = _c_rules_directive_words(lines, code, directives, directive_lines)
     arm_joins = _c_rules_arm_joins(mapped if mapped is not None else [b""] * len(lines), len(lines))
     directive_words = mapped if mapped is not None else [b""] * len(lines)
+    projection = _c_rules_attribute_projection(code, words)
     depths = _c_rules_depths(lines, code, mapped)
     state = (0, True, False, False, 0, False, 0)
     stack: list[
@@ -2814,7 +2843,7 @@ def _c_rules_blank(source: bytes, attributes: set[bytes]) -> bytes:
             and depths[index] == 0
             and state[1]
             and _c_rules_blank_call(
-                raw, clean, names, (code, directive_words, index + 1, arm_joins)
+                raw, clean, names, (projection, directive_words, index + 1, arm_joins)
             )
         ):
             lines[index] = re.sub(rb"[^\r]", b" ", raw)

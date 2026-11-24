@@ -1004,7 +1004,200 @@ TOOL_SPECS: dict[str, ToolSpec] = {
 
 AWK_TOOL_NAMES = frozenset({"awk", "gawk", "mawk", "nawk"})
 AWK_LOAD_OPTS = frozenset({"-i", "--include", "-l", "--load"})
-AWK_FILE_CONSTRUCT = re.compile(r"\b(?:getline|system)\b|[<|]")
+AWK_ALLOWED_CHARS = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_ \t\n$(){}[];,+-*/%^!=<>?:~."
+)
+AWK_SAFE_WORDS = frozenset(
+    {
+        "BEGIN",
+        "END",
+        "if",
+        "else",
+        "while",
+        "for",
+        "do",
+        "in",
+        "break",
+        "continue",
+        "next",
+        "exit",
+        "delete",
+        "function",
+        "func",
+        "return",
+        "print",
+        "printf",
+        "length",
+        "substr",
+        "index",
+        "split",
+        "sub",
+        "gsub",
+        "match",
+        "sprintf",
+        "tolower",
+        "toupper",
+        "int",
+        "sqrt",
+        "exp",
+        "log",
+        "sin",
+        "cos",
+        "atan2",
+        "rand",
+        "srand",
+        "NR",
+        "NF",
+        "FNR",
+        "FS",
+        "OFS",
+        "ORS",
+        "RS",
+        "RSTART",
+        "RLENGTH",
+        "SUBSEP",
+        "CONVFMT",
+        "OFMT",
+        "FILENAME",
+    }
+)
+AWK_NON_OPERAND_WORDS = frozenset(
+    {
+        "BEGIN",
+        "END",
+        "if",
+        "else",
+        "while",
+        "for",
+        "do",
+        "in",
+        "break",
+        "continue",
+        "next",
+        "exit",
+        "delete",
+        "function",
+        "func",
+        "return",
+        "print",
+        "printf",
+    }
+)
+AWK_PRINT_WORDS = frozenset({"print", "printf"})
+AWK_PRINT_REDIRECT_OPS = frozenset({">", ">>"})
+AWK_STATEMENT_ENDS = frozenset({"\n", ";"})
+# Reserved namespace from gawk 5.4.1 FUNCTAB, SYMTAB, and the scalar-assignment measurement.
+AWK_RESERVED_WORDS = frozenset(
+    {
+        "ARGC",
+        "ARGIND",
+        "ARGV",
+        "BEGIN",
+        "BEGINFILE",
+        "BINMODE",
+        "CONVFMT",
+        "END",
+        "ENDFILE",
+        "ENVIRON",
+        "ERRNO",
+        "FIELDWIDTHS",
+        "FILENAME",
+        "FNR",
+        "FPAT",
+        "FS",
+        "FUNCTAB",
+        "IGNORECASE",
+        "LINT",
+        "NF",
+        "NR",
+        "OFMT",
+        "OFS",
+        "ORS",
+        "PREC",
+        "PROCINFO",
+        "RLENGTH",
+        "ROUNDMODE",
+        "RS",
+        "RSTART",
+        "RT",
+        "SUBSEP",
+        "SYMTAB",
+        "TEXTDOMAIN",
+        "and",
+        "asort",
+        "asorti",
+        "atan2",
+        "bindtextdomain",
+        "break",
+        "case",
+        "close",
+        "compl",
+        "continue",
+        "cos",
+        "dcgettext",
+        "dcngettext",
+        "default",
+        "delete",
+        "do",
+        "else",
+        "exit",
+        "exp",
+        "fflush",
+        "for",
+        "func",
+        "function",
+        "gensub",
+        "getline",
+        "gsub",
+        "if",
+        "in",
+        "index",
+        "int",
+        "isarray",
+        "k",
+        "length",
+        "log",
+        "lshift",
+        "match",
+        "mkbool",
+        "mktime",
+        "next",
+        "nextfile",
+        "or",
+        "patsplit",
+        "print",
+        "printf",
+        "rand",
+        "return",
+        "rshift",
+        "sin",
+        "split",
+        "sprintf",
+        "sqrt",
+        "srand",
+        "strftime",
+        "strtonum",
+        "sub",
+        "substr",
+        "switch",
+        "system",
+        "systime",
+        "tolower",
+        "toupper",
+        "typeof",
+        "while",
+        "xor",
+    }
+)
+AWK_NUMBER_RE = re.compile(r"(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?")
+AWK_IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+AWK_TOKEN_RE = re.compile(
+    r"\n"
+    r"|(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?"
+    r"|[A-Za-z_][A-Za-z0-9_]*"
+    r"|>>|>=|<=|==|!=|\|\||&&"
+    r"|[^ \t\nA-Za-z0-9_]"
+)
 ENV_ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 SED_FILE_COMMANDS = frozenset({"r", "R", "w", "W", "e"})
 SED_DELIMITED_COMMANDS = frozenset({"s", "y"})
@@ -1355,9 +1548,272 @@ def command_file_operands(words: list[str]) -> list[str]:
     return operands
 
 
+def skip_awk_string(source: str, start: int) -> int | None:
+    """Return index after closing double quote from start, or None if unterminated."""
+    escaped = False
+    for idx in range(start, len(source)):
+        char = source[idx]
+        if escaped:
+            escaped = False
+            continue
+        if char == "\\":
+            escaped = True
+            continue
+        if char == '"':
+            return idx + 1
+    return None
+
+
+def skip_awk_posix_class(source: str, start: int, kind: str) -> int | None:
+    """Return index after closing :], .], or =] in an awk regex bracket expression."""
+    end = source.find(f"{kind}]", start)
+    if end < 0 or "\n" in source[start:end]:
+        return None
+    return end + 2
+
+
+def step_awk_bracket_char(source: str, pos: int, first: int) -> tuple[int | None, bool]:
+    """Advance one item inside an awk regex bracket expression; bool marks closing ']'."""
+    limit = len(source)
+    char = source[pos]
+    if char == "]" and pos > first:
+        return pos + 1, True
+    if char == "\\":
+        if pos + 1 >= limit or source[pos + 1] == "\n":
+            return None, False
+        return pos + 2, False
+    if char == "[" and pos + 1 < limit and source[pos + 1] in ":.=":
+        return skip_awk_posix_class(source, pos + 2, source[pos + 1]), False
+    return pos + 1, False
+
+
+def skip_awk_bracket(source: str, start: int) -> int | None:
+    """Return index after closing ']' of a regex bracket expression starting at start."""
+    limit = len(source)
+    first = start + 1 if start < limit and source[start] == "^" else start
+    pos = first
+    for _ in range(limit - start + 1):
+        if pos >= limit or source[pos] == "\n":
+            return None
+        next_pos, closed = step_awk_bracket_char(source, pos, first)
+        if next_pos is None:
+            return None
+        if closed:
+            return next_pos
+        pos = next_pos
+    return None
+
+
+def skip_awk_regex(source: str, start: int) -> int | None:
+    """Return index after closing '/' of an awk regex literal, or None if unterminated."""
+    limit = len(source)
+    pos = start
+    for _ in range(limit - start + 1):
+        if pos >= limit or source[pos] == "\n":
+            return None
+        char = source[pos]
+        if char == "\\":
+            if pos + 1 >= limit or source[pos + 1] == "\n":
+                return None
+            pos += 2
+            continue
+        if char == "[":
+            ended = skip_awk_bracket(source, pos + 1)
+            if ended is None:
+                return None
+            pos = ended
+            continue
+        if char == "/":
+            return pos + 1
+        pos += 1
+    return None
+
+
+def step_awk_non_literal(source: str, index: int, prev_is_operand: bool) -> tuple[int, str, bool]:
+    """Consume one non-literal awk token or character at index and update operand state."""
+    char = source[index]
+    if char in " \t":
+        return index + 1, char, prev_is_operand
+    if char == "\\" and index + 1 < len(source) and source[index + 1] == "\n":
+        return index + 2, "\\\n", prev_is_operand
+    if source[index : index + 2] in ("++", "--"):
+        return index + 2, source[index : index + 2], prev_is_operand
+    num_match = AWK_NUMBER_RE.match(source, index)
+    if num_match is not None:
+        return num_match.end(), num_match.group(0), True
+    id_match = AWK_IDENT_RE.match(source, index)
+    if id_match is not None:
+        word = id_match.group(0)
+        return id_match.end(), word, word not in AWK_NON_OPERAND_WORDS
+    return index + 1, char, char in ")]"
+
+
+def strip_awk_literals(source: str) -> str | None:
+    """Replace awk strings and regex literals with ' 0 ', strip comments, or return None."""
+    kept: list[str] = []
+    limit = len(source)
+    index = 0
+    prev_is_operand = False
+    for _ in range(limit + 1):
+        if index >= limit:
+            return "".join(kept)
+        char = source[index]
+        if char == "#":
+            newline = source.find("\n", index)
+            index = limit if newline < 0 else newline
+            continue
+        if char == '"':
+            end = skip_awk_string(source, index + 1)
+            if end is None:
+                return None
+            kept.append(" 0 ")
+            index, prev_is_operand = end, True
+            continue
+        if char == "/" and not prev_is_operand:
+            end = skip_awk_regex(source, index + 1)
+            if end is None:
+                return None
+            kept.append(" 0 ")
+            index, prev_is_operand = end, False
+            continue
+        index, chunk, prev_is_operand = step_awk_non_literal(source, index, prev_is_operand)
+        kept.append(chunk)
+    return None
+
+
+def step_awk_special_char(stripped: str, idx: int, char: str) -> tuple[bool, bool]:
+    """Validate |, &, \\, or : at idx and return (allowed, consume_next)."""
+    nxt = stripped[idx + 1] if idx + 1 < len(stripped) else ""
+    if char == "|":
+        return nxt == "|", nxt == "|"
+    if char == "&":
+        return nxt == "&", nxt == "&"
+    if char == "\\":
+        return nxt == "\n", False
+    return nxt != ":", False
+
+
+def awk_chars_allowed(stripped: str) -> bool:
+    """Return whether stripped awk text uses only allow-listed ASCII characters."""
+    skip_next = False
+    for idx, char in enumerate(stripped):
+        if skip_next:
+            skip_next = False
+            continue
+        if char in "|&\\:":
+            ok, skip_next = step_awk_special_char(stripped, idx, char)
+            if not ok:
+                return False
+            continue
+        if char not in AWK_ALLOWED_CHARS:
+            return False
+    return True
+
+
+def classify_awk_token(token: str) -> tuple[str, str]:
+    """Classify one regex-matched awk token as nl, num, id, or op."""
+    if token == "\n":
+        return "nl", token
+    first = token[0]
+    if first.isdigit() or (first == "." and len(token) > 1):
+        return "num", token
+    if first.isascii() and (first.isalpha() or first == "_"):
+        return "id", token
+    return "op", token
+
+
+def tokenize_awk_stripped(stripped: str) -> list[tuple[str, str]]:
+    """Tokenize literal-stripped awk source after normalizing line continuations."""
+    normalized = stripped.replace("\\\n", " ")
+    return [classify_awk_token(m.group(0)) for m in AWK_TOKEN_RE.finditer(normalized)]
+
+
+def awk_identifiers_safe(tokens: list[tuple[str, str]]) -> bool:
+    """Return whether every awk identifier is a safe word or non-reserved user name."""
+    return all(
+        text in AWK_SAFE_WORDS or text not in AWK_RESERVED_WORDS
+        for kind, text in tokens
+        if kind == "id"
+    )
+
+
+def awk_defined_functions(tokens: list[tuple[str, str]]) -> set[str]:
+    """Collect user function names declared with function NAME( or func NAME(."""
+    defined: set[str] = set()
+    for idx in range(len(tokens) - 2):
+        kind, text = tokens[idx]
+        next_kind, next_text = tokens[idx + 1]
+        if (
+            kind == "id"
+            and text in ("function", "func")
+            and next_kind == "id"
+            and tokens[idx + 2] == ("op", "(")
+        ):
+            defined.add(next_text)
+    return defined
+
+
+def awk_calls_safe(tokens: list[tuple[str, str]]) -> bool:
+    """Return whether every identifier before '(' is safe or program-defined."""
+    allowed = AWK_SAFE_WORDS | awk_defined_functions(tokens)
+    return all(
+        tokens[idx][1] in allowed
+        for idx in range(len(tokens) - 1)
+        if tokens[idx][0] == "id" and tokens[idx + 1] == ("op", "(")
+    )
+
+
+def step_awk_print_depth(
+    text: str, in_print: bool, paren_depth: int, brace_depth: int, print_brace: int
+) -> tuple[bool, int, int]:
+    """Update print-statement state and paren/brace depths on one punctuation token."""
+    if text in AWK_STATEMENT_ENDS:
+        return False, paren_depth, brace_depth
+    if text == "{":
+        return in_print, paren_depth, brace_depth + 1
+    if text == "}":
+        still_in = in_print and brace_depth > print_brace
+        return still_in, paren_depth, max(0, brace_depth - 1)
+    if text == "(":
+        return in_print, paren_depth + 1, brace_depth
+    if text == ")":
+        return in_print, max(0, paren_depth - 1), brace_depth
+    return in_print, paren_depth, brace_depth
+
+
+def awk_print_redirects_safe(tokens: list[tuple[str, str]]) -> bool:
+    """Return whether print and printf statements avoid unparenthesized > or >>."""
+    in_print = False
+    paren_depth = 0
+    brace_depth = 0
+    print_paren = 0
+    print_brace = 0
+    for kind, text in tokens:
+        if kind == "id" and text in AWK_PRINT_WORDS and not in_print:
+            in_print, print_paren, print_brace = True, paren_depth, brace_depth
+            continue
+        if in_print and text in AWK_PRINT_REDIRECT_OPS and paren_depth <= print_paren:
+            return False
+        in_print, paren_depth, brace_depth = step_awk_print_depth(
+            text, in_print, paren_depth, brace_depth, print_brace
+        )
+    return True
+
+
+def awk_program_safe(source: str) -> bool:
+    """Return whether an awk program satisfies all allow-list scanner rules."""
+    stripped = strip_awk_literals(source)
+    if stripped is None or not awk_chars_allowed(stripped):
+        return False
+    tokens = tokenize_awk_stripped(stripped)
+    return (
+        awk_identifiers_safe(tokens) and awk_calls_safe(tokens) and awk_print_redirects_safe(tokens)
+    )
+
+
 def awk_program_reads_files(source: str) -> bool:
-    """Return whether an awk program uses getline, system, or pipe/input redirection."""
-    return bool(AWK_FILE_CONSTRUCT.search(strip_awk_double_quotes(source)))
+    """Return whether an awk program fails the allow-list safety scanner."""
+    return not awk_program_safe(source)
 
 
 def skip_sed_delimited(script: str, start: int, delim: str) -> int | None:
@@ -1509,12 +1965,19 @@ def sed_program_reads_files(program: str) -> bool:
     return True
 
 
+def awk_stage_safe(parsed: StageParse) -> bool:
+    """Return whether a parsed awk stage uses only inline allow-listed programs."""
+    if parsed.refused or parsed.uses_file or (parsed.seen_opts & AWK_LOAD_OPTS):
+        return False
+    if any(strip_awk_literals(prog) is None for prog in parsed.programs):
+        return False
+    return not awk_program_reads_files("\n".join(parsed.programs)) if parsed.programs else True
+
+
 def intermediate_program_safe(parsed: StageParse) -> bool:
     """Return whether an intermediate awk or sed stage avoids external file constructs."""
     if parsed.tool in AWK_TOOL_NAMES:
-        if parsed.uses_file or (parsed.seen_opts & AWK_LOAD_OPTS):
-            return False
-        return not any(awk_program_reads_files(prog) for prog in parsed.programs)
+        return awk_stage_safe(parsed)
     if parsed.tool == "sed":
         if parsed.uses_file:
             return False
@@ -1530,14 +1993,24 @@ def stage_reads_only_pipe(words: list[str], *, is_final: bool) -> bool:
     parsed = parse_tool_stage(words, cmd_index)
     if parsed.refused or parsed.input_redirects or any(op != "-" for op in parsed.operands):
         return False
-    return True if is_final else intermediate_program_safe(parsed)
+    if is_final:
+        return awk_stage_safe(parsed) if parsed.tool in AWK_TOOL_NAMES else True
+    return intermediate_program_safe(parsed)
+
+
+def length_command_program_safe(words: list[str]) -> bool:
+    """Return whether a length command's own program is safe to execute."""
+    tool_index = length_tool_index(words)
+    if tool_index is None or Path(words[tool_index]).name not in AWK_TOOL_NAMES:
+        return True
+    return awk_stage_safe(parse_tool_stage(words, tool_index))
 
 
 def length_command_allowed(words: list[str], pipeline: list[list[str]], command_index: int) -> bool:
     """Return whether a length command may read outside a git diff."""
     operands = command_file_operands(words)
     if operands and all(operand_is_lane_owned(operand) for operand in operands):
-        return True
+        return length_command_program_safe(words)
     if command_index == 0 or not GIT_DIFF_COMMAND.search(" ".join(pipeline[0])):
         return False
     return all(

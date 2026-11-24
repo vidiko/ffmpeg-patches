@@ -253,7 +253,7 @@ FIX5_G1_PARSE_CASES: tuple[tuple[str, bool], ...] = (
     ("awk -F, -v x=1 'length > 72' file", True),
     ("awk -F, -v x=1 'length > 72' .lane/tmp/a.txt", False),
     ("awk -f .lane/tmp/p.awk scripts/a.py", True),
-    ("awk -f .lane/tmp/p.awk .lane/tmp/a.txt", False),
+    ("awk -f .lane/tmp/p.awk .lane/tmp/a.txt", True),
     ("wc -L --bogus .lane/tmp/a.txt", True),
     ("wc -L -Z .lane/tmp/a.txt", True),
 )
@@ -276,6 +276,215 @@ FIX5_G3_CHAIN_CASES: tuple[tuple[str, bool], ...] = (
     ("git diff | grep -r x | wc -L", True),
     ("git diff | grep x scripts/a.py | wc -L", True),
     ("git diff | sort --files0-from=.lane/tmp/list | wc -L", True),
+)
+
+FIX6_PROBE_CASES: tuple[tuple[str, str, bool], ...] = (
+    (
+        "i01 awk ARGV reassign",
+        "git diff | awk 'BEGIN{ARGV[1]=\"scripts/a.py\";ARGC=2} 1' | wc -L",
+        True,
+    ),
+    (
+        "i02 awk ARGV append",
+        "git diff | awk 'BEGIN{ARGV[ARGC++]=\"scripts/a.py\"} 1' | wc -L",
+        True,
+    ),
+    (
+        "i03 gawk ARGV reassign",
+        "git diff | gawk 'BEGIN{ARGV[1]=\"scripts/a.py\";ARGC=2} 1' | wc -L",
+        True,
+    ),
+    (
+        "i04 awk ARGV via -v",
+        "git diff | awk -v f=scripts/a.py 'BEGIN{ARGV[1]=f;ARGC=2} 1' | wc -L",
+        True,
+    ),
+    (
+        "i05 awk ARGV string concat",
+        'git diff | awk \'BEGIN{ARGV[1]="scripts/" "a.py";ARGC=2} 1\' | wc -L',
+        True,
+    ),
+    (
+        "i06 gawk SYMTAB ARGV",
+        'git diff | gawk \'BEGIN{SYMTAB["ARGV"][1]="scripts/a.py";ARGC=2} 1\' | wc -L',
+        True,
+    ),
+    (
+        "i07 gawk SYMTAB ARGC",
+        'git diff | gawk \'BEGIN{SYMTAB["ARGC"]=2;ARGV[1]="scripts/a.py"} 1\' | wc -L',
+        True,
+    ),
+    (
+        "i08 gawk indirect builtin call",
+        'git diff | gawk \'BEGIN{f="system";@f("cat scripts/a.py")} 1\' | wc -L',
+        True,
+    ),
+    (
+        "i09 gawk @include",
+        "git diff | gawk '@include \"scripts/inc.awk\"\n1' | wc -L",
+        True,
+    ),
+    (
+        "i10 gawk -i include",
+        "git diff | gawk -i scripts/inc.awk 1 | wc -L",
+        True,
+    ),
+    (
+        "i11 awk print to command",
+        "git diff | awk '{print | \"cat scripts/a.py\"}' | wc -L",
+        True,
+    ),
+    (
+        "i12 awk command getline",
+        "git diff | awk 'BEGIN{\"cat scripts/a.py\" | getline l; print l} 1' | wc -L",
+        True,
+    ),
+    (
+        "i13 awk -f lane program",
+        "git diff | awk -f .lane/tmp/p.awk | wc -L",
+        True,
+    ),
+    (
+        "i14 awk getline from var",
+        "git diff | awk 'BEGIN{f=\"scripts/a.py\"; while ((getline l < f) > 0) print l} 1' | wc -L",
+        True,
+    ),
+    (
+        "i15 awk print redirect to file",
+        "git diff | awk '{print > \"/dev/stderr\"}' | wc -L",
+        True,
+    ),
+    (
+        "i16 gawk -e program ARGV",
+        "git diff | gawk -e 'BEGIN{ARGV[1]=\"scripts/a.py\";ARGC=2}' -e 1 | wc -L",
+        True,
+    ),
+    (
+        "i17 awk -- program ARGV",
+        "git diff | awk -- 'BEGIN{ARGV[1]=\"scripts/a.py\";ARGC=2} 1' | wc -L",
+        True,
+    ),
+    ("c01 awk field print", "git diff | awk '{print $1}' | wc -L", False),
+    ("c02 awk -v user var", "git diff | awk -v n=3 'NR > n' | wc -L", False),
+    (
+        "c03 awk user function",
+        "git diff | awk 'function f(x) { return x } { print f($0) }' | wc -L",
+        False,
+    ),
+    ("c04 awk regex filter", r"git diff | awk '/^\+/ && !/^\+\+\+/' | wc -L", False),
+    ("c05 awk sub strip", "git diff | awk '{ sub(/^\\+/, \"\") } 1' | wc -L", False),
+    ("c06 awk regex naming ARGV", "git diff | awk '$0 ~ /ARGV/' | wc -L", False),
+    (
+        "c07 awk string naming ARGV",
+        "git diff | awk '{ x = \"ARGV getline\" } 1' | wc -L",
+        False,
+    ),
+    ("c08 awk comment naming ARGV", "git diff | awk '# ARGV getline\n1' | wc -L", False),
+    ("c09 awk uppercase user var", "git diff | awk 'BEGIN { N = 72 } length < N' | wc -L", False),
+    ("c10 awk -F field split", "git diff | awk -F: '{print $2}' | wc -L", False),
+    ("c11 awk logical or and", "git diff | awk 'NR > 1 || NF == 0 && 1' | wc -L", False),
+    ("c12 awk division", "git diff | awk '{ print NF / 2 }' | wc -L", False),
+    (
+        "f01 awk final ARGV",
+        "git diff | awk 'BEGIN{ARGV[1]=\"scripts/a.py\";ARGC=2} length > 80'",
+        True,
+    ),
+    (
+        "f02 awk final ARGV append",
+        "git diff | awk 'BEGIN{ARGV[ARGC++]=\"scripts/a.py\"} length($0) > 80'",
+        True,
+    ),
+    (
+        "f03 gawk final -i include",
+        "git diff | gawk -i scripts/inc.awk 'length > 80'",
+        True,
+    ),
+    (
+        "f04 awk final print to command",
+        "git diff | awk 'length < 80 { print | \"cat scripts/a.py\" }'",
+        True,
+    ),
+    ("f05 awk final -f lane program", "git diff | awk -f .lane/tmp/p.awk", True),
+    (
+        "f06 gawk final SYMTAB",
+        'git diff | gawk \'BEGIN{SYMTAB["ARGV"][1]="scripts/a.py";ARGC=2} length > 80\'',
+        True,
+    ),
+    ("f07 awk final control", "git diff | awk 'length > 80'", False),
+    (
+        "f08 awk final control with NR",
+        "git diff | awk 'length($0) > 80 { print NR \": \" $0 }'",
+        False,
+    ),
+    (
+        "l01 awk lane ARGV reassign",
+        "awk 'BEGIN{ARGV[1]=\"scripts/a.py\";ARGC=2} length > 80' .lane/tmp/a.txt",
+        True,
+    ),
+    (
+        "l02 awk lane ARGV append",
+        "awk 'BEGIN{ARGV[ARGC++]=\"scripts/a.py\"} length > 80' .lane/tmp/a.txt",
+        True,
+    ),
+    (
+        "l03 awk lane print to command",
+        "awk 'length < 80 { print | \"cat scripts/a.py\" }' .lane/tmp/a.txt",
+        True,
+    ),
+    (
+        "l04 gawk lane -i include",
+        "gawk -i scripts/inc.awk 'length > 80' .lane/tmp/a.txt",
+        True,
+    ),
+    ("l05 awk lane -f lane program", "awk -f .lane/tmp/p.awk .lane/tmp/a.txt", True),
+    (
+        "l06 gawk lane SYMTAB",
+        'gawk \'BEGIN{SYMTAB["ARGV"][1]="scripts/a.py"} length > 80\' .lane/tmp/a.txt',
+        True,
+    ),
+    ("l07 awk lane control", "awk 'length > 80' .lane/tmp/a.txt", False),
+    ("l08 awk lane -v control", "awk -v n=80 'length > n' .lane/tmp/a.txt", False),
+    ("l09 wc lane control", "wc -L .lane/tmp/a.txt", False),
+    ("l10 grep lane control", "grep -E '.{80}' .lane/tmp/a.txt", False),
+)
+
+FIX6_AWK_SCANNER_CASES: tuple[tuple[str, bool], ...] = (
+    ('ARGV[1]="x"', False),
+    ("ARGC=2", False),
+    ('SYMTAB["ARGV"][1]="x"', False),
+    ('PROCINFO["x"]', False),
+    ('ENVIRON["X"]', False),
+    ("getline l", False),
+    ('"c" | getline', False),
+    ('system("x")', False),
+    ('close("x")', False),
+    ("fflush()", False),
+    ("nextfile", False),
+    ('@include "x"', False),
+    ("BEGINFILE{}", False),
+    ('print | "x"', False),
+    ('print > "x"', False),
+    ('print $1 >> "x"', False),
+    ('printf "%s" > "x"', False),
+    ("a & b", False),
+    (r"x = y \ z", False),
+    ("awk::NR", False),
+    ("foo(1)", False),
+    ('"unterminated', False),
+    ("/unterminated", False),
+    ("length > 72", True),
+    ("$0 ~ /ARGV/", True),
+    ("!/getline/", True),
+    ('{ x = "ARGV getline" } 1', True),
+    ("# ARGV getline\n1", True),
+    ("function f(x) { return x } { print f($0) }", True),
+    ("BEGIN { N = 72 } length < N", True),
+    ("NR > 1 || NF == 0 && 1", True),
+    ("{ print NF / 2 }", True),
+    ("{ print (a > b) }", True),
+    (r'printf("%s\n", $0)', True),
+    (r'{ sub(/^\+/, "") } 1', True),
+    ("NR > 1 \\\n&& NF == 0", True),
 )
 
 
@@ -1542,6 +1751,18 @@ class LaneBriefTest(unittest.TestCase):
         for span, want in FIX5_G3_CHAIN_CASES:
             with self.subTest(span=span):
                 self.assertEqual(lane_brief.span_whole_file_length_refused(span), want)
+
+    def test_fix6_probe_cases_table(self) -> None:
+        """Exercise all non-split round-6 probe spans through span_whole_file_length_refused."""
+        for tag, span, want in FIX6_PROBE_CASES:
+            with self.subTest(tag=tag, span=span):
+                self.assertEqual(lane_brief.span_whole_file_length_refused(span), want)
+
+    def test_fix6_awk_scanner_table(self) -> None:
+        """Exercise allow-list awk program scanner cases across refused and safe constructs."""
+        for program, want in FIX6_AWK_SCANNER_CASES:
+            with self.subTest(program=program):
+                self.assertEqual(not lane_brief.awk_program_reads_files(program), want)
 
     def test_conflict_alternate_forms_refused(self) -> None:
         """Refuse alternate column-limit, one-line join, and ERE grep length forms."""

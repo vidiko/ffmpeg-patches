@@ -284,15 +284,14 @@ from itertools import islice
 from pathlib import Path, PurePosixPath
 
 # Ensure repository root is on sys.path for test/tool imports
-REPO_ROOT = Path(__file__).resolve().parent.parent
-_PROCESS_STREAMS = (("stdout", sys.__stdout__), ("stderr", sys.__stderr__))
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
+if str(Path(__file__).resolve().parent.parent) not in sys.path:
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from scripts import series
 from scripts.process_group import kill_process_group  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+_PROCESS_STREAMS = (("stdout", sys.__stdout__), ("stderr", sys.__stderr__))
 
 PRE_COMMIT = "pre-commit"
 ALLOWED_EXECUTABLES = frozenset({"git", "pre-commit", "bash"})

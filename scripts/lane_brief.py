@@ -16,6 +16,7 @@ Exit status: 0 when valid, 1 for invalid briefs, 2 for usage or input errors.
 from __future__ import annotations
 
 import argparse
+import bisect
 import importlib
 import io
 import os
@@ -87,6 +88,9 @@ GIT_DIFF_COMMAND = re.compile(r"\bgit\b[^|;&]*\bdiff\b")
 STANDALONE_OBJECT = re.compile(r"(?<![0-9a-fA-F])[0-9a-fA-F]{40}(?![0-9a-fA-F])")
 NESTED_GIT_C = re.compile(r"""\bgit\s+-C\s+("[^"\n]+"|'[^'\n]+'|[^\s`'";,|&()<>]+)""")
 MAX_NESTED_REPOS = 8
+REDIRECT_CHARS = frozenset("<>&|")
+COMMAND_SEPARATORS = frozenset({";", "&", "&&", "||"})
+PIPE_SEPARATORS = frozenset({"|", "|&"})
 
 
 def validate_lines(lines: list[bytes], label: str) -> None:
@@ -358,11 +362,10 @@ def non_clause_spans(content: str) -> list[re.Match[str]]:
     spans = list(BACKTICK_SPAN.finditer(content))
     if not clauses:
         return spans
+    clause_ends = [end for _start, end in clauses]
     outside: list[re.Match[str]] = []
-    clause_index = 0
     for match in spans:
-        while clause_index < len(clauses) and clauses[clause_index][1] <= match.start():
-            clause_index += 1
+        clause_index = bisect.bisect_right(clause_ends, match.start())
         inside = (
             clause_index < len(clauses)
             and clauses[clause_index][0] <= match.start()
@@ -434,111 +437,43 @@ def conflict_join_under_column_limit(content: str) -> str:
     return f'"{join_text}" under "{limit_text}": give the exact wrapped form instead of a join'
 
 
-def shell_quote_advance(
-    span: str, index: int, in_single: bool, in_double: bool
-) -> tuple[int, bool, bool]:
-    """Advance one index through a shell fragment while tracking quote state."""
-    length = len(span)
-    next_index = index
-    next_single = in_single
-    next_double = in_double
-    if index >= length:
-        return next_index, next_single, next_double
-    char = span[index]
-    if in_single:
-        next_index = index + 1
-        next_single = char != "'"
-    elif in_double:
-        if char == "\\" and index + 1 < length:
-            next_index = index + 2
-        else:
-            next_index = index + 1
-            next_double = char != '"'
-    elif char == "'":
-        next_index = index + 1
-        next_single = True
-    elif char == '"':
-        next_index = index + 1
-        next_double = True
-    return next_index, next_single, next_double
+def is_redirect_operator(token: str) -> bool:
+    """Return whether token is a shell redirect made only of redirection punctuation."""
+    if not token:
+        return False
+    if any(char not in REDIRECT_CHARS for char in token):
+        return False
+    return "<" in token or ">" in token
 
 
-def append_shell_piece(pieces: list[str], span: str, start: int, end: int) -> int:
-    """Append span[start:end] to pieces when non-empty and return end."""
-    piece = span[start:end].strip()
-    if piece:
-        pieces.append(piece)
-    return end
+def span_shell_tokens(span: str) -> list[str] | None:
+    """Return punctuation-aware shell tokens for span or None when quoting is unclosed."""
+    try:
+        lexer = shlex.shlex(span, posix=True, punctuation_chars=True)
+        lexer.whitespace_split = True
+        return list(lexer)
+    except ValueError:
+        return None
 
 
-def split_span_fragments(span: str, separator: str) -> list[str]:
-    """Split a shell fragment on separator characters outside single and double quotes."""
-    pieces: list[str] = []
-    start = 0
-    index = 0
-    in_single = False
-    in_double = False
-    length = len(span)
-    for _ in range(length + 1):
-        if index >= length:
-            break
-        quoted, in_single, in_double = shell_quote_advance(span, index, in_single, in_double)
-        if quoted != index:
-            index = quoted
-            continue
-        if span[index] == separator:
-            start = append_shell_piece(pieces, span, start, index) + 1
-        index += 1
-    append_shell_piece(pieces, span, start, length)
-    return pieces
-
-
-def shell_command_boundary(span: str, index: int) -> tuple[str, int]:
-    """Return a shell boundary token and its length when unquoted."""
-    pair = span[index : index + 2]
-    if pair in ("||", "&&"):
-        return pair, 2
-    if span[index] in ";&":
-        return span[index], 1
-    return "", 0
-
-
-def span_command_groups(span: str) -> list[list[str]]:
-    """Split a backtick span into pipeline command strings grouped by shell boundaries."""
+def split_token_groups(tokens: list[str], separators: frozenset[str]) -> list[list[str]]:
+    """Split token list on separator tokens while preserving empty groups."""
     groups: list[list[str]] = []
-    start = 0
-    index = 0
-    in_single = False
-    in_double = False
-    length = len(span)
-    for _ in range(length + 1):
-        if index >= length:
-            break
-        quoted, in_single, in_double = shell_quote_advance(span, index, in_single, in_double)
-        if quoted != index:
-            index = quoted
+    current: list[str] = []
+    for token in tokens:
+        if token in separators:
+            groups.append(current)
+            current = []
             continue
-        boundary, width = shell_command_boundary(span, index)
-        if not boundary:
-            index += 1
-            continue
-        piece = span[start:index].strip()
-        if piece:
-            groups.append(split_span_fragments(piece, "|"))
-        start = index + width
-        index = start
-    tail = span[start:].strip()
-    if tail:
-        groups.append(split_span_fragments(tail, "|"))
+        current.append(token)
+    groups.append(current)
     return groups
 
 
-def words_of_command(command: str) -> list[str] | None:
-    """Return POSIX shell words for command or None when quoting is unclosed."""
-    try:
-        return shlex.split(command, posix=True)
-    except ValueError:
-        return None
+def span_token_command_groups(tokens: list[str]) -> list[list[list[str]]]:
+    """Split shell tokens into command groups and pipeline stages."""
+    command_groups = split_token_groups(tokens, COMMAND_SEPARATORS)
+    return [split_token_groups(group, PIPE_SEPARATORS) for group in command_groups]
 
 
 def length_tool_index(words: list[str]) -> int | None:
@@ -564,31 +499,34 @@ def wc_is_length_check(words: list[str], tool_index: int) -> bool:
 def strip_awk_double_quotes(program: str) -> str:
     """Remove double-quoted awk string literals while honoring backslash escapes."""
     kept: list[str] = []
-    index = 0
-    length = len(program)
-    while index < length:
-        if program[index] != '"':
-            kept.append(program[index])
-            index += 1
-            continue
-        index += 1
-        while index < length:
-            if program[index] == "\\" and index + 1 < length:
-                index += 2
+    in_string = False
+    escape = False
+    for char in program:
+        if in_string:
+            if escape:
+                escape = False
                 continue
-            if program[index] == '"':
-                index += 1
-                break
-            index += 1
+            if char == "\\":
+                escape = True
+                continue
+            if char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+            continue
+        kept.append(char)
     return "".join(kept)
 
 
 def awk_program_token(words: list[str], tool_index: int) -> tuple[str | None, bool]:
     """Return the inline awk program token and whether -f is present."""
     uses_file = False
-    index = tool_index + 1
     limit = len(words)
-    while index < limit:
+    index = tool_index + 1
+    for _ in range(limit):
+        if index >= limit:
+            break
         token = words[index]
         if token == "--":
             break
@@ -667,23 +605,48 @@ LENGTH_OPTION_FLAGS = frozenset(
 
 
 def length_redirect_advance(words: list[str], index: int, limit: int) -> tuple[list[str], int]:
-    """Collect stdin operands and skip output redirects starting at index."""
+    """Collect stdin operands and skip redirects starting at index."""
     found: list[str] = []
     token = words[index]
+    if re.fullmatch(r"\d+", token) and index + 1 < limit and is_redirect_operator(words[index + 1]):
+        index += 1
+        token = words[index]
+    if not is_redirect_operator(token):
+        return found, index
     if token == "<" and index + 1 < limit:
         found.append(words[index + 1])
         return found, index + 2
-    if token in {">", ">>", ">&", "2>", "2>>", "2>&1", ">|"}:
-        target = index + 1
-        if token in {">", ">>", ">|"} and target < limit and not words[target].startswith("-"):
-            return found, target + 1
-        return found, index + 1
-    if re.fullmatch(r"\d+", token) and index + 2 < limit and words[index + 1] == "<":
-        found.append(words[index + 2])
-        return found, index + 3
-    if re.fullmatch(r"\d+", token) and index + 1 < limit and words[index + 1] in {">", ">>"}:
-        return found, index + 3
-    return found, index
+    next_index = index + 1
+    if (
+        next_index < limit
+        and words[next_index] not in COMMAND_SEPARATORS
+        and token != "<"
+        and not is_redirect_operator(words[next_index])
+    ):
+        next_index += 1
+    return found, next_index
+
+
+def length_redirect_operands(
+    words: list[str], index: int, limit: int
+) -> tuple[int, list[str]] | None:
+    """Return redirect advance when index starts a paren or redirection token."""
+    token = words[index]
+    if token in ("(", ")"):
+        return index + 1, []
+    extra, advanced = length_redirect_advance(words, index, limit)
+    if advanced == index:
+        return None
+    return advanced, extra
+
+
+def length_option_index(words: list[str], index: int, limit: int, token: str) -> int | None:
+    """Return the next index after a length-tool option token when applicable."""
+    if token.startswith("-") and token in LENGTH_OPTION_FLAGS and index + 1 < limit:
+        return index + 2
+    if token.startswith("-"):
+        return index + 1
+    return None
 
 
 def command_file_operands(words: list[str]) -> list[str]:
@@ -701,21 +664,21 @@ def command_file_operands(words: list[str]) -> list[str]:
     program_seen = False
     pattern_seen = False
     limit = len(words)
-    while index < limit:
+    for _ in range(limit):
+        if index >= limit:
+            break
         token = words[index]
         if token == "--":
             operands.extend(words[index + 1 :])
             break
-        extra, advanced = length_redirect_advance(words, index, limit)
-        if advanced != index:
+        redirect = length_redirect_operands(words, index, limit)
+        if redirect is not None:
+            index, extra = redirect
             operands.extend(extra)
-            index = advanced
             continue
-        if token.startswith("-") and (token in LENGTH_OPTION_FLAGS and index + 1 < limit):
-            index += 2
-            continue
-        if token.startswith("-"):
-            index += 1
+        option_index = length_option_index(words, index, limit, token)
+        if option_index is not None:
+            index = option_index
             continue
         if awk_tool and not program_seen:
             program_seen = True
@@ -743,13 +706,11 @@ def length_command_allowed(words: list[str], pipeline: list[list[str]], command_
 
 def span_whole_file_length_refused(span: str) -> bool:
     """Return whether any parsed length command in the span must be refused."""
-    for pipeline in span_command_groups(span):
-        parsed: list[list[str]] = []
-        for command in pipeline:
-            words = words_of_command(command)
-            if words is None:
-                return bool(WHOLE_FILE_LENGTH.search(span))
-            parsed.append(words)
+    tokens = span_shell_tokens(span)
+    if tokens is None:
+        return bool(WHOLE_FILE_LENGTH.search(span))
+    for pipeline in span_token_command_groups(tokens):
+        parsed = [stage for stage in pipeline if stage]
         for command_index, words in enumerate(parsed):
             if command_is_length_check(words) and not length_command_allowed(
                 words, parsed, command_index
@@ -781,17 +742,17 @@ def standalone_object_names(content: str) -> list[str]:
     return list(seen)
 
 
-def probe_repository_root(directory: Path) -> tuple[Path | None, str]:
-    """Return the resolved directory when Git reports it as its own root, else an error."""
+def probe_repository_root(directory: Path) -> tuple[Path | None, str, str]:
+    """Return resolved root, error message, and probe status ok, git, or not_root."""
     lane_isolation = importlib.import_module("scripts.lane_isolation")
     result = lane_isolation.run_git(["-C", str(directory), "rev-parse", "--show-toplevel"])
     toplevel = result.stdout.removesuffix("\n")
     if result.returncode != 0 or not toplevel:
-        return None, result.stderr.strip() or f"{directory}: not a git worktree"
+        return None, result.stderr.strip() or f"{directory}: not a git worktree", "git"
     resolved = directory.resolve()
     if Path(toplevel).resolve() != resolved:
-        return None, f"{directory}: not its own repository root"
-    return resolved, ""
+        return None, f"{directory}: not its own repository root", "not_root"
+    return resolved, "", "ok"
 
 
 def valid_nested_root(path: Path, worktree_root: Path) -> bool:
@@ -801,12 +762,12 @@ def valid_nested_root(path: Path, worktree_root: Path) -> bool:
         return False
     if not path.is_dir():
         return False
-    root, error = probe_repository_root(path)
+    root, error, kind = probe_repository_root(path)
     if root is not None:
         return True
-    if error.endswith(": not its own repository root"):
+    if kind == "not_root":
         return False
-    if error:
+    if kind == "git" and error:
         raise lane_isolation.IsolationError(error)
     return False
 
@@ -847,7 +808,7 @@ def conflict_missing_object(content: str, worktree: Path) -> str:
     lane_isolation = importlib.import_module("scripts.lane_isolation")
     current = names[0]
     try:
-        worktree_root, root_error = probe_repository_root(worktree)
+        worktree_root, root_error, _kind = probe_repository_root(worktree)
         if worktree_root is None:
             raise lane_isolation.IsolationError(root_error)
         repositories = [worktree_root, *nested_repositories(content, worktree_root)]

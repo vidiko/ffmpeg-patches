@@ -1191,6 +1191,112 @@ class LaneBriefTest(unittest.TestCase):
         rc, error = self.check_snippet("- `awk -F: 'length > 72' .lane/evidence/x/msg.txt`\n")
         self.assertEqual(rc, 0, error)
 
+    def test_fix4_r1_wc_joined_stdout_redirect_passes(self) -> None:
+        """Pass wc -L on a lane file when stdout redirect has no space before the target."""
+        rc, error = self.check_snippet("- `wc -L .lane/tmp/a.txt >/dev/null`\n")
+        self.assertEqual(rc, 0, error)
+
+    def test_fix4_r2_wc_spaced_stderr_redirect_passes(self) -> None:
+        """Pass wc -L on a lane file when stderr redirect tokens are spaced."""
+        rc, error = self.check_snippet("- `wc -L .lane/tmp/a.txt 2> /dev/null`\n")
+        self.assertEqual(rc, 0, error)
+
+    def test_fix4_r3_wc_joined_stderr_redirect_passes(self) -> None:
+        """Pass wc -L on a lane file when stderr descriptor and operator are joined."""
+        rc, error = self.check_snippet("- `wc -L .lane/tmp/a.txt 2>/dev/null`\n")
+        self.assertEqual(rc, 0, error)
+
+    def test_fix4_r4_wc_spaced_stdout_redirect_passes(self) -> None:
+        """Pass wc -L on a lane file when stdout redirect tokens are spaced (control)."""
+        rc, error = self.check_snippet("- `wc -L .lane/tmp/a.txt > /dev/null`\n")
+        self.assertEqual(rc, 0, error)
+
+    def test_fix4_r5_wc_spaced_descriptor_redirect_passes(self) -> None:
+        """Pass wc -L on a lane file when descriptor digit is spaced from the operator."""
+        rc, error = self.check_snippet("- `wc -L .lane/tmp/a.txt 2 > /dev/null`\n")
+        self.assertEqual(rc, 0, error)
+
+    def test_fix4_r6_wc_repo_file_joined_redirect_refused(self) -> None:
+        """Refuse wc -L on a repository file even when stdout redirect is joined."""
+        rc, error = self.check_snippet("- `wc -L scripts/a.py >/dev/null`\n")
+        self.assertEqual(rc, 1, error)
+        self.assertIn("conflict:", error)
+
+    def test_fix4_strip_awk_double_quotes_table(self) -> None:
+        """Pin strip_awk_double_quotes behavior for quoted and escaped awk programs."""
+        cases = {
+            r'print "he\"llo"': "print ",
+            'print "\\"': "print ",
+            'print "open': "print ",
+            'print "a" b "c"': "print  b ",
+            'print "a\nb" x': "print  x",
+        }
+        for program, expected in cases.items():
+            with self.subTest(program=program):
+                self.assertEqual(lane_brief.strip_awk_double_quotes(program), expected)
+
+    def test_fix4_awk_program_token_table(self) -> None:
+        """Pin awk_program_token for option shapes and end-of-argv programs."""
+        cases = [
+            (["awk", "-F:", "prog"], 0, ("prog", False)),
+            (["awk", "-F", ":", "prog"], 0, ("prog", False)),
+            (["awk", "-v", "x=1", "prog"], 0, ("prog", False)),
+            (["awk", "-f", "file.awk"], 0, (None, True)),
+            (["awk", "--", "prog"], 0, (None, False)),
+        ]
+        for words, tool_index, expected in cases:
+            with self.subTest(words=words):
+                self.assertEqual(lane_brief.awk_program_token(words, tool_index), expected)
+
+    def test_fix4_command_file_operands_table(self) -> None:
+        """Pin command_file_operands for options and lane-owned stdin redirects."""
+        cases = [
+            (["wc", "-L", "-c", "file"], ["file"]),
+            (["wc", "-L", "file", ">"], ["file"]),
+            (["wc", "-L", "lane", "<", ".lane/tmp/in.txt"], ["lane", ".lane/tmp/in.txt"]),
+        ]
+        for words, expected in cases:
+            with self.subTest(words=words):
+                self.assertEqual(lane_brief.command_file_operands(words), expected)
+
+    def test_fix4_command_file_operands_redirect_table(self) -> None:
+        """Pin command_file_operands redirect forms that differ from round-3 tokenization."""
+        cases = [
+            (["wc", "-L", "file", "2", ">&", "1"], ["file"]),
+            (["wc", "-L", "file", "&>", "out"], ["file"]),
+        ]
+        for words, expected in cases:
+            with self.subTest(words=words):
+                self.assertEqual(lane_brief.command_file_operands(words), expected)
+
+    def test_fix4_g3_nested_probe_status(self) -> None:
+        """Use probe failure kind for nested roots without changing worktree error text."""
+        worktree, _commit = self.commit_fixture()
+        broken = worktree / "sub"
+        broken.mkdir()
+        (broken / ".git").write_text("gitdir: /nonexistent/x\n", encoding="utf-8")
+        plain = worktree / "plain"
+        plain.mkdir()
+        probe_plain = lane_brief.probe_repository_root(plain)
+        missing = worktree / "missing"
+        probe_missing = lane_brief.probe_repository_root(missing)
+        probe_worktree = lane_brief.probe_repository_root(worktree)
+        if len(probe_plain) == 3:
+            _root, _err, kind = probe_plain
+            self.assertEqual(kind, "not_root")
+            _root2, _err2, kind2 = probe_missing
+            self.assertEqual(kind2, "git")
+            _wroot, werr, wkind = probe_worktree
+            self.assertEqual(wkind, "ok")
+            self.assertEqual(werr, "")
+        self.assertFalse(lane_brief.valid_nested_root(plain, worktree.resolve()))
+        self.assertFalse(lane_brief.valid_nested_root(missing, worktree.resolve()))
+        missing_id = "1" * 40
+        rc, error = self.check_snippet(
+            f"`git -C sub log -1`\nHEAD {missing_id}\n", worktree=worktree
+        )
+        self.assertEqual(rc, 2, error)
+
     def test_conflict_alternate_forms_refused(self) -> None:
         """Refuse alternate column-limit, one-line join, and ERE grep length forms."""
         for snippet in (

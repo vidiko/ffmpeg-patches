@@ -28,7 +28,86 @@ _DQ_TAIL_INNER = re.compile(
     rb"^[A-Za-z0-9_ ./:,=+\-]*"
     rb"(?:\$(?:\{[A-Za-z_][A-Za-z0-9_]*\}|[A-Za-z_][A-Za-z0-9_]*))*$"
 )
-_TAIL_MARK = re.compile(rb"(?<![0-9A-Za-z_])(\d)<<<")
+_DESCRIPTOR_PREFIX = rb"(?<![0-9A-Za-z_])([0-9]+|\{[A-Za-z_][A-Za-z0-9_]*\})"
+_TAIL_MARK = re.compile(_DESCRIPTOR_PREFIX + rb"<<<")
+_DUP_STDIN = re.compile(r"^([0-9]*)<&([0-9]+)$")
+_DUP_STDIN_BYTES = re.compile(rb"(?<![0-9A-Za-z_])([0-9]*)<&\s*([0-9]+)(?![0-9A-Za-z_])")
+_HS_FD_TAG = re.compile(r"^__RCG_HS_FD([0-9]+)_([0-9]+)__$")
+_EXEC_ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+
+
+def _descriptor_fd(prefix: str | bytes) -> int | None:
+    """Return integer descriptor for an empty or digit prefix, or None for brace names."""
+    text = prefix.decode("ascii") if isinstance(prefix, bytes) else prefix
+    if not text:
+        return 0
+    return int(text) if text.isdigit() else None
+
+
+def _is_stdin_descriptor(prefix: str | bytes) -> bool:
+    """Return whether an empty or digit descriptor prefix refers to fd 0."""
+    return _descriptor_fd(prefix) == 0
+
+
+def _dup_stdin_fd(left: str | bytes, right: str | bytes) -> int | None:
+    """Return the duplicated descriptor number when left<&right targets fd 0."""
+    if not _is_stdin_descriptor(left):
+        return None
+    return int(right)
+
+
+def _advance_unquoted_mask(raw: bytes, buf: bytearray, idx: int) -> tuple[int, int | None, bool]:
+    """Advance one unquoted step and return next index, opened quote, and ANSI-C flag."""
+    n = len(raw)
+    b = raw[idx]
+    if b == ord("\\"):
+        if idx + 1 < n and raw[idx + 1] != ord("\n"):
+            buf[idx] = buf[idx + 1] = 1
+        return idx + 2, None, False
+    if b == ord("#") and (idx == 0 or raw[idx - 1] in b" \t\r\n;&|()"):
+        nl = raw.find(b"\n", idx)
+        end = n if nl < 0 else nl
+        buf[idx:end] = b"\x01" * (end - idx)
+        return (n if nl < 0 else nl + 1), None, False
+    if b in (ord("'"), ord('"')):
+        ansi = b == ord("'") and idx > 0 and raw[idx - 1] == ord("$")
+        return idx + 1, b, ansi
+    return idx + 1, None, False
+
+
+def _advance_quoted_mask(
+    raw: bytes, buf: bytearray, idx: int, quote: int, ansi: bool
+) -> tuple[int, int | None, bool]:
+    """Advance one quoted step and mask non-newline interior bytes to SOH."""
+    n = len(raw)
+    b = raw[idx]
+    if b == ord("\\") and (quote == ord('"') or ansi):
+        buf[idx] = 1
+        if idx + 1 < n and raw[idx + 1] != ord("\n"):
+            buf[idx + 1] = 1
+        return idx + 2, quote, ansi
+    if b == quote:
+        return idx + 1, None, False
+    if b != ord("\n"):
+        buf[idx] = 1
+    return idx + 1, quote, ansi
+
+
+def _mask_quoted_bytes(raw: bytes) -> bytes:
+    """Replace quoted, escaped, and comment interior bytes with SOH."""
+    buf = bytearray(raw)
+    quote: int | None = None
+    ansi = False
+    idx = 0
+    n = len(raw)
+    for _ in range(n):
+        if idx >= n:
+            break
+        if quote is None:
+            idx, quote, ansi = _advance_unquoted_mask(raw, buf, idx)
+        else:
+            idx, quote, ansi = _advance_quoted_mask(raw, buf, idx, quote, ansi)
+    return bytes(buf)
 
 
 def _append_redirect_fd(punc: str, tokens: list[str], raw_tokens: list[str], idx: int) -> int:
@@ -301,14 +380,75 @@ def _scan_heredocs(command: str) -> tuple[str, dict[str, str], set[str]] | None:
     return "".join(out_lines), heredocs, expanding_tags
 
 
+def _byte_offset(command: str, pos: int, is_ascii: bool) -> int:
+    """Return UTF-8 byte offset of char index pos in command."""
+    return pos if is_ascii else len(command[:pos].encode("utf-8", "surrogatepass"))
+
+
+def _herestring_opener(
+    command: str,
+    pos: int,
+    precomputed: tuple[bytes, bytes, bool] | None = None,
+) -> tuple[int, str]:
+    """Return char length and descriptor prefix of an unquoted here-string opener at pos."""
+    if pos < 0 or pos >= len(command) or command[pos] in " \t\r\n":
+        return 0, ""
+    if precomputed is None:
+        raw = command.encode("utf-8", "surrogatepass")
+        masked = _mask_quoted_bytes(raw)
+        is_ascii = len(raw) == len(command)
+    else:
+        raw, masked, is_ascii = precomputed
+    bpos = _byte_offset(command, pos, is_ascii)
+    if masked[bpos] == 1:
+        return 0, ""
+    match = _TAIL_MARK.match(masked, bpos)
+    if match is not None:
+        prefix = raw[match.start(1) : match.end(1)].decode("ascii")
+        return len(prefix) + 3, prefix
+    if masked[bpos : bpos + 3] == b"<<<":
+        return 3, ""
+    return 0, ""
+
+
+def _herestring_op_len(command: str, pos: int) -> int:
+    """Return char length of a here-string opener at pos, or zero when none starts there."""
+    return _herestring_opener(command, pos)[0]
+
+
+def _herestring_tag(prefix: str, val: str, idx: int, herestrings: dict[str, str]) -> str:
+    """Register one extracted here-string value and return its token placeholder."""
+    if _is_stdin_descriptor(prefix):
+        tag = f"__RCG_HS_0_{idx}__"
+    elif (fd := _descriptor_fd(prefix)) is not None:
+        tag = f"__RCG_HS_FD{fd}_{idx}__"
+        herestrings[f"__RCG_HS_0_{idx}__"] = val
+    else:
+        tag = f"__RCG_HS_BR_{idx}__"
+    herestrings[tag] = val
+    return tag
+
+
+def _prepare_herestring_masks(command: str) -> tuple[bytes, bytes, bool] | None:
+    """Build UTF-8 bytes and quote mask when command contains a potential <<< operator."""
+    if "<<<" not in command:
+        return None
+    raw = command.encode("utf-8", "surrogatepass")
+    return raw, _mask_quoted_bytes(raw), len(raw) == len(command)
+
+
 def _scan_herestrings(command: str) -> tuple[str, dict[str, str], list[str]]:
     """Extract here-strings outside quotes and replace with placeholders."""
+    prepared = _prepare_herestring_masks(command)
+    if prepared is None:
+        return command, {}, []
     herestrings: dict[str, str] = {}
     hs_to_scan: list[str] = []
     quote = None
     pos = 0
     cmd_len = len(command)
     pieces: list[str] = []
+    hs_count = 0
     for _ in range(cmd_len):
         if pos >= cmd_len:
             break
@@ -316,15 +456,12 @@ def _scan_herestrings(command: str) -> tuple[str, dict[str, str], list[str]]:
         if quote is None:
             if ch in ("'", '"'):
                 quote = ch
-            elif command[pos : pos + 3] == "<<<":
-                pos += 3
-                for _ in range(cmd_len - pos):
-                    if command[pos] not in " \t":
-                        break
-                    pos += 1
+            elif (opener := _herestring_opener(command, pos, prepared))[0] > 0:
+                pos += opener[0]
+                pos += len(command[pos:]) - len(command[pos:].lstrip(" \t"))
                 val, pos, q_delim = _read_delim(command, pos, cmd_len)
-                tag = f"__RCG_HS_{len(herestrings)}__"
-                herestrings[tag] = val
+                tag = _herestring_tag(opener[1], val, hs_count, herestrings)
+                hs_count += 1
                 if q_delim != "'":
                     hs_to_scan.append(val)
                 pieces.append(tag)
@@ -334,6 +471,87 @@ def _scan_herestrings(command: str) -> tuple[str, dict[str, str], list[str]]:
         pieces.append(ch)
         pos += 1
     return "".join(pieces), herestrings, hs_to_scan
+
+
+def _is_redirect_word_op(tok: str) -> bool:
+    """Return whether tok is a file redirection operator taking a following word."""
+    return (
+        tok in REDIRECT_TARGET_OPS or re.fullmatch(r"^\d*(?:>>|>|<|&>|&>>|>\|)$", tok) is not None
+    )
+
+
+def _is_self_redirect_tok(tok: str) -> bool:
+    """Return whether tok is a descriptor-duplication or close redirection token."""
+    return tok in (">&", "<&") or SELF_REDIRECT.fullmatch(tok) is not None
+
+
+def _stage_is_bare_exec(stage: list[str]) -> bool:
+    """Return whether stage tokens form a bare exec redirection statement."""
+    words: list[str] = []
+    skip = False
+    for tok in stage:
+        if skip or tok.startswith(("__RCG_HD_", "__RCG_HS_")):
+            skip = False
+            continue
+        if _is_redirect_word_op(tok):
+            skip = True
+            continue
+        if _is_self_redirect_tok(tok):
+            continue
+        if not words and _EXEC_ASSIGN.match(tok) is not None:
+            continue
+        words.append(tok)
+    return words == ["exec"]
+
+
+def _dup_stdin_source(tok: str) -> int | None:
+    """Return source fd when tok duplicates a numeric descriptor onto fd 0."""
+    match = _DUP_STDIN.fullmatch(tok)
+    return _dup_stdin_fd(match.group(1), match.group(2)) if match is not None else None
+
+
+def _resolve_stage_dups(
+    stage: list[str], exec_fds: dict[int, str]
+) -> tuple[list[str], dict[int, str]]:
+    """Promote 0<&N and <&N tokens to fd 0 here-string tags within one stage."""
+    local_fds = dict(exec_fds)
+    defined_fds: dict[int, str] = {}
+    out: list[str] = []
+    for tok in stage:
+        fd_match = _HS_FD_TAG.fullmatch(tok)
+        if fd_match is not None:
+            promoted = f"__RCG_HS_0_{fd_match.group(2)}__"
+            local_fds[int(fd_match.group(1))] = promoted
+            defined_fds[int(fd_match.group(1))] = promoted
+            out.append(tok)
+            continue
+        src_fd = _dup_stdin_source(tok)
+        if src_fd is not None and src_fd in local_fds:
+            out.append(local_fds[src_fd])
+            continue
+        out.append(tok)
+    next_exec = {**exec_fds, **defined_fds} if _stage_is_bare_exec(stage) else exec_fds
+    return out, next_exec
+
+
+def _resolve_herestring_dups(tokens: list[str]) -> list[str]:
+    """Resolve descriptor here-string dups onto fd 0 across simple commands."""
+    result: list[str] = []
+    stage: list[str] = []
+    exec_fds: dict[int, str] = {}
+    for tok in tokens:
+        if tok in SEPARATORS:
+            if stage:
+                resolved, exec_fds = _resolve_stage_dups(stage, exec_fds)
+                result.extend(resolved)
+                stage = []
+            result.append(tok)
+        else:
+            stage.append(tok)
+    if stage:
+        resolved, _ = _resolve_stage_dups(stage, exec_fds)
+        result.extend(resolved)
+    return result
 
 
 def _tokens(command: str) -> list[str] | None:
@@ -360,13 +578,16 @@ def _tokens(command: str) -> list[str] | None:
             idx = _append_punctuation(token, tokens, raw_slice, idx)
             continue
         tokens.append(token)
-    return tokens if len(tokens) <= MAX_TOKENS else None
+    if len(tokens) > MAX_TOKENS:
+        return None
+    return _resolve_herestring_dups(tokens)
 
 
 def _strip_redirections(tokens: list[str]) -> tuple[list[str], list[str]]:
     """Separate command words from redirection operators, targets, and heredoc tags."""
     words: list[str] = []
-    attached: list[str] = []
+    fd0_tags: list[str] = []
+    other_tags: list[str] = []
     idx = 0
     tok_len = len(tokens)
     for _ in range(tok_len):
@@ -374,16 +595,16 @@ def _strip_redirections(tokens: list[str]) -> tuple[list[str], list[str]]:
             break
         tok = tokens[idx]
         idx += 1
-        if tok.startswith("__RCG_HD_") or tok.startswith("__RCG_HS_"):
-            attached.append(tok)
-            continue
-        if tok in REDIRECT_TARGET_OPS or re.fullmatch(r"^\d*(?:>>|>|<|&>|&>>|>\|)$", tok):
+        if tok.startswith(("__RCG_HD_", "__RCG_HS_0_")):
+            fd0_tags.append(tok)
+        elif tok.startswith("__RCG_HS_"):
+            other_tags.append(tok)
+        elif _is_redirect_word_op(tok):
             if idx < tok_len and tokens[idx] not in SEPARATORS:
                 idx += 1
-            continue
-        if SELF_REDIRECT.fullmatch(tok) or tok in (">&", "<&"):
-            continue
-        words.append(tok)
+        elif not _is_self_redirect_tok(tok):
+            words.append(tok)
+    attached = [fd0_tags[-1], *fd0_tags[:-1], *other_tags] if fd0_tags else other_tags
     return words, attached
 
 
@@ -467,7 +688,113 @@ def script_blocks_fd_herestring_allowlist(raw: bytes) -> bool:
         offset = pos + 2
         if offset > len(raw):
             break
+    return raw.find(b"<<", offset) >= 0
+
+
+def strip_descriptor_tail_marks(raw: bytes) -> bytes:
+    """Build twin bytes with each unquoted descriptor prefix before <<< removed."""
+    masked = _mask_quoted_bytes(raw)
+    parts: list[bytes] = []
+    cursor = 0
+    for match in _TAIL_MARK.finditer(masked):
+        start, end = match.span(1)
+        parts.append(raw[cursor:start])
+        cursor = end
+    parts.append(raw[cursor:])
+    return b"".join(parts)
+
+
+def descriptor_tail_marks_present(raw: bytes) -> bool:
+    """Return whether raw bytes contain an unquoted descriptor prefix before <<<."""
+    return _TAIL_MARK.search(_mask_quoted_bytes(raw)) is not None
+
+
+def _herestring_word_end_bytes(seg: bytes, masked: bytes, pos: int) -> tuple[int, int] | None:
+    """Return start and end byte offsets of the here-string word starting at or after pos."""
+    n = len(seg)
+    start = pos + (len(seg[pos:]) - len(seg[pos:].lstrip(b" \t")))
+    if start >= n:
+        return None
+    end = start
+    for _ in range(n - start):
+        if end >= n or masked[end] in b" \t\r\n;&|<>()":
+            break
+        end += 1
+    return (start, end) if end > start else None
+
+
+def _collect_segment_herestrings(seg: bytes, masked_seg: bytes) -> tuple[dict[int, bytes], bool]:
+    """Collect numeric descriptor here-string words and detect bare exec segments."""
+    cmd_fds: dict[int, bytes] = {}
+    stripped = bytearray(masked_seg)
+    for match in _TAIL_MARK.finditer(masked_seg):
+        word_span = _herestring_word_end_bytes(seg, masked_seg, match.end())
+        if word_span is None:
+            continue
+        stripped[match.start(1) : word_span[1]] = b" " * (word_span[1] - match.start(1))
+        fd = _descriptor_fd(seg[match.start(1) : match.end(1)])
+        if fd is not None:
+            cmd_fds[fd] = seg[word_span[0] : word_span[1]]
+    return cmd_fds, bytes(stripped).strip() == b"exec"
+
+
+def _rewrite_segment_dups(
+    seg: bytes, masked_seg: bytes, exec_fds: dict[int, bytes]
+) -> tuple[bytes, dict[int, bytes]]:
+    """Replace 0<&N and <&N in one simple command with <<< word when fd N holds a here-string."""
+    cmd_fds, is_exec = _collect_segment_herestrings(seg, masked_seg)
+    next_exec = {**exec_fds, **cmd_fds} if is_exec else exec_fds
+    active = {**exec_fds, **cmd_fds}
+    if not active:
+        return seg, next_exec
+    parts: list[bytes] = []
+    cursor = 0
+    for dup in _DUP_STDIN_BYTES.finditer(masked_seg):
+        src_fd = _dup_stdin_fd(dup.group(1), dup.group(2))
+        if src_fd is None or src_fd not in active:
+            continue
+        parts.append(seg[cursor : dup.start()])
+        parts.append(b"<<< " + active[src_fd])
+        cursor = dup.end()
+    parts.append(seg[cursor:])
+    return b"".join(parts), next_exec
+
+
+def _is_separator_byte(masked: bytes, idx: int) -> bool:
+    """Return whether idx in masked bytes is an unquoted command separator."""
+    b = masked[idx]
+    if b in (ord(";"), ord("\n")):
+        return True
+    if b == ord("|"):
+        return not (idx > 0 and masked[idx - 1] == ord(">"))
+    if b == ord("&"):
+        prev_redir = idx > 0 and masked[idx - 1] in b"><"
+        next_redir = idx + 1 < len(masked) and masked[idx + 1] == ord(">")
+        return not (prev_redir or next_redir)
     return False
+
+
+def rewrite_descriptor_dups(raw: bytes) -> bytes:
+    """Rewrite 0<&N and <&N to plain here-strings when fd N carries a here-string word."""
+    masked = _mask_quoted_bytes(raw)
+    if _DUP_STDIN_BYTES.search(masked) is None:
+        return raw
+    out: list[bytes] = []
+    exec_fds: dict[int, bytes] = {}
+    seg_start = 0
+    for idx in range(len(raw)):
+        if _is_separator_byte(masked, idx):
+            if idx > seg_start:
+                rewritten, exec_fds = _rewrite_segment_dups(
+                    raw[seg_start:idx], masked[seg_start:idx], exec_fds
+                )
+                out.append(rewritten)
+            out.append(raw[idx : idx + 1])
+            seg_start = idx + 1
+    if seg_start < len(raw):
+        rewritten, _ = _rewrite_segment_dups(raw[seg_start:], masked[seg_start:], exec_fds)
+        out.append(rewritten)
+    return b"".join(out)
 
 
 def _parse_herestring_word(line: bytes, pos: int) -> int | None:
@@ -575,16 +902,17 @@ def _tail_line_suffix_valid(line: bytes, digit: int) -> tuple[bool, list[bytes]]
 
 
 def descriptor_tail_mark_count(raw: bytes) -> int:
-    """Count descriptor digit occurrences immediately followed by <<< in raw script bytes."""
+    """Count unquoted descriptor prefixes immediately followed by <<< in raw script bytes."""
+    masked = _mask_quoted_bytes(raw)
     count = 0
     line_start = 0
     for _ in range(256):
-        if line_start >= len(raw):
+        if line_start >= len(masked):
             break
-        line_end = raw.find(b"\n", line_start)
+        line_end = masked.find(b"\n", line_start)
         if line_end < 0:
-            line_end = len(raw)
-        line = raw[line_start:line_end]
+            line_end = len(masked)
+        line = masked[line_start:line_end]
         count += len(_TAIL_MARK.findall(line))
         line_start = line_end + 1
     return count
@@ -594,6 +922,7 @@ def find_descriptor_herestring_tail(raw: bytes) -> tuple[int, int, int, list[byt
     """Locate exactly one allowed descriptor here-string tail line in raw script bytes."""
     if script_blocks_fd_herestring_allowlist(raw):
         return None
+    masked = _mask_quoted_bytes(raw)
     marks: list[tuple[bytes, int, int, int]] = []
     line_start = 0
     for _ in range(256):
@@ -603,7 +932,8 @@ def find_descriptor_herestring_tail(raw: bytes) -> tuple[int, int, int, list[byt
         if line_end < 0:
             line_end = len(raw)
         line = raw[line_start:line_end]
-        for match in _TAIL_MARK.finditer(line):
+        masked_line = masked[line_start:line_end]
+        for match in _TAIL_MARK.finditer(masked_line):
             marks.append((line, match.start(1), line_start, line_end))
         line_start = line_end + 1
     if len(marks) != 1:

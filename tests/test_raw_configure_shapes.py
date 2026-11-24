@@ -13,6 +13,7 @@ import unittest.mock
 from pathlib import Path
 
 from scripts import raw_configure_body as body_mod
+from scripts import raw_configure_files as files_mod
 from scripts import raw_configure_lex as lex_mod
 from scripts.raw_configure_body import (
     BodyBudget,
@@ -58,6 +59,90 @@ GUARDFD_G6 = (
 
 _BODY_PATH = Path(body_mod.__file__)
 _LEX_PATH = Path(lex_mod.__file__)
+_PARITY_CFG = "./" + "con" + "figure"
+_PARITY_COMMANDS = ("bash", "sh", "python3 -", "cat", "cat - x")
+_PARITY_WORDS = (
+    f'"{_PARITY_CFG}"',
+    f"'{_PARITY_CFG} --prefix=/x'",
+    '"$d"',
+    "'true'",
+    "x",
+)
+_PARITY_TAILS = ("", " > /tmp/y")
+_INLINE_FAIL_OPEN = (
+    ("eval_bash_fd0_cfg", f"eval 'bash 0<<< \"{_PARITY_CFG}\"'\n"),
+    ("eval_bash_fd3_cfg", f"eval 'bash 3<<< \"{_PARITY_CFG}\"'\n"),
+    ("bashc_bash_fd0_cfg", f"bash -c 'bash 0<<< \"{_PARITY_CFG}\"'\n"),
+    ("eval_bash_fd0_var", "eval 'bash 0<<< \"$d\"'\n"),
+    (
+        "top_cat_fd3_var_then_eval_bash_fd0_cfg",
+        f'cat 3<<< "$d"\neval \'bash 0<<< "{_PARITY_CFG}"\'\n',
+    ),
+    ("bash_fd0_cfg_then_cat_redirect", f'bash 0<<< "{_PARITY_CFG}" > /tmp/y\n'),
+    ("python_fd0_cfg", f'python3 - 0<<< "{_PARITY_CFG}"\n'),
+    ("env_bash_fd0_cfg", f'env bash 0<<< "{_PARITY_CFG}"\n'),
+)
+_R9_Q = f'"{_PARITY_CFG}"'
+_R9_PAD = ":\n" * 300
+_R9_CASES = (
+    ("md01_plain_cfg_fd33_x", f"bash <<< {_R9_Q} 33<<< x\n", "refuse"),
+    ("md02_fd33_x_plain_cfg", f"bash 33<<< x <<< {_R9_Q}\n", "refuse"),
+    ("md03_fd0_cfg_fd33_x", f"bash 0<<< {_R9_Q} 33<<< x\n", "refuse"),
+    ("md04_fd33_x_fd0_cfg", f"bash 33<<< x 0<<< {_R9_Q}\n", "refuse"),
+    ("md05_fd0_cfg_fd10_x", f"bash 0<<< {_R9_Q} 10<<< x\n", "refuse"),
+    ("md06_plain_cfg_brace_x", f"bash <<< {_R9_Q} {{fd}}<<< x\n", "refuse"),
+    ("md07_fd0_cfg_brace_x", f"bash 0<<< {_R9_Q} {{fd}}<<< x\n", "refuse"),
+    ("md08_fd00_cfg", f"bash 00<<< {_R9_Q}\n", "refuse"),
+    ("md09_fd000_cfg", f"bash 000<<< {_R9_Q}\n", "refuse"),
+    ("md10_fd33_cfg_only", f"bash 33<<< {_R9_Q}\n", "any"),
+    ("md11_cat_fd33_var_redirect", 'cat 33<<< "$d" > /tmp/y\n', "any"),
+    ("md12_plain_cfg_fd3_x", f"bash <<< {_R9_Q} 3<<< x\n", "refuse"),
+    ("md13_fd0_cfg_fd3_x", f"bash 0<<< {_R9_Q} 3<<< x\n", "refuse"),
+    ("md14_fd33_cfg_dup0", f"bash 33<<< {_R9_Q} 0<&33\n", "refuse"),
+    ("md15_fd3_cfg_dup0", f"bash 3<<< {_R9_Q} 0<&3\n", "refuse"),
+    ("md16_exec_fd33_then_dup", f"exec 33<<< {_R9_Q}; bash 0<&33\n", "refuse"),
+    ("md17_fd0_cfg_2to1", f"bash 0<<< {_R9_Q} 2>&1\n", "refuse"),
+    ("md20_fd0_x_fd33_cfg", f"bash 0<<< x 33<<< {_R9_Q}\n", "any"),
+    ("md21_sh_fd0_cfg_fd33_x", f"sh 0<<< {_R9_Q} 33<<< x\n", "refuse"),
+    ("md22_fd0_cfg_fd99_x", f"bash 0<<< {_R9_Q} 99<<< x\n", "refuse"),
+    ("pad300_cat_fd3_var_redirect", _R9_PAD + 'cat 3<<< "$d" > /tmp/y\n', "any"),
+    (
+        "cat_fd3_var_pad300_bash_fd3_cfg",
+        'cat 3<<< "$d" > /tmp/y\n' + _R9_PAD + f'bash 3<<< "{_PARITY_CFG}"\n',
+        "refuse",
+    ),
+    (
+        "cat_fd3_var_pad300_bash_plain_cfg",
+        'cat 3<<< "$d" > /tmp/y\n' + _R9_PAD + f'bash <<< "{_PARITY_CFG}"\n',
+        "refuse",
+    ),
+    ("cat_fd3_var_pad300_cfg", 'cat 3<<< "$d" > /tmp/y\n' + _R9_PAD + f"{_PARITY_CFG}\n", "refuse"),
+    ("bash_fd33_cfg", f'bash 33<<< "{_PARITY_CFG}"\n', "any"),
+    ("bash_fd0_33_cfg", f'bash 0<<< "{_PARITY_CFG}" 33<<< x\n', "refuse"),
+    ("bash_brace_fd_cfg", f'bash {{fd}}<<< "{_PARITY_CFG}"\n', "any"),
+    ("bash_fd0_nospace_cfg", f'bash 0<<<"{_PARITY_CFG}"\n', "refuse"),
+    ("bash_fd0_unquoted_cfg", f"bash 0<<<{_PARITY_CFG}\n", "refuse"),
+    ("bash_fd0_ansic_cfg", f"bash 0<<<$'{_PARITY_CFG}'\n", "refuse"),
+    ("bash_tab_fd0_cfg", f'bash\t0<<< "{_PARITY_CFG}"\n', "refuse"),
+    ("bash_s_fd0_cfg", f'bash -s 0<<< "{_PARITY_CFG}"\n', "refuse"),
+    ("cmdsub_bash_fd0_cfg", f'x=$(bash 0<<< "{_PARITY_CFG}")\n', "refuse"),
+    ("two_marks_one_line", f'cat 3<<< "$d"; bash 0<<< "{_PARITY_CFG}"\n', "refuse"),
+    ("cat_fd3_then_pipe_bash", f'cat 0<<< "{_PARITY_CFG}" | bash\n', "refuse"),
+    ("cat_fd3_var_semicolon_true", 'cat 3<<< "$d"; true\n', "any"),
+)
+_GRAMMAR_CASES = (
+    ("cat 3<<< x\n", 4, 4, "cat <<< x\n", 1),
+    ("cat 33<<< x\n", 4, 5, "cat <<< x\n", 1),
+    ("cat 00<<< x\n", 4, 5, "cat <<< x\n", 1),
+    ("cat 000<<< x\n", 4, 6, "cat <<< x\n", 1),
+    ("cat 99<<< x\n", 4, 5, "cat <<< x\n", 1),
+    ("cat {fd}<<< x\n", 4, 7, "cat <<< x\n", 1),
+    ("cat {_a1}<<< x\n", 4, 8, "cat <<< x\n", 1),
+    ("cat a3<<< x\n", 5, 0, "cat a3<<< x\n", 0),
+    ("cat x_33<<< x\n", 6, 0, "cat x_33<<< x\n", 0),
+    ("echo '3<<<'\n", 6, 0, "echo '3<<<'\n", 0),
+    ("cat {1fd}<<< x\n", 4, 0, "cat {1fd}<<< x\n", 0),
+)
 
 
 def _ast_module_funcs(path: Path) -> dict[str, ast.FunctionDef]:
@@ -582,6 +667,99 @@ class RawConfigureShapeTest(RawConfigureGuardBase):
         for body in (b5, b6):
             self._check_parser_body(body, refused=False)
 
+    def test_refuses_unterminated_heredoc_dangerous_tail(self) -> None:
+        """Refuse configure bytes left after an unclosed heredoc opener."""
+        body = "cat <<EOF\n./configure --prefix=/x\n"
+        self._check_parser_body(body, refused=True)
+
+    def test_refuses_descriptor_plain_twin_parity_fail_open_rows(self) -> None:
+        """Refuse every parity-grid descriptor form that fail-opened on plain-twin parity."""
+        client = self._next_client()
+        for cmd in _PARITY_COMMANDS:
+            for word in _PARITY_WORDS:
+                for tail in _PARITY_TAILS:
+                    plain = f"{cmd} <<< {word}{tail}"
+                    plain_rc = self.run_guard(
+                        client, self.payload(client, plain, self.tree)
+                    ).returncode
+                    if plain_rc != 2:
+                        continue
+                    for fd in ("0", "3"):
+                        desc = f"{cmd} {fd}<<< {word}{tail}"
+                        with self.subTest(cmd=cmd, word=word, tail=tail, fd=fd):
+                            result = self.run_guard(client, self.payload(client, desc, self.tree))
+                            self.assertEqual(result.returncode, 2, result.stderr)
+
+    def test_refuses_descriptor_plain_twin_inline_fail_open_rows(self) -> None:
+        """Refuse inline descriptor shapes that fail-opened before the plain-twin guard."""
+        cases = tuple((body.rstrip("\n"), self.tree) for _label, body in _INLINE_FAIL_OPEN)
+        self._assert_refused(cases)
+
+    def test_allows_descriptor_plain_twin_cat_pass_shapes(self) -> None:
+        """Allow descriptor cat tails that stay allowed after plain-twin parity."""
+        bodies = (
+            'cat 3<<< "$d"\n',
+            'cat 3<<< "$d" > /tmp/y\n',
+            'cat - x 3<<< "$d"\n',
+        )
+        for body in bodies:
+            self._check_parser_body(body, refused=False)
+
+    def test_descriptor_plain_twin_fd_refused_when_plain_refused(self) -> None:
+        """Refuse fd 0 and fd 3 whenever the plain here-string twin is refused."""
+        for cmd in _PARITY_COMMANDS:
+            for word in _PARITY_WORDS:
+                for tail in _PARITY_TAILS:
+                    plain = f"{cmd} <<< {word}{tail}\n"
+                    plain_hit = scan_body(plain, self._shape_context(), BodyBudget())[0]
+                    if plain_hit is None:
+                        continue
+                    for fd in ("0", "3"):
+                        body = f"{cmd} {fd}<<< {word}{tail}\n"
+                        with self.subTest(cmd=cmd, word=word, tail=tail, fd=fd):
+                            hit = scan_body(body, self._shape_context(), BodyBudget())[0]
+                            self.assertIsNotNone(hit)
+
+    def test_script_blocks_fd_herestring_allowlist_shift_limit(self) -> None:
+        """Fail closed when shift occurrences exceed the script-wide inspection limit."""
+        shift = "delay=$((1 << 2))\n"
+        heredoc = "cat <<EOF\nx\nEOF\n"
+        raw_many = (shift * 4100 + heredoc).encode()
+        self.assertTrue(lex_mod.script_blocks_fd_herestring_allowlist(raw_many))
+        raw_n = (shift * 4096).encode()
+        raw_n1 = (shift * 4097).encode()
+        self.assertFalse(lex_mod.script_blocks_fd_herestring_allowlist(raw_n))
+        self.assertTrue(lex_mod.script_blocks_fd_herestring_allowlist(raw_n1))
+        self.assertFalse(lex_mod.script_blocks_fd_herestring_allowlist((shift * 10).encode()))
+
+    def test_descriptor_twin_refuses_when_plain_twin_parser_unavailable(self) -> None:
+        """Refuse descriptor tails when the plain-twin side scan cannot parse."""
+        body = f'bash 0<<< "{_PARITY_CFG}"\n'
+        calls: list[int] = []
+        real_parser = body_mod.bash_parser
+
+        def staged_parser() -> object:
+            """Return the real parser once, then a refusal string on the twin lookup."""
+            calls.append(1)
+            if len(calls) > 1:
+                return "simulated parser unavailable"
+            return real_parser()
+
+        with unittest.mock.patch.object(body_mod, "bash_parser", side_effect=staged_parser):
+            hit = scan_body(body, self._shape_context(), BodyBudget())[0]
+        self.assertIsNotNone(hit)
+        self.assertIn("without the descriptor digit is refused", hit or "")
+
+    def _shape_context(self) -> InspectionContext:
+        """Build the inspection context shared by in-process shape probes."""
+        return InspectionContext(
+            cwd=self.root,
+            directory_changed=False,
+            files_read=[],
+            classifier=lambda _words: None,
+            script_dir=self.root,
+        )
+
     def test_clean_redirect_targets_match_descriptor_tail_targets(self) -> None:
         """Pin descriptor-tail redirect targets to clean here-string redirect checks."""
         context = InspectionContext(
@@ -811,3 +989,87 @@ class RawConfigureShapeTest(RawConfigureGuardBase):
             subshell = blocked[-1][0]
             self.assertIsNone(scan_body(subshell, context, BodyBudget())[0])
         self.assertIsNone(scan_body(p1, context, BodyBudget())[0])
+
+    def test_refuses_r9_command_surface_table(self) -> None:
+        """Decide every in-scope lim414b and lim414 command case in-process."""
+        for label, command, want in _R9_CASES:
+            with self.subTest(label=label):
+                blocked = GUARD_MOD._inspect_with_deadline(command, self.tree)
+                if want == "refuse":
+                    self.assertIsNotNone(blocked)
+
+    def test_refuses_r9_script_body_table(self) -> None:
+        """Refuse every in-scope lim414b and lim414 refuse body when invoked via bash ./s.sh."""
+        client = self._next_client()
+        script = self.tree / "s.sh"
+        for label, command, want in _R9_CASES:
+            if want != "refuse":
+                continue
+            script.write_text(command, encoding="utf-8")
+            with self.subTest(label=label):
+                result = self.run_guard(client, self.payload(client, "bash ./s.sh", self.tree))
+                self.assertEqual(result.returncode, 2, result.stderr)
+
+    def test_descriptor_prefix_grammar_table(self) -> None:
+        """Verify shared descriptor-prefix counting, stripping, and opener length."""
+        for text, pos, want_hop, want_stripped, want_count in _GRAMMAR_CASES:
+            raw = text.encode("utf-8")
+            with self.subTest(text=text):
+                self.assertEqual(lex_mod.descriptor_tail_mark_count(raw), want_count)
+                self.assertEqual(
+                    lex_mod.strip_descriptor_tail_marks(raw), want_stripped.encode("utf-8")
+                )
+                self.assertEqual(lex_mod._herestring_op_len(text, pos), want_hop)
+
+    def test_descriptor_twin_owns_files_read_and_directory_state(self) -> None:
+        """Keep caller files_read and directory_state isolated from the twin side scan."""
+        (self.root / "lib.sh").write_text(":\n", encoding="utf-8")
+        sourced_body = 'source ./lib.sh\ncat 3<<< "$d"\n'
+        ctx_real = InspectionContext(
+            cwd=self.root,
+            directory_changed=False,
+            files_read=[0],
+            classifier=lambda _words: None,
+            script_dir=self.root,
+            source_reader=files_mod._read_source,
+        )
+        ctx_patched = ctx_real._replace(files_read=[0])
+        self.assertIsNone(scan_body(sourced_body, ctx_real, BodyBudget())[0])
+        with unittest.mock.patch.object(
+            body_mod, "_descriptor_plain_twin_refusal", return_value=None
+        ):
+            self.assertIsNone(scan_body(sourced_body, ctx_patched, BodyBudget())[0])
+        self.assertEqual(ctx_real.files_read[0], 1)
+        self.assertEqual(ctx_real.files_read[0], ctx_patched.files_read[0])
+        dir_state = [False]
+        limit_budget = BodyBudget(nodes=body_mod.MAX_BODY_NODES - 26)
+        hit = scan_body('cd /tmp\ncat 3<<< "$d"\n', self._shape_context(), limit_budget, dir_state)[
+            0
+        ]
+        self.assertEqual(hit, "shell syntax tree larger than inspect limit")
+        self.assertEqual(dir_state, [False])
+
+    def test_refuses_fd0_leading_zeros_and_stdin_dup_precedence(self) -> None:
+        """Refuse leading-zero fd 0 precedence and 0<&N or <&N dups onto fd 0 on both surfaces."""
+        cmd_cases = (
+            f"bash 33<<< x 00<<< {_R9_Q}\n",
+            f"bash 33<<< x 000<<< {_R9_Q}\n",
+            f"bash 0<<< x 33<<< {_R9_Q} 0<&33\n",
+            f"bash 0<<< x 33<<< {_R9_Q} <&33\n",
+            f"exec 33<<< {_R9_Q}; python3 - 0<&33\n",
+            f"exec 3<<< {_R9_Q}; python3 - <&3\n",
+        )
+        for command in cmd_cases:
+            with self.subTest(surface="command", command=command):
+                self.assertIsNotNone(GUARD_MOD._inspect_with_deadline(command, self.tree))
+        part_a = "./con"
+        part_b = "figure"
+        body_cases = (
+            f'a={part_a}; b={part_b}; bash 33<<< "$a$b" 0<&33\n',
+            f'a={part_a}; b={part_b}; bash 33<<< "$a$b" <&33\n',
+            f'a={part_a}; b={part_b}; exec 33<<< "$a$b"; bash 0<&33\n',
+            f'a={part_a}; b={part_b}; exec 33<<< "$a$b"; bash <&33\n',
+        )
+        for body in body_cases:
+            with self.subTest(surface="body", body=body):
+                self.assertIsNotNone(scan_body(body, self._shape_context(), BodyBudget())[0])

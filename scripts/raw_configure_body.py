@@ -18,8 +18,11 @@ from scripts.raw_configure_lex import (
     _tokens,
     collect_error_nodes,
     descriptor_tail_mark_count,
+    descriptor_tail_marks_present,
     errors_within_tail_span,
     find_descriptor_herestring_tail,
+    rewrite_descriptor_dups,
+    strip_descriptor_tail_marks,
     tail_line_is_toplevel,
 )
 from scripts.raw_configure_unwrap import _unwrap_command
@@ -749,6 +752,20 @@ def _record_directory(words: list[str], idx: int, scan: _Scan) -> None:
     scan.dir_changed = scan.moved = True
 
 
+def _inline_twin_node(raw: bytes, scan: _Scan) -> tuple[Any, bytes] | None:
+    """Build a digit-stripped twin syntax root for an inline body with descriptor marks."""
+    if not descriptor_tail_marks_present(raw):
+        return None
+    twin_raw = strip_descriptor_tail_marks(rewrite_descriptor_dups(raw))
+    twin_root = bash_parser().parse(twin_raw).root_node
+    hit = _unterminated_heredoc_refusal(twin_root, twin_raw)
+    if hit is not None:
+        scan.refusal = hit
+        return None
+    scan.syntax_roots[twin_raw] = twin_root
+    return twin_root, twin_raw
+
+
 def _queue_inline(body: str, scan: _Scan, *, source: bool = False) -> None:
     """Queue an inline syntax tree or record an explicit shared-budget refusal."""
     if scan.budget.inline_bodies >= MAX_INLINE_BODIES:
@@ -770,7 +787,10 @@ def _queue_inline(body: str, scan: _Scan, *, source: bool = False) -> None:
         scan.var_scope = _merge_scopes(scan.var_scope, names.var_scope)
         scan.source_literals[id(root)] = _literal_map(names, raw, watched)
         _note_prefix_calls(names, scan)
+    twin = _inline_twin_node(raw, scan)
     scan.stack.append((root, raw, False))
+    if twin is not None:
+        scan.stack.append((twin[0], twin[1], False))
 
 
 def _file_target(target: str | None, scan: _Scan) -> str | None:
@@ -1387,6 +1407,49 @@ def _probe_clean_redirect_target(
         return False
     hit, *_ = _run_scan_walk(root, raw, scan, probe, None)
     return hit is None
+
+
+def _descriptor_plain_twin_refusal(
+    body: str,
+    context: InspectionContext,
+    budget: BodyBudget,
+) -> str | None:
+    """Refuse descriptor tails when the digit-stripped twin body is refused."""
+    raw = body.encode("utf-8", "surrogateescape")
+    if not descriptor_tail_marks_present(raw):
+        return None
+    twin_raw = strip_descriptor_tail_marks(rewrite_descriptor_dups(raw))
+    parser = bash_parser()
+    prefix = (
+        "descriptor here-string form refused because the same script "
+        "without the descriptor digit is refused"
+    )
+    reason: str | None
+    if isinstance(parser, str):
+        reason = parser
+    else:
+        current_reads = context.files_read[0] if context.files_read else 0
+        twin_context = context._replace(files_read=[current_reads])
+        twin_directory_state = [context.directory_changed]
+        probe = BodyBudget(
+            nodes=budget.nodes,
+            inline_bodies=budget.inline_bodies,
+            peeks=budget.peeks,
+            rebound_scripts=set(budget.rebound_scripts),
+            rebound_unknown=budget.rebound_unknown,
+            suppress_fd_tail_allow=True,
+        )
+        scan = _Scan(twin_context, probe, dir_changed=context.directory_changed)
+        root = parser.parse(twin_raw).root_node
+        prelude = _unterminated_heredoc_refusal(root, twin_raw)
+        if prelude is not None:
+            reason = prelude
+        else:
+            hit, *_ = _run_scan_walk(root, twin_raw, scan, probe, twin_directory_state)
+            reason = hit if hit is not None else scan.refusal
+    if reason is None:
+        return None
+    return f"{prefix}: {reason}"
 
 
 def _prime_fd_tail_verdicts(
@@ -3475,5 +3538,8 @@ def scan_body(
             empty,
             empty,
         )
+    twin_refusal = _descriptor_plain_twin_refusal(body, context, budget)
+    if twin_refusal is not None:
+        return twin_refusal, empty, empty, empty
     _prime_fd_tail_verdicts(scan, context, budget, raw)
     return _run_scan_walk(root, raw, scan, budget, directory_state)

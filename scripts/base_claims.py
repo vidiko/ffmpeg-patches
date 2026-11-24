@@ -33,6 +33,8 @@ DEPENDENCY_REFERENCE = re.compile(
     re.IGNORECASE,
 )
 DEPENDENCY_SEPARATOR = re.compile(r"\s*(?:,\s*(?:and\s+)?|\band\s+|&\s*)", re.IGNORECASE)
+DEPENDENCY_NONMEMBER_PREFIX = re.compile(r"\s*\b(?:and\s+)?(?:see|unrelated)\s+", re.IGNORECASE)
+DEPENDENCY_LEAD_GAP = re.compile(r"\s+(?:(?:and\s+)?now|previously)\s+", re.IGNORECASE)
 DEPENDENCY_HEAD = re.compile(
     r"\b(?:head|ending\s+at|ends\s+at|tip)\b[\s:(]*([0-9a-f]{7,40})\b", re.IGNORECASE
 )
@@ -222,12 +224,20 @@ def _dependency_member_end(sentence: str, depths: list[int], start: int, end: in
     return cursor
 
 
-def _dependency_attribution_error(sentence: str, first: re.Match[str], end: int) -> ValueError:
-    """Name window references when a head or hidden member cannot be safely attributed."""
-    numbers = ", ".join(
-        f"#{int(reference.group(1))}"
-        for reference in DEPENDENCY_MEMBER.finditer(sentence, first.start(), end)
-    )
+def _sentence_member_numbers(sentence: str) -> str:
+    """Format every member reference number in a sentence in appearance order."""
+    return ", ".join(f"#{match.group(1)}" for match in DEPENDENCY_MEMBER.finditer(sentence))
+
+
+def _dependency_sentence_error(sentence: str, subject: str, fix: str) -> ValueError:
+    """Build an ambiguity error naming every sentence member and one repair clause."""
+    numbers = _sentence_member_numbers(sentence)
+    return ValueError(f"ambiguous dependency {subject} for {numbers}: {fix}")
+
+
+def _dependency_attribution_error(sentence: str) -> ValueError:
+    """Name sentence references when a head or hidden member cannot be safely attributed."""
+    numbers = _sentence_member_numbers(sentence)
     return ValueError(
         f"ambiguous dependency heads for {numbers}: unpaired head or hidden member; "
         "write the head right after each reference or one dependency per sentence"
@@ -259,10 +269,12 @@ def _dependency_list_lead_historical(
 def _dependency_lead_annotation_end(
     sentence: str, depths: list[int], member_start: int, end: int
 ) -> int:
-    """Return the furthest bracketed annotation end before any depth-zero prose gap."""
+    """Return the furthest bracketed annotation end before prose or a depth-zero member."""
     cursor = member_start
     for index in range(member_start, end):
         if _dependency_prose_break(sentence, depths, index):
+            return cursor
+        if depths[index] == 0 and DEPENDENCY_MEMBER.match(sentence, index, end) is not None:
             return cursor
         if sentence[index] in "([":
             cursor = max(cursor, _dependency_bracket_extent(sentence, index, end))
@@ -280,37 +292,52 @@ def _dependency_separated_member(
     return None
 
 
-def _dependency_hidden_scan_end(
-    sentence: str, depths: list[int], list_parse_end: int, end: int
-) -> int:
-    """Extend hidden-member scans through unparsed depth-zero separator-led continuations."""
-    cursor = list_parse_end
-    for _ in range(end - list_parse_end + 1):
-        member = _dependency_separated_member(sentence, depths, cursor, end)
-        if member is None:
-            break
-        next_end = _dependency_member_end(sentence, depths, member.end(), end)
-        cursor = max(member.end(), next_end)
-    return cursor
-
-
 def _reject_hidden_dependency_members(
     sentence: str,
     depths: list[int],
     members: list[tuple[re.Match[str], int]],
     end: int,
 ) -> None:
-    """Reject unparsed members after depth-zero separators or inside lead annotations."""
+    """Reject unparsed members hidden inside parsed member annotations."""
     first = members[0][0]
-    if _dependency_separated_member(sentence, depths, members[-1][1], end) is not None:
-        raise _dependency_attribution_error(sentence, first, end)
     parsed_starts = {reference.start() for reference, _ in members[1:]}
     for member in DEPENDENCY_MEMBER.finditer(sentence, first.end(), end):
         if member.start() in parsed_starts or member.start() <= first.start():
             continue
         if depths[member.start()] == 0:
             continue
-        raise _dependency_attribution_error(sentence, first, end)
+        raise _dependency_attribution_error(sentence)
+
+
+def _dependency_nonmember_introducer(sentence: str, start: int, end: int) -> bool:
+    """Report whether clause text before a later reference is an allowed introducer."""
+    return DEPENDENCY_NONMEMBER_PREFIX.fullmatch(sentence, start, end) is not None
+
+
+def _reject_unlisted_later_references(
+    sentence: str,
+    depths: list[int],
+    bounds: tuple[int, int],
+    lead_historical: bool,
+) -> None:
+    """Reject later window references on current leads unless allow-listed."""
+    if lead_historical:
+        return
+    floor, end = bounds
+    fix = "write the head right after its reference or one dependency per sentence"
+    chain_end: int | None = None
+    for member in DEPENDENCY_MEMBER.finditer(sentence, floor, end):
+        if depths[member.start()] != 0:
+            raise _dependency_sentence_error(sentence, "references", fix)
+        if chain_end is not None and DEPENDENCY_SEPARATOR.fullmatch(
+            sentence, chain_end, member.start()
+        ):
+            chain_end = member.end()
+            continue
+        clause_start = _dependency_clause_start(sentence, depths, floor, member.start(), floor)
+        if not _dependency_nonmember_introducer(sentence, clause_start, member.start()):
+            raise _dependency_sentence_error(sentence, "references", fix)
+        chain_end = member.end()
 
 
 def _dependency_member_heads(
@@ -329,70 +356,120 @@ def _reject_unpaired_dependency_heads(
     list_bounds: tuple[int, int],
 ) -> None:
     """Reject current member-owned heads outside the shared annotation grammar."""
-    list_end, lead_start = list_bounds
+    list_end, _ = list_bounds
     heads = [_dependency_member_heads(sentence, reference, list_end) for reference, _ in members]
     current = _current_dependency_heads(sentence, depths, members, heads, list_bounds)
     for (_, member_end), member_heads in zip(members, current, strict=True):
         for head in member_heads:
             if head.end() > member_end:
                 raise ValueError(
-                    f"{_dependency_attribution_error(sentence, members[0][0], list_end)}: "
-                    f"{head.group(1).lower()}"
+                    f"{_dependency_attribution_error(sentence)}: {head.group(1).lower()}"
                 )
 
 
-def _dependency_lead_start(
+def _dependency_lead_gap_allowed(gap: str) -> bool:
+    """Report whether text from clause start to a later lead verb is allow-listed."""
+    return DEPENDENCY_LEAD_GAP.fullmatch(gap) is not None
+
+
+def _dependency_next_lead_start(
+    sentence: str, depths: list[int], prev_floor: int, reference: re.Match[str]
+) -> int:
+    """Validate a later lead's depth and clause gap and return its history-window start."""
+    fix = "write one dependency per sentence"
+    if depths[reference.start()] != 0:
+        raise _dependency_sentence_error(sentence, "leads", fix)
+    lead_start = _dependency_clause_start(
+        sentence, depths, prev_floor, reference.start(), prev_floor
+    )
+    if not _dependency_lead_gap_allowed(sentence[lead_start : reference.start()]):
+        raise _dependency_sentence_error(sentence, "leads", fix)
+    return lead_start
+
+
+def _split_claim_sentences(line: str) -> list[str]:
+    """Split a claim line only at depth-zero sentence breaks."""
+    depths = _dependency_bracket_depths(line)
+    sentences: list[str] = []
+    start = 0
+    for match in SENTENCE_BREAK.finditer(line):
+        if depths[match.start()] == 0:
+            sentences.append(line[start : match.start()])
+            start = match.end()
+    sentences.append(line[start:])
+    return sentences
+
+
+def _reject_bracketed_sentence_break(sentence: str, depths: list[int]) -> None:
+    """Reject a sentence with a dependency lead and a bracketed sentence break."""
+    for match in SENTENCE_BREAK.finditer(sentence):
+        if depths[match.start()] > 0:
+            raise _dependency_sentence_error(
+                sentence, "annotation", "write no sentence break inside the annotation"
+            )
+
+
+def _parse_dependency_members(
+    sentence: str, depths: list[int], first: re.Match[str], list_end: int
+) -> list[tuple[re.Match[str], int]]:
+    """Parse separator-joined list members and their own supported annotation ends."""
+    reference = first
+    members: list[tuple[re.Match[str], int]] = []
+    for _ in range(list_end - reference.end() + 1):
+        member_end = _dependency_member_end(sentence, depths, reference.end(), list_end)
+        members.append((reference, member_end))
+        separator = DEPENDENCY_SEPARATOR.match(sentence, member_end, list_end)
+        following = (
+            DEPENDENCY_MEMBER.match(sentence, separator.end(), list_end) if separator else None
+        )
+        if following is None:
+            break
+        reference = following
+    return members
+
+
+def _dependency_list_floor(
     sentence: str,
     depths: list[int],
-    references: list[re.Match[str]],
-    index: int,
+    members: list[tuple[re.Match[str], int]],
+    list_end: int,
 ) -> int:
-    """Start a dependency lead's history window at its depth-zero clause boundary."""
-    first = references[index]
-    if index == 0:
-        return _dependency_clause_start(sentence, depths, 0, first.start())
-    return _dependency_clause_start(
-        sentence, depths, references[index - 1].end(), first.start(), first.start()
-    )
+    """Return the end of the last member's annotation and bracket extent."""
+    first_bracket = _dependency_lead_annotation_end(sentence, depths, members[0][0].end(), list_end)
+    last_bracket = _dependency_lead_annotation_end(sentence, depths, members[-1][0].end(), list_end)
+    return max(members[-1][1], first_bracket, last_bracket)
 
 
 def _dependency_lists(
     sentence: str, depths: list[int] | None = None
 ) -> Iterator[tuple[list[tuple[re.Match[str], int]], int, int]]:
-    """Yield grammar spans, rejecting hidden window members and unpaired member-owned heads."""
+    """Yield grammar spans, rejecting unlisted continuations and unpaired heads."""
     if depths is None:
         depths = _dependency_bracket_depths(sentence)
     references = list(DEPENDENCY_REFERENCE.finditer(sentence))
+    if references:
+        _reject_bracketed_sentence_break(sentence, depths)
+    prev_floor = 0
     for index, first in enumerate(references):
         list_end = references[index + 1].start() if index + 1 < len(references) else len(sentence)
-        lead_start = _dependency_lead_start(sentence, depths, references, index)
-        reference = first
-        members = []
-        for _ in range(list_end - reference.end() + 1):
-            member_end = _dependency_member_end(sentence, depths, reference.end(), list_end)
-            members.append((reference, member_end))
-            separator = DEPENDENCY_SEPARATOR.match(sentence, member_end, list_end)
-            following = (
-                DEPENDENCY_MEMBER.match(sentence, separator.end(), list_end) if separator else None
-            )
-            if following is None:
-                break
-            reference = following
+        lead_start = (
+            _dependency_clause_start(sentence, depths, 0, first.start())
+            if index == 0
+            else _dependency_next_lead_start(sentence, depths, prev_floor, first)
+        )
+        members = _parse_dependency_members(sentence, depths, first, list_end)
+        floor = _dependency_list_floor(sentence, depths, members, list_end)
         lead_historical = _dependency_list_lead_historical(
             sentence, depths, first, lead_start, list_end
         )
         if not lead_historical:
-            prose_end = _dependency_hidden_scan_end(sentence, depths, members[-1][1], list_end)
-            annotation_end = _dependency_lead_annotation_end(
-                sentence, depths, first.end(), list_end
-            )
-            _reject_hidden_dependency_members(
-                sentence, depths, members, max(prose_end, annotation_end)
-            )
+            _reject_hidden_dependency_members(sentence, depths, members, floor)
+        _reject_unlisted_later_references(sentence, depths, (floor, list_end), lead_historical)
         if len(members) == 1:
             members[0] = (members[0][0], list_end)
         if not lead_historical:
             _reject_unpaired_dependency_heads(sentence, depths, members, (list_end, lead_start))
+        prev_floor = floor
         yield members, list_end, lead_start
 
 
@@ -494,7 +571,7 @@ def _dependency_records(text: str) -> list[tuple[int, str | None]]:
     records = [
         claim
         for line in _claim_lines(text)
-        for sentence in SENTENCE_BREAK.split(line)
+        for sentence in _split_claim_sentences(line)
         for claim in _sentence_dependencies(sentence)
     ]
     _check_dependency_count({number for number, _ in records})

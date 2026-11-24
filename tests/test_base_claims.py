@@ -16,6 +16,128 @@ from scripts import base_claims
 
 MERGE_BASE = "c" * 40
 
+DEPENDENCY_ALLOWLIST_CASES: tuple[tuple[str, list[tuple[int, str]] | None, str], ...] = (
+    ("r1-or", None, "Depends on #12 ~ head aaaaaaa or #13 (head bbbbbbb)."),
+    ("r1-comma-or", None, "Depends on #12 ~ head aaaaaaa, or #13 (head bbbbbbb)."),
+    ("r1-plus", None, "Depends on #12 ~ head aaaaaaa plus #13 (head bbbbbbb)."),
+    ("r1-as-well-as", None, "Depends on #12 ~ head aaaaaaa as well as #13 (head bbbbbbb)."),
+    ("r1-along-with", None, "Depends on #12 ~ head aaaaaaa along with #13 (head bbbbbbb)."),
+    ("r1-slash", None, "Depends on #12 ~ head aaaaaaa / #13 (head bbbbbbb)."),
+    ("r1-and-or", None, "Depends on #12 ~ head aaaaaaa and/or #13 (head bbbbbbb)."),
+    ("r1-plus-sign", None, "Depends on #12 ~ head aaaaaaa + #13 (head bbbbbbb)."),
+    ("r1-then", None, "Depends on #12 ~ head aaaaaaa then #13 (head bbbbbbb)."),
+    ("r1-full-or", None, "Depends on #12 (head aaaaaaa) or #13 (head bbbbbbb)."),
+    ("r1-prose-or", None, "Depends on #12 (head aaaaaaa), or #13 (head bbbbbbb)."),
+    ("r1-prose-plus", None, "Depends on #12 (head aaaaaaa), plus #13 (head bbbbbbb)."),
+    ("r1-prose-bracket", None, "Depends on #12 (head aaaaaaa), (and #13, head bbbbbbb)."),
+    ("r1-prose-words", None, "Depends on #12 (head aaaaaaa), for details see #14."),
+    ("r1-keep-see", [(12, "aaaaaaa")], "Depends on #12 (head aaaaaaa), see #14 for benchmarks."),
+    (
+        "r1-keep-and-see",
+        [(12, "aaaaaaa")],
+        "Depends on #12 (head aaaaaaa) and see #14 for benchmarks.",
+    ),
+    (
+        "r1-keep-see-chain",
+        [(12, "aaaaaaa")],
+        "Depends on #12 (head aaaaaaa), see #14 and #15 for benchmarks.",
+    ),
+    (
+        "r1-keep-unrelated",
+        [(12, "aaaaaaa"), (13, "bbbbbbb")],
+        "Depends on #12 (head aaaaaaa), #13 (head bbbbbbb), unrelated #14 head ccccccc.",
+    ),
+    ("r1-keep-historical", [], "Previously stacked on #12 ~ head aaaaaaa, #13 (head bbbbbbb)."),
+    (
+        "r2-and-previously",
+        None,
+        "Depends on #12 (head aaaaaaa) and previously stacked on #13 (head bbbbbbb).",
+    ),
+    (
+        "r2-previously-comma",
+        None,
+        "Depends on #12 (head aaaaaaa), previously, stacked on #13 (head bbbbbbb).",
+    ),
+    ("r2-formerly", None, "Depends on #12 (head aaaaaaa), formerly stacked on #13 (head bbbbbbb)."),
+    (
+        "r2-originally",
+        None,
+        "Depends on #12 (head aaaaaaa), originally stacked on #13 (head bbbbbbb).",
+    ),
+    (
+        "r2-no-longer",
+        None,
+        "Depends on #12 (head aaaaaaa) and no longer depends on #13 (head bbbbbbb).",
+    ),
+    ("r2-dash", None, "Depends on #12 (head aaaaaaa) - previously stacked on #13 (head bbbbbbb)."),
+    ("r2-which", None, "Depends on #12 (head aaaaaaa) which builds on #13 (head bbbbbbb)."),
+    ("r2-empty-gap", None, "Depends on #12 (head aaaaaaa), based on #13 (head bbbbbbb)."),
+    ("r2-truncated", None, "Depends on #12 ~ head aaaaaaa then depends on #13 (head bbbbbbb)."),
+    (
+        "r2-keep-and-now",
+        [(12, "aaaaaaa"), (13, "bbbbbbb")],
+        "Depends on #12 (head aaaaaaa), and now depends on #13 (head bbbbbbb).",
+    ),
+    (
+        "r2-keep-previously",
+        [(12, "aaaaaaa")],
+        "Depends on #12 (head aaaaaaa), previously stacked on #13 (head bbbbbbb).",
+    ),
+    (
+        "r2-keep-historical-first",
+        [(13, "bbbbbbb")],
+        "Previously stacked on #12 and now depends on #13 (head bbbbbbb).",
+    ),
+    (
+        "r2-keep-used-to",
+        [(12, "aaaaaaa")],
+        "Depends on #12 (head aaaaaaa); it used to depend on #13 (head bbbbbbb).",
+    ),
+    (
+        "r3-in-brackets",
+        None,
+        "Depends on #12 (head aaaaaaa; previously stacked on #13, head bbbbbbb).",
+    ),
+    ("r3-semicolon", None, "Depends on #12 (previous head aaaaaaa; now head bbbbbbb)."),
+    ("r3-period", None, "Depends on #12 (old head aaaaaaa. New head bbbbbbb)."),
+    ("r3-bang", None, "Depends on #12 (old head aaaaaaa! new head bbbbbbb)."),
+    ("r3-question", None, "Depends on #12 (old head aaaaaaa? new head bbbbbbb)."),
+    ("r3-see", None, "Depends on #12 (head aaaaaaa; see #13)."),
+    ("r3-abbreviation", None, "Depends on #12 (head aaaaaaa, e.g. rebased)."),
+    (
+        "r3-keep-depth-zero",
+        [(13, "bbbbbbb")],
+        "Depends on #13 - head bbbbbbb! Then unrelated head ccccccc.",
+    ),
+    ("control-plain", [(12, "aaaaaaa")], "Depends on #12 (head aaaaaaa)."),
+    (
+        "control-two",
+        [(12, "aaaaaaa"), (13, "bbbbbbb")],
+        "Depends on #12 (head aaaaaaa) and #13 (head bbbbbbb).",
+    ),
+    ("r1-sibling-with", None, "Depends on #12 ~ head aaaaaaa with #13 (head bbbbbbb)."),
+    ("r1-sibling-via", None, "Depends on #12 (head aaaaaaa) via #13 (head bbbbbbb)."),
+    ("r1-sibling-see-or", None, "Depends on #12 (head aaaaaaa), see #14 or #15 for benchmarks."),
+    (
+        "r2-sibling-historically",
+        None,
+        "Depends on #12 (head aaaaaaa), historically stacked on #13 (head bbbbbbb).",
+    ),
+    (
+        "r2-sibling-currently",
+        None,
+        "Depends on #12 (head aaaaaaa), currently depends on #13 (head bbbbbbb).",
+    ),
+    ("r2-sibling-nospace-gap", None, "Depends on #12 (head aaaaaaa),based on #13 (head bbbbbbb)."),
+    (
+        "r3-sibling-square-semicolon",
+        None,
+        "Depends on #12 [previous head aaaaaaa; now head bbbbbbb].",
+    ),
+    ("r3-sibling-square-period", None, "Depends on #12 [old head aaaaaaa. New head bbbbbbb]."),
+    ("r3-sibling-nested-brackets", None, "Depends on #12 (head aaaaaaa [e.g. rebased])."),
+)
+
 
 class BaseClaimsTest(unittest.TestCase):
     """Verify base-claim extraction, filtering, staleness checks and CLI exit codes."""
@@ -1377,6 +1499,64 @@ class BaseClaimsTest(unittest.TestCase):
         ]
         rc, err = self.run_cli("--merge-base", MERGE_BASE, *options, str(body))
         self.assertEqual((rc, err), (0, ""))
+
+    def test_dependency_allowlist_cases(self) -> None:
+        """Allow-listed continuations pass while unlisted joiners, gaps and breaks fail closed."""
+        for label, want, sentence in DEPENDENCY_ALLOWLIST_CASES:
+            with self.subTest(case=label):
+                if want is None:
+                    with self.assertRaises(ValueError) as caught:
+                        base_claims.find_dependency_claims(sentence)
+                    message = str(caught.exception)
+                    self.assertTrue(message.startswith("ambiguous dependency"), message)
+                    for match in base_claims.DEPENDENCY_MEMBER.finditer(sentence):
+                        self.assertIn(f"#{match.group(1)}", message)
+                    continue
+                try:
+                    actual = base_claims.find_dependency_claims(sentence)
+                except ValueError as error:
+                    self.fail(f"unexpected ValueError: {error}")
+                self.assertEqual(actual, want)
+
+    def test_dependency_allowlist_cli_and_chains(self) -> None:
+        """Comma chains in see/unrelated prose pass while CLI modes reject unlisted shapes."""
+        self.assertEqual(
+            base_claims.find_dependency_claims(
+                "Depends on #12 (head aaaaaaa), see #14, #15, and PR 16 & #17 for benchmarks."
+            ),
+            [(12, "aaaaaaa")],
+        )
+        self.assertEqual(
+            base_claims.find_dependency_claims(
+                "Depends on #12 (head aaaaaaa), now depends on #13 (head bbbbbbb)."
+            ),
+            [(12, "aaaaaaa"), (13, "bbbbbbb")],
+        )
+        hist_body = self.write_fixture(
+            "hist.md", "Previously stacked on #12 ~ head aaaaaaa, #13 (head bbbbbbb)."
+        )
+        self.assertEqual(self.run_cli("--merge-base", MERGE_BASE, str(hist_body)), (0, ""))
+        dependency = self.dependency_json()
+        for sample in (
+            "Depends on #12 (head aaaaaaa) or #13 (head bbbbbbb).",
+            "Depends on #12 (head aaaaaaa), formerly stacked on #13 (head bbbbbbb).",
+            "Depends on #12 (head aaaaaaa; see #13).",
+        ):
+            body = self.write_fixture("body.md", sample)
+            for flags in ((), ("--list-dependencies",)):
+                with self.subTest(sample=sample, flags=flags):
+                    rc, err = self.run_cli(
+                        "--merge-base",
+                        MERGE_BASE,
+                        "--dependency-json",
+                        f"12={dependency}",
+                        *flags,
+                        str(body),
+                    )
+                    self.assertEqual(rc, 2)
+                    self.assertIn("ambiguous dependency", err)
+                    self.assertIn("#12", err)
+                    self.assertIn("#13", err)
 
 
 if __name__ == "__main__":

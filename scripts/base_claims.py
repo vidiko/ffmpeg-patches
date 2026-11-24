@@ -103,37 +103,118 @@ def find_base_claims(text: str) -> list[str]:
     return [claim for line in _claim_lines(text) for claim in _line_claims(line)]
 
 
-def _dependency_clause_start(sentence: str, start: int, end: int, fallback: int = 0) -> int:
-    """Return the last clause boundary in a range or the supplied fallback."""
+def _dependency_bracket_depths(sentence: str) -> list[int]:
+    """Return bracket depth immediately before each sentence index in one bounded pass."""
+    depths = [0] * (len(sentence) + 1)
+    depth = 0
+    for index, char in enumerate(sentence):
+        depths[index] = depth
+        if char in "([":
+            depth += 1
+        elif char in ")]" and depth > 0:
+            depth -= 1
+    depths[len(sentence)] = depth
+    return depths
+
+
+def _dependency_prose_break(sentence: str, depths: list[int], index: int) -> bool:
+    """Report whether an index is a depth-zero prose clause or list boundary."""
+    if index >= len(sentence) or depths[index] != 0:
+        return False
+    char = sentence[index]
+    if char in ",;|":
+        return True
+    return char == "." and index + 1 < len(sentence) and sentence[index + 1].isspace()
+
+
+def _dependency_clause_start(
+    sentence: str, depths: list[int], start: int, end: int, fallback: int = 0
+) -> int:
+    """Return the last depth-zero prose boundary in a range or the supplied fallback."""
     clause_start = fallback
-    for sep in CLAUSE_BREAK.finditer(sentence, start, end):
-        clause_start = sep.end()
+    for index in range(start, end):
+        if _dependency_prose_break(sentence, depths, index):
+            clause_start = index + 1 if sentence[index] != "." else index + 2
     return clause_start
 
 
+def _dependency_bracket_extent(sentence: str, open_index: int, end: int) -> int:
+    """Return the index after the bracket opened at open_index, or end when unclosed."""
+    open_char = sentence[open_index]
+    close_char = ")" if open_char == "(" else "]"
+    depth = 0
+    for index in range(open_index, end):
+        if sentence[index] == open_char:
+            depth += 1
+        elif sentence[index] == close_char:
+            depth -= 1
+            if depth == 0:
+                return index + 1
+    return end
+
+
+def _dependency_head_clause_start(
+    sentence: str, depths: list[int], scope_start: int, head_index: int, depth: int
+) -> int:
+    """Return the start of the depth-local clause holding head_index."""
+    clause_start = scope_start
+    for index in range(scope_start, head_index):
+        if depths[index] == depth and sentence[index] in ",;":
+            clause_start = index + 1
+    return clause_start
+
+
+def _dependency_head_scope_start(
+    sentence: str, depths: list[int], reference_end: int, head_index: int
+) -> int:
+    """Return the search start for history in the scope that owns head_index."""
+    head_depth = depths[min(head_index, len(sentence))]
+    if head_depth != 0:
+        return reference_end
+    index = reference_end
+    for _ in range(head_index - reference_end + 1):
+        if index >= head_index:
+            break
+        if sentence[index] in "([":
+            index = _dependency_bracket_extent(sentence, index, head_index)
+            continue
+        if sentence[index].isspace() or sentence[index] in ",;|":
+            index += 1
+            continue
+        break
+    return index
+
+
 def _dependency_head_is_historical(
-    sentence: str, reference: re.Match[str], head: re.Match[str], reference_clause_start: int
+    sentence: str,
+    depths: list[int],
+    reference: re.Match[str],
+    head: re.Match[str],
+    reference_clause_start: int,
 ) -> bool:
-    """Check history in the reference clause and the head's own clause before its hex."""
-    boundary = next(CLAUSE_BREAK.finditer(sentence, reference.end(), head.start(1)), None)
-    reference_clause_end = boundary.start() if boundary is not None else head.start(1)
-    head_clause_start = _dependency_clause_start(
-        sentence, reference.end(), head.start(), reference_clause_start
+    """Check history in the reference lead and the head's depth-local clause before its hex."""
+    head_index = head.start(1)
+    reference_lead = sentence[reference_clause_start : reference.start()]
+    if HISTORY_WORDS.search(reference_lead) or re.search(
+        r"\bpreviously\b", reference_lead, re.IGNORECASE
+    ):
+        return True
+    head_depth = depths[min(head_index, len(sentence))]
+    scope_start = _dependency_head_scope_start(sentence, depths, reference.end(), head_index)
+    clause_start = _dependency_head_clause_start(
+        sentence, depths, scope_start, head_index, head_depth
     )
-    clauses = (
-        sentence[reference_clause_start:reference_clause_end],
-        sentence[head_clause_start : head.start(1)],
-    )
-    return any(
-        HISTORY_WORDS.search(clause) or re.search(r"\bpreviously\b", clause, re.IGNORECASE)
-        for clause in clauses
-    )
+    clause = sentence[clause_start:head_index]
+    return bool(HISTORY_WORDS.search(clause) or re.search(r"\bpreviously\b", clause, re.IGNORECASE))
 
 
-def _dependency_member_end(sentence: str, start: int, end: int) -> int:
-    """Consume colon, dash, parenthesis or bracket heads without crossing member separators."""
+def _dependency_member_end(sentence: str, depths: list[int], start: int, end: int) -> int:
+    """Consume annotation heads without crossing depth-zero member separators."""
     cursor = start
     for _ in range(end - start + 1):
+        separator = DEPENDENCY_SEPARATOR.match(sentence, cursor, end)
+        if separator is not None and _dependency_prose_break(sentence, depths, separator.start()):
+            break
         annotation = DEPENDENCY_ANNOTATION.match(sentence, cursor, end)
         if annotation is None:
             break
@@ -154,14 +235,17 @@ def _dependency_attribution_error(sentence: str, first: re.Match[str], end: int)
 
 
 def _dependency_list_lead_historical(
-    sentence: str, first: re.Match[str], end: int | None = None
+    sentence: str,
+    depths: list[int],
+    first: re.Match[str],
+    lead_start: int,
+    end: int | None = None,
 ) -> bool:
     """Return whether list history appears before the first member annotation."""
     window = len(sentence) if end is None else end
-    lead_start = _dependency_clause_start(sentence, 0, first.start())
     gap_end = first.end()
     if DEPENDENCY_SEPARATOR.match(sentence, gap_end, window) is None:
-        member_end = _dependency_member_end(sentence, first.end(), window)
+        member_end = _dependency_member_end(sentence, depths, first.end(), window)
         for index in range(first.end(), min(member_end, window)):
             if sentence[index] in "([":
                 gap_end = index
@@ -172,16 +256,33 @@ def _dependency_list_lead_historical(
     return bool(HISTORY_WORDS.search(lead) or re.search(r"\bpreviously\b", lead, re.IGNORECASE))
 
 
-def _dependency_hidden_scan_end(sentence: str, list_parse_end: int, end: int) -> int:
-    """Extend hidden-member scans through unparsed separator-led continuations."""
+def _dependency_lead_annotation_end(
+    sentence: str, depths: list[int], member_start: int, end: int
+) -> int:
+    """Return the end of any bracketed annotation opened before the first depth-zero prose gap."""
+    cursor = member_start
+    for index in range(member_start, end):
+        if _dependency_prose_break(sentence, depths, index):
+            return cursor
+        if sentence[index] in "([":
+            cursor = _dependency_bracket_extent(sentence, index, end)
+    return cursor
+
+
+def _dependency_hidden_scan_end(
+    sentence: str, depths: list[int], list_parse_end: int, end: int
+) -> int:
+    """Extend hidden-member scans through unparsed depth-zero separator-led continuations."""
     cursor = list_parse_end
     for _ in range(end - list_parse_end + 1):
         extended = False
         for separator in DEPENDENCY_SEPARATOR.finditer(sentence, cursor, end):
+            if not _dependency_prose_break(sentence, depths, separator.start()):
+                continue
             member = DEPENDENCY_MEMBER.match(sentence, separator.end(), end)
             if member is None:
                 break
-            next_end = _dependency_member_end(sentence, member.end(), end)
+            next_end = _dependency_member_end(sentence, depths, member.end(), end)
             cursor = max(member.end(), next_end)
             extended = True
             break
@@ -191,13 +292,25 @@ def _dependency_hidden_scan_end(sentence: str, list_parse_end: int, end: int) ->
 
 
 def _reject_hidden_dependency_members(
-    sentence: str, first: re.Match[str], end: int, parsed_starts: set[int]
+    sentence: str,
+    depths: list[int],
+    first: re.Match[str],
+    end: int,
+    parsed_starts: set[int],
 ) -> None:
-    """Reject separator-led members anywhere in the window unless already parsed."""
+    """Reject unparsed members at prose boundaries or inside lead annotations."""
     for separator in DEPENDENCY_SEPARATOR.finditer(sentence, first.end(), end):
+        if not _dependency_prose_break(sentence, depths, separator.start()):
+            continue
         member = DEPENDENCY_MEMBER.match(sentence, separator.end(), end)
         if member is not None and member.start() not in parsed_starts:
             raise _dependency_attribution_error(sentence, first, end)
+    for member in DEPENDENCY_MEMBER.finditer(sentence, first.end(), end):
+        if member.start() in parsed_starts or member.start() <= first.start():
+            continue
+        if depths[member.start()] == 0:
+            continue
+        raise _dependency_attribution_error(sentence, first, end)
 
 
 def _dependency_member_heads(
@@ -210,48 +323,67 @@ def _dependency_member_heads(
 
 
 def _reject_unpaired_dependency_heads(
-    sentence: str, members: list[tuple[re.Match[str], int]], end: int
+    sentence: str,
+    depths: list[int],
+    members: list[tuple[re.Match[str], int]],
+    list_bounds: tuple[int, int],
 ) -> None:
     """Reject current member-owned heads outside the shared annotation grammar."""
-    heads = [_dependency_member_heads(sentence, reference, end) for reference, _ in members]
-    current = _current_dependency_heads(sentence, members, heads)
+    list_end, lead_start = list_bounds
+    heads = [_dependency_member_heads(sentence, reference, list_end) for reference, _ in members]
+    current = _current_dependency_heads(sentence, depths, members, heads, list_bounds)
     for (_, member_end), member_heads in zip(members, current, strict=True):
         for head in member_heads:
             if head.end() > member_end:
                 raise ValueError(
-                    f"{_dependency_attribution_error(sentence, members[0][0], end)}: "
+                    f"{_dependency_attribution_error(sentence, members[0][0], list_end)}: "
                     f"{head.group(1).lower()}"
                 )
 
 
-def _dependency_lists(sentence: str) -> Iterator[list[tuple[re.Match[str], int]]]:
+def _dependency_lists(
+    sentence: str, depths: list[int] | None = None
+) -> Iterator[tuple[list[tuple[re.Match[str], int]], int, int]]:
     """Yield grammar spans, rejecting hidden window members and unpaired member-owned heads."""
+    if depths is None:
+        depths = _dependency_bracket_depths(sentence)
     references = list(DEPENDENCY_REFERENCE.finditer(sentence))
     for index, first in enumerate(references):
-        end = references[index + 1].start() if index + 1 < len(references) else len(sentence)
+        list_end = references[index + 1].start() if index + 1 < len(references) else len(sentence)
+        lead_start = (
+            first.start()
+            if index > 0
+            else _dependency_clause_start(sentence, depths, 0, first.start())
+        )
         reference = first
         members = []
-        for _ in range(end - reference.end() + 1):
-            member_end = _dependency_member_end(sentence, reference.end(), end)
+        for _ in range(list_end - reference.end() + 1):
+            member_end = _dependency_member_end(sentence, depths, reference.end(), list_end)
             members.append((reference, member_end))
-            separator = DEPENDENCY_SEPARATOR.match(sentence, member_end, end)
+            separator = DEPENDENCY_SEPARATOR.match(sentence, member_end, list_end)
             following = (
-                DEPENDENCY_MEMBER.match(sentence, separator.end(), end) if separator else None
+                DEPENDENCY_MEMBER.match(sentence, separator.end(), list_end) if separator else None
             )
             if following is None:
                 break
             reference = following
         parsed_starts = {reference.start() for reference, _ in members[1:]}
         list_parse_end = members[-1][1]
-        lead_historical = _dependency_list_lead_historical(sentence, first, end)
+        lead_historical = _dependency_list_lead_historical(
+            sentence, depths, first, lead_start, list_end
+        )
         if not lead_historical:
-            scan_end = _dependency_hidden_scan_end(sentence, list_parse_end, end)
-            _reject_hidden_dependency_members(sentence, first, scan_end, parsed_starts)
+            prose_end = _dependency_hidden_scan_end(sentence, depths, list_parse_end, list_end)
+            annotation_end = _dependency_lead_annotation_end(
+                sentence, depths, first.end(), list_end
+            )
+            scan_end = max(prose_end, annotation_end)
+            _reject_hidden_dependency_members(sentence, depths, first, scan_end, parsed_starts)
         if len(members) == 1:
-            members[0] = (members[0][0], end)
+            members[0] = (members[0][0], list_end)
         if not lead_historical:
-            _reject_unpaired_dependency_heads(sentence, members, end)
-        yield members
+            _reject_unpaired_dependency_heads(sentence, depths, members, (list_end, lead_start))
+        yield members, list_end, lead_start
 
 
 def _reject_ambiguous_dependency_list(
@@ -268,20 +400,27 @@ def _reject_ambiguous_dependency_list(
 
 
 def _dependency_list_history(
-    sentence: str, first: re.Match[str], heads: list[re.Match[str]]
+    sentence: str,
+    depths: list[int],
+    first: re.Match[str],
+    list_bounds: tuple[int, int],
 ) -> tuple[int, bool]:
     """Locate the lead clause and judge history shared by every list member."""
-    lead_start = _dependency_clause_start(sentence, 0, first.start())
-    historical = _dependency_list_lead_historical(sentence, first, len(sentence))
+    list_end, lead_start = list_bounds
+    historical = _dependency_list_lead_historical(sentence, depths, first, lead_start, list_end)
     return lead_start, historical
 
 
 def _current_dependency_heads(
-    sentence: str, members: list[tuple[re.Match[str], int]], heads: list[list[re.Match[str]]]
+    sentence: str,
+    depths: list[int],
+    members: list[tuple[re.Match[str], int]],
+    heads: list[list[re.Match[str]]],
+    list_bounds: tuple[int, int],
 ) -> list[list[re.Match[str]]]:
     """Filter member heads through unchanged clause history before ambiguity judgement."""
     first = members[0][0]
-    lead_start, historical = _dependency_list_history(sentence, first, heads[0])
+    lead_start, historical = _dependency_list_history(sentence, depths, first, list_bounds)
     current = []
     for (reference, _), member_heads in zip(members, heads, strict=True):
         clause_start = lead_start if reference is first else reference.start()
@@ -290,20 +429,26 @@ def _current_dependency_heads(
                 head
                 for head in member_heads
                 if not historical
-                and not _dependency_head_is_historical(sentence, reference, head, clause_start)
+                and not _dependency_head_is_historical(
+                    sentence, depths, reference, head, clause_start
+                )
             ]
         )
     return current
 
 
 def _dependency_list_claims(
-    sentence: str, members: list[tuple[re.Match[str], int]]
+    sentence: str,
+    depths: list[int],
+    members: list[tuple[re.Match[str], int]],
+    list_bounds: tuple[int, int],
 ) -> list[tuple[int, str | None]]:
     """Pair nearest-reference member heads, judging history before ambiguity."""
-    if _dependency_list_lead_historical(sentence, members[0][0]):
+    list_end, lead_start = list_bounds
+    if _dependency_list_lead_historical(sentence, depths, members[0][0], lead_start, list_end):
         return []
-    heads = [_dependency_member_heads(sentence, reference, end) for reference, end in members]
-    current = _current_dependency_heads(sentence, members, heads)
+    heads = [_dependency_member_heads(sentence, reference, list_end) for reference, _ in members]
+    current = _current_dependency_heads(sentence, depths, members, heads, list_bounds)
     if any(heads) and not any(current):
         return []
     _reject_ambiguous_dependency_list(members, heads)
@@ -320,10 +465,11 @@ def _dependency_list_claims(
 
 def _sentence_dependencies(sentence: str) -> list[tuple[int, str | None]]:
     """Extract list members and their own heads, raising ValueError for ambiguous lists."""
+    depths = _dependency_bracket_depths(sentence)
     return [
         claim
-        for members in _dependency_lists(sentence)
-        for claim in _dependency_list_claims(sentence, members)
+        for members, list_end, lead_start in _dependency_lists(sentence, depths)
+        for claim in _dependency_list_claims(sentence, depths, members, (list_end, lead_start))
     ]
 
 

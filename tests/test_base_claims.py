@@ -853,6 +853,66 @@ class BaseClaimsTest(unittest.TestCase):
         self.assertEqual(base_claims.find_dependency_claims(text), [(13, "bbbbbbb")])
         self.assertEqual(base_claims._dependency_numbers([("body", text)]), [13])
 
+    def test_dependency_bracket_history_drops_previous_keeps_now_head(self) -> None:
+        """Bracket history stops at an inner comma and the later head stays current."""
+        text = "Depends on #12 [previous head aaaaaaa, now head bbbbbbb]."
+        self.assertEqual(base_claims.find_dependency_claims(text), [(12, "bbbbbbb")])
+
+    def test_dependency_bracketed_historical_lead_yields_no_claims(self) -> None:
+        """A bracketed historical lead still yields no dependency claims."""
+        text = "Previously stacked on #12 [head aaaaaaa]."
+        self.assertEqual(base_claims.find_dependency_claims(text), [])
+
+    def test_dependency_split_lead_claims_only_the_current_depends_on(self) -> None:
+        """A later depends-on lead keeps its head without inheriting Earlier lead history."""
+        text = "Previously stacked on #12 and now depends on #13 (head bbbbbbb)."
+        self.assertEqual(base_claims.find_dependency_claims(text), [(13, "bbbbbbb")])
+
+    def test_dependency_split_historical_and_without_heads_is_quiet(self) -> None:
+        """Previously stacked on two members without heads still emits nothing."""
+        text = "Previously stacked on #12 and #13."
+        self.assertEqual(base_claims.find_dependency_claims(text), [])
+
+    def test_dependency_and_lists_both_numbers_without_heads(self) -> None:
+        """Depends on #12 and #13 still records both members with no head claims."""
+        text = "Depends on #12 and #13."
+        self.assertEqual(base_claims.find_dependency_claims(text), [])
+        self.assertEqual(base_claims._dependency_numbers([("body", text)]), [12, 13])
+
+    def test_dependency_hidden_member_inside_annotation_raises(self) -> None:
+        """A member number inside another member's annotation fails closed."""
+        text = "Depends on #12 (head aaaaaaa, rebased, and #13 head bbbbbbb)."
+        with self.assertRaisesRegex(ValueError, r"#13"):
+            base_claims.find_dependency_claims(text)
+
+    def test_dependency_see_prose_outside_annotation_lists_both_heads(self) -> None:
+        """Closed annotations and see-prose tails keep two explicit member heads."""
+        text = (
+            "Depends on #12 (head aaaaaaa) and #13 (head bbbbbbb), see #14 and #15 for benchmarks."
+        )
+        self.assertEqual(
+            base_claims.find_dependency_claims(text), [(12, "aaaaaaa"), (13, "bbbbbbb")]
+        )
+
+    def test_dependency_bracket_depths_nested_brackets(self) -> None:
+        """Bracket depth increases inside nested openers and returns after closes."""
+        depths = base_claims._dependency_bracket_depths("a[(b)c]")
+        self.assertEqual(depths[3], 2)
+        self.assertEqual(depths[len("a[(b)c]")], 0)
+
+    def test_dependency_bracket_depths_unclosed_bracket(self) -> None:
+        """An unclosed opener keeps depth past an inner comma through sentence end."""
+        text = "open (still, more"
+        depths = base_claims._dependency_bracket_depths(text)
+        comma = text.index(",")
+        self.assertEqual(depths[comma + 1], 1)
+        self.assertGreater(depths[len(text)], 0)
+
+    def test_dependency_bracket_depths_stray_close(self) -> None:
+        """A stray closer does not drive depth below zero."""
+        depths = base_claims._dependency_bracket_depths("x)y")
+        self.assertEqual(depths[2], 0)
+
     def test_dependency_list_current_depends_on_two_members_unchanged(self) -> None:
         """Depends on #12 and #13 still lists both numbers without a historical lead."""
         text = "Depends on #12 and #13."

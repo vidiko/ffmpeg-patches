@@ -12,6 +12,7 @@ import os
 import re
 import signal
 import subprocess  # nosec B404 - Fixed argv is used for the zombie regression test.
+import sys
 import tempfile
 import time
 import unittest
@@ -485,6 +486,22 @@ FIX6_AWK_SCANNER_CASES: tuple[tuple[str, bool], ...] = (
     (r'printf("%s\n", $0)', True),
     (r'{ sub(/^\+/, "") } 1', True),
     ("NR > 1 \\\n&& NF == 0", True),
+)
+
+CLI_THREAD_CASES: tuple[tuple[str, bool], ...] = (
+    ("gawk -- 'length > 72' scripts/a.py", True),
+    ("awk -- '{print $1}' scripts/a.py", False),
+    ("awk -- 'length > 72' .lane/tmp/a.txt", False),
+    ("wc -L -m scripts/a.py .lane/tmp/a.txt", True),
+    ("wc -L -m .lane/tmp/a.txt", False),
+    ("git diff -- scripts/a.py | < scripts/a.py wc -L", True),
+    ("git diff | < scripts/a.py awk 'length > 72'", True),
+    ("< .lane/tmp/a.txt wc -L", False),
+    ("grep -E -e '.{80}' scripts/lane_brief.py .lane/tmp/draft.txt", True),
+    ("grep -E -e '.{80}' .lane/tmp/draft.txt", False),
+    ("git diff -- scripts/a.py | grep '^' scripts/a.py | awk 'length > 72'", True),
+    ("git diff -- scripts/a.py | cat scripts/a.py | awk 'length > 72'", True),
+    ("git diff -- scripts/a.py | grep '^+' | awk 'length > 72'", False),
 )
 
 
@@ -1764,6 +1781,18 @@ class LaneBriefTest(unittest.TestCase):
             with self.subTest(program=program):
                 self.assertEqual(not lane_brief.awk_program_reads_files(program), want)
 
+    def test_cli_thread_cases_table(self) -> None:
+        """Check whole-file length refusal and exemption cases through the check command."""
+        for row, (span, refused) in enumerate(CLI_THREAD_CASES, start=1):
+            with self.subTest(row=row, span=span):
+                rc, error = self.check_snippet(f"- `{span}`\n")
+                if refused:
+                    self.assertEqual(rc, 1, error)
+                    self.assertIn(span, error)
+                else:
+                    self.assertEqual(rc, 0, error)
+                    self.assertNotIn("conflict:", error)
+
     def test_conflict_alternate_forms_refused(self) -> None:
         """Refuse alternate column-limit, one-line join, and ERE grep length forms."""
         for snippet in (
@@ -1945,6 +1974,8 @@ class LaneBriefTest(unittest.TestCase):
         self.assertIsNotNone(spec)
         self.assertIsNotNone(spec.loader)
         mutant = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = mutant
+        self.addCleanup(sys.modules.pop, spec.name, None)
         spec.loader.exec_module(mutant)
         content = self.rendered().replace("tests.test_import_style", "tests.test_import_styles")
         required = lane_brief.read_required(CONFIG)

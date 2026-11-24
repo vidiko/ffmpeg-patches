@@ -2581,20 +2581,22 @@ def _c_rules_depths(
     if directive_words is None:
         return [-1] * len(lines)
     depths: list[int] = []
-    stack: list[tuple[int, set[int]]] = []
+    stack: list[tuple[int, set[int], bool]] = []
     depth = 0
     valid = True
     for index in range(len(lines)):
         clean = code[index]
         word = directive_words[index]
         if word in {b"if", b"ifdef", b"ifndef"} and len(stack) < len(lines):
-            stack.append((depth, set()))
+            stack.append((depth, set(), False))
         elif word in {b"elif", b"else"} and stack:
-            stack[-1][1].add(depth)
-            depth = stack[-1][0]
+            entry, ends, has_else = stack[-1]
+            ends.add(depth)
+            stack[-1] = (entry, ends, has_else or word == b"else")
+            depth = entry
         elif word == b"endif" and stack:
-            _, ends = stack.pop()
-            valid = valid and ends <= {depth}
+            entry, ends, has_else = stack.pop()
+            valid = valid and ends <= {depth} and (has_else or entry == depth)
         elif word in {b"if", b"ifdef", b"ifndef", b"elif", b"else", b"endif"}:
             return [-1] * len(lines)
         depths.append(depth if valid else -1)

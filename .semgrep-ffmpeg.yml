@@ -31,18 +31,23 @@ rules:
           return ...;
 
   # Derive pointers after checking allocation results (review of upstream FFmpeg pull request 25480, November 2026):
-  # in one function, an allocated pointer feeds a NULL-fallback ternary followed by a
-  # NULL check of the pointer or destination. Earlier checks never exclude a match.
-  # Unchecked allocation: add a failure check and return the error before deriving pointers.
-  # Checked earlier: the ternary null test is redundant; remove it, or retain it with
-  # an adjacent rule-specific suppression comment and a semgrep-reason explaining why.
+  # in one function, an allocator call assigns a variable, a NULL-fallback ternary
+  # tests a variable of the same name, and a later NULL check tests that name or the
+  # ternary destination. Earlier checks never exclude a match, and a reassignment
+  # between the allocation and the ternary is not seen, so the tested variable may
+  # hold another value. The ternary null test is redundant only when an earlier
+  # failure check of the allocation returns or exits; an earlier check that only
+  # logs, or no check, leaves the fallback live, and the fix is a failure check that
+  # returns the error before deriving pointers. Remove a redundant ternary null test,
+  # or retain it with an adjacent rule-specific suppression comment
+  # and a semgrep-reason explaining why.
   # No control flow, data flow, macro expansion, alias tracking, or struct-member tracking.
   # Original eight scope pins (syntactic matches, not proof of safety or reachability):
   # - use-before-check: reported by plain shape
   # - log-only-later-check: reported by plain shape
   # - stale-later-check: reported by plain shape
   # - second-ternary: reported by plain shape
-  # - conditional-early-check: now reported, redundant reading
+  # - conditional-early-check: now reported, without control flow
   # - earlier-allocation-check: now reported, without data flow
   # - goto-into-ternary: now reported, without control flow
   # - unbraced-inner-loop-break: now reported, without control flow
@@ -55,12 +60,19 @@ rules:
     languages: [c]
     severity: ERROR
     message: >-
-      An allocated buffer feeds a NULL-fallback ternary before a later NULL check.
-      If the allocation has no failure check, add one and return the error before
-      deriving the pointer. If the buffer was checked earlier, the ternary null
-      test is redundant: remove it, or keep it with a rule-specific suppression
-      comment and a semgrep-reason stating why. This syntactic rule does not see
-      control flow, data flow, macro expansion, aliases, or struct members.
+      An allocator call assigns a variable earlier in the function, a
+      NULL-fallback ternary tests a variable of the same name, and a later NULL
+      check tests that name or the ternary destination.
+      A reassignment between the allocation and the ternary is not seen, so the
+      tested variable may hold another value.
+      The ternary null test is redundant only when an earlier failure check of
+      the allocation returns or exits; an earlier check that only logs, or no
+      check, leaves the fallback live, and the fix is a failure check that
+      returns the error before the pointer is derived.
+      Remove a redundant ternary null test, or keep it with a rule-specific
+      suppression comment and a semgrep-reason stating why.
+      This syntactic rule does not see control flow, data flow, macro
+      expansion, aliases, or struct members.
     patterns:
       - pattern-either:
           - pattern-inside: |

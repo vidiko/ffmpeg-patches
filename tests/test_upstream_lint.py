@@ -4683,6 +4683,68 @@ class CRulesBlankingTest(_CRulesBlankingMixin, unittest.TestCase):
         )
         self.assertEqual(upstream_lint._c_rules_blank(header_source, set()), header_source)
 
+    def test_conditional_without_else_keeps_inner_macro_call(self) -> None:
+        """Conditionals without else keep inner macro calls and blank file-scope controls."""
+        source = (
+            b"#define CALL(x) int value##x;\n"
+            b"void f(void) {\n"
+            b"#if A\n"
+            b"}\n"
+            b"#endif\n"
+            b"CALL(1)\n"
+            b"#if !A\n"
+            b"}\n"
+            b"#endif\n"
+        )
+        self.assertEqual(upstream_lint._c_rules_blank(source, set()), source)
+        define = b"#define CALL(x) int value##x;\n"
+        elif_case = (
+            define
+            + b"void f(void) {\n#if A\n}\n#elif B\n}\n#endif\n"
+            + b"CALL(1)\n#if !A && !B\n}\n#endif\n"
+        )
+        kept = (
+            define + b"void f(void) {\n#if A\n}\n#endif\nCALL(1)\n#if A\n#else\n}\n#endif\n",
+            define + b"void f(void) {\n#ifdef A\n}\n#endif\nCALL(1)\n#ifndef A\n}\n#endif\n",
+            elif_case,
+            define + b"void f(void) {\n#if A\n}\n#endif\nCALL(1)\n",
+        )
+        for index in range(len(kept)):
+            self.assertEqual(upstream_lint._c_rules_blank(kept[index], set()), kept[index])
+        control = define + b"void f(void) {\n}\nCALL(1)\n"
+        expected = control[: -len(b"CALL(1)\n")] + b" " * len(b"CALL(1)") + b"\n"
+        self.assertEqual(upstream_lint._c_rules_blank(control, set()), expected)
+
+    def test_depths_count_entry_arm_without_else(self) -> None:
+        """Conditionals without else include the entry depth in arm-end comparisons."""
+        define = b"#define CALL(x) int value##x;\n"
+        bot_example = define + b"void f(void) {\n#if A\n}\n#endif\nCALL(1)\n#if !A\n}\n#endif\n"
+        elif_no_else = define + b"void f(void) {\n#if A\n}\n#elif B\n}\n#endif\nCALL(1)\n"
+        for index in range(2):
+            source = bot_example if index == 0 else elif_no_else
+            code, directives, directive_lines = upstream_lint._c_lex_lines(
+                source.decode("latin-1"), positions=True
+            )
+            lines = source.split(b"\n")
+            mapped = upstream_lint._c_rules_directive_words(
+                lines, code, directives, directive_lines
+            )
+            depths = upstream_lint._c_rules_depths(lines, code, mapped)
+            first_endif = lines.index(b"#endif")
+            self.assertTrue(all(depth >= 0 for depth in depths[:first_endif]))
+            self.assertEqual(depths[first_endif:], [-1] * (len(lines) - first_endif))
+        control = define + b"#if A\nint x;\n#endif\nCALL(1)\n"
+        ctrl_code, ctrl_dirs, ctrl_dir_lines = upstream_lint._c_lex_lines(
+            control.decode("latin-1"), positions=True
+        )
+        ctrl_lines = control.split(b"\n")
+        ctrl_mapped = upstream_lint._c_rules_directive_words(
+            ctrl_lines, ctrl_code, ctrl_dirs, ctrl_dir_lines
+        )
+        ctrl_depths = upstream_lint._c_rules_depths(ctrl_lines, ctrl_code, ctrl_mapped)
+        self.assertEqual(len(ctrl_depths), len(ctrl_lines))
+        self.assertTrue(all(depth >= 0 for depth in ctrl_depths))
+
     def test_conditional_directive_mismatch_disables_blanking(self) -> None:
         """Duplicate else and elif-after-else directives disable subsequent macro blanking."""
         duplicate_else = (

@@ -1072,6 +1072,33 @@ class FfmpegRuleIdTest(unittest.TestCase):
         self.assertTrue(ids, "no id key read from .semgrep-ffmpeg.yml")
         self.assertEqual([rule_id for rule_id in ids if "." in rule_id], [])
 
+    def test_ternary_message_describes_syntactic_match(self) -> None:
+        """The ternary rule message describes name matching and conditional redundancy."""
+        text = upstream_lint.SEMGREP_FFMPEG_RULES.read_text(encoding="utf-8")
+        rule_section = text.split("  - id: ffmpeg-null-ternary-after-allocation\n", 1)[1]
+        raw_message = rule_section.split("    message: >-\n", 1)[1].split("    patterns:\n", 1)[0]
+        raw_lines = raw_message.splitlines()
+        message = " ".join(raw_lines[index].strip() for index in range(len(raw_lines)))
+        self.assertNotIn("feeds", message)
+        self.assertIn(
+            "An allocator call assigns a variable earlier in the function, a "
+            "NULL-fallback ternary tests a variable of the same name, and a later "
+            "NULL check tests that name or the ternary destination.",
+            message,
+        )
+        self.assertIn(
+            "A reassignment between the allocation and the ternary is not seen, "
+            "so the tested variable may hold another value.",
+            message,
+        )
+        self.assertIn(
+            "The ternary null test is redundant only when an earlier failure check "
+            "of the allocation returns or exits; an earlier check that only logs, "
+            "or no check, leaves the fallback live, and the fix is a failure check "
+            "that returns the error before the pointer is derived.",
+            message,
+        )
+
 
 @unittest.skipUnless(shutil.which("semgrep"), "semgrep not installed; make semgrep needs it")
 class FfmpegSemgrepRulesTest(unittest.TestCase):

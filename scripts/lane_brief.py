@@ -26,6 +26,7 @@ import stat
 import subprocess  # nosec B404 - runner precheck with explicit argv, no shell, bounded timeout.
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -476,24 +477,752 @@ def span_token_command_groups(tokens: list[str]) -> list[list[list[str]]]:
     return [split_token_groups(group, PIPE_SEPARATORS) for group in command_groups]
 
 
+@dataclass(frozen=True)
+class ToolSpec:
+    """Describe option arity, program words, and unnamed-file flags for one tool."""
+
+    short_no_arg: frozenset[str] = frozenset()
+    short_arg: frozenset[str] = frozenset()
+    short_opt_arg: frozenset[str] = frozenset()
+    long_no_arg: frozenset[str] = frozenset()
+    long_arg: frozenset[str] = frozenset()
+    long_opt_arg: frozenset[str] = frozenset()
+    program_opts: frozenset[str] = frozenset()
+    file_program_opts: frozenset[str] = frozenset()
+    program_words: int = 0
+    unnamed_file_opts: frozenset[str] = frozenset()
+    unnamed_file_opt_values: tuple[tuple[str, str], ...] = ()
+    ignore_operands: bool = False
+
+
+@dataclass(frozen=True)
+class StageParse:
+    """Hold parsed options, programs, operands, and redirects for one pipeline stage."""
+
+    tool: str
+    seen_opts: frozenset[str]
+    programs: tuple[str, ...]
+    uses_file: bool
+    operands: tuple[str, ...]
+    input_redirects: tuple[str, ...]
+    refused: bool
+
+
+@dataclass
+class _StageState:
+    """Accumulate mutable option, operand, and redirect state while scanning one stage."""
+
+    seen_opts: set[str]
+    opt_programs: list[str]
+    uses_file: bool
+    positionals: list[str]
+    input_redirects: list[str]
+    refused: bool
+
+
+WC_SPEC = ToolSpec(
+    short_no_arg=frozenset("cmlLw"),
+    long_no_arg=frozenset(
+        {
+            "--bytes",
+            "--chars",
+            "--lines",
+            "--debug",
+            "--max-line-length",
+            "--words",
+            "--help",
+            "--version",
+        }
+    ),
+    long_arg=frozenset({"--files0-from", "--total"}),
+    unnamed_file_opts=frozenset({"--files0-from"}),
+)
+
+GREP_SPEC = ToolSpec(
+    short_no_arg=frozenset("EFGPiwxzsvVbnHhoqaIrRLlcTZU0123456789"),
+    short_arg=frozenset("efmdDBAC"),
+    long_no_arg=frozenset(
+        {
+            "--extended-regexp",
+            "--fixed-strings",
+            "--basic-regexp",
+            "--perl-regexp",
+            "--ignore-case",
+            "--no-ignore-case",
+            "--word-regexp",
+            "--line-regexp",
+            "--null-data",
+            "--no-messages",
+            "--invert-match",
+            "--version",
+            "--help",
+            "--byte-offset",
+            "--line-number",
+            "--line-buffered",
+            "--with-filename",
+            "--no-filename",
+            "--only-matching",
+            "--quiet",
+            "--silent",
+            "--text",
+            "--recursive",
+            "--dereference-recursive",
+            "--files-without-match",
+            "--files-with-matches",
+            "--count",
+            "--initial-tab",
+            "--null",
+            "--no-group-separator",
+            "--binary",
+        }
+    ),
+    long_arg=frozenset(
+        {
+            "--regexp",
+            "--file",
+            "--max-count",
+            "--label",
+            "--binary-files",
+            "--directories",
+            "--devices",
+            "--include",
+            "--exclude",
+            "--exclude-from",
+            "--exclude-dir",
+            "--before-context",
+            "--after-context",
+            "--context",
+            "--group-separator",
+        }
+    ),
+    long_opt_arg=frozenset({"--color", "--colour"}),
+    program_opts=frozenset({"-e", "--regexp"}),
+    file_program_opts=frozenset({"-f", "--file"}),
+    program_words=1,
+    unnamed_file_opts=frozenset({"-r", "-R", "--recursive", "--dereference-recursive"}),
+    unnamed_file_opt_values=(("-d", "recurse"), ("--directories", "recurse")),
+)
+
+RG_SPEC = ToolSpec(
+    short_no_arg=frozenset("zsFivxUPSawL.ubhnN0opqHIclV"),
+    short_arg=frozenset("efEmjgdtTABCMr"),
+    long_no_arg=frozenset(
+        {
+            "--auto-hybrid-regex",
+            "--binary",
+            "--block-buffered",
+            "--byte-offset",
+            "--case-sensitive",
+            "--column",
+            "--count",
+            "--count-matches",
+            "--crlf",
+            "--debug",
+            "--files",
+            "--files-with-matches",
+            "--files-without-match",
+            "--fixed-strings",
+            "--follow",
+            "--glob-case-insensitive",
+            "--heading",
+            "--help",
+            "--hidden",
+            "--ignore",
+            "--ignore-case",
+            "--ignore-dot",
+            "--ignore-exclude",
+            "--ignore-file-case-insensitive",
+            "--ignore-files",
+            "--ignore-global",
+            "--ignore-messages",
+            "--ignore-parent",
+            "--ignore-vcs",
+            "--include-zero",
+            "--invert-match",
+            "--json",
+            "--line-buffered",
+            "--line-number",
+            "--line-regexp",
+            "--max-columns-preview",
+            "--messages",
+            "--mmap",
+            "--multiline",
+            "--multiline-dotall",
+            "--no-auto-hybrid-regex",
+            "--no-binary",
+            "--no-block-buffered",
+            "--no-byte-offset",
+            "--no-column",
+            "--no-config",
+            "--no-context-separator",
+            "--no-crlf",
+            "--no-encoding",
+            "--no-filename",
+            "--no-fixed-strings",
+            "--no-follow",
+            "--no-glob-case-insensitive",
+            "--no-heading",
+            "--no-hidden",
+            "--no-ignore",
+            "--no-ignore-dot",
+            "--no-ignore-exclude",
+            "--no-ignore-file-case-insensitive",
+            "--no-ignore-files",
+            "--no-ignore-global",
+            "--no-ignore-messages",
+            "--no-ignore-parent",
+            "--no-ignore-vcs",
+            "--no-include-zero",
+            "--no-invert-match",
+            "--no-json",
+            "--no-line-buffered",
+            "--no-line-number",
+            "--no-max-columns-preview",
+            "--no-messages",
+            "--no-mmap",
+            "--no-multiline",
+            "--no-multiline-dotall",
+            "--no-one-file-system",
+            "--no-pcre2",
+            "--no-pcre2-unicode",
+            "--no-pre",
+            "--no-require-git",
+            "--no-search-zip",
+            "--no-sort-files",
+            "--no-stats",
+            "--no-text",
+            "--no-trim",
+            "--no-unicode",
+            "--null",
+            "--null-data",
+            "--one-file-system",
+            "--only-matching",
+            "--passthrough",
+            "--passthru",
+            "--pcre2",
+            "--pcre2-unicode",
+            "--pcre2-version",
+            "--pretty",
+            "--quiet",
+            "--require-git",
+            "--search-zip",
+            "--smart-case",
+            "--sort-files",
+            "--stats",
+            "--stop-on-nonmatch",
+            "--text",
+            "--trace",
+            "--trim",
+            "--type-list",
+            "--unicode",
+            "--unrestricted",
+            "--version",
+            "--vimgrep",
+            "--with-filename",
+            "--word-regexp",
+        }
+    ),
+    long_arg=frozenset(
+        {
+            "--after-context",
+            "--before-context",
+            "--color",
+            "--colors",
+            "--context",
+            "--context-separator",
+            "--dfa-size-limit",
+            "--encoding",
+            "--engine",
+            "--field-context-separator",
+            "--field-match-separator",
+            "--file",
+            "--generate",
+            "--glob",
+            "--hostname-bin",
+            "--hyperlink-format",
+            "--iglob",
+            "--ignore-file",
+            "--max-columns",
+            "--max-count",
+            "--max-depth",
+            "--maxdepth",
+            "--max-filesize",
+            "--path-separator",
+            "--pre",
+            "--pre-glob",
+            "--regex-size-limit",
+            "--regexp",
+            "--replace",
+            "--sort",
+            "--sortr",
+            "--threads",
+            "--type",
+            "--type-add",
+            "--type-clear",
+            "--type-not",
+        }
+    ),
+    program_opts=frozenset({"-e", "--regexp"}),
+    file_program_opts=frozenset({"-f", "--file"}),
+    program_words=1,
+    unnamed_file_opts=frozenset({"--files"}),
+)
+
+AWK_SPEC = ToolSpec(
+    short_no_arg=frozenset("bcCghIkMNnOPrsStV"),
+    short_arg=frozenset("fFveEil"),
+    short_opt_arg=frozenset("dDLop"),
+    long_no_arg=frozenset(
+        {
+            "--characters-as-bytes",
+            "--traditional",
+            "--copyright",
+            "--gen-pot",
+            "--help",
+            "--trace",
+            "--csv",
+            "--bignum",
+            "--use-lc-numeric",
+            "--non-decimal-data",
+            "--optimize",
+            "--posix",
+            "--re-interval",
+            "--no-optimize",
+            "--sandbox",
+            "--lint-old",
+            "--version",
+        }
+    ),
+    long_arg=frozenset(
+        {
+            "--file",
+            "--field-separator",
+            "--assign",
+            "--source",
+            "--exec",
+            "--include",
+            "--load",
+        }
+    ),
+    long_opt_arg=frozenset(
+        {"--dump-variables", "--debug", "--lint", "--pretty-print", "--profile"}
+    ),
+    program_opts=frozenset({"-e", "--source"}),
+    file_program_opts=frozenset({"-f", "--file", "-E", "--exec"}),
+    program_words=1,
+)
+
+SED_SPEC = ToolSpec(
+    short_no_arg=frozenset("nErsuz"),
+    short_arg=frozenset("efl"),
+    short_opt_arg=frozenset("i"),
+    long_no_arg=frozenset(
+        {
+            "--quiet",
+            "--silent",
+            "--debug",
+            "--follow-symlinks",
+            "--posix",
+            "--regexp-extended",
+            "--separate",
+            "--sandbox",
+            "--unbuffered",
+            "--null-data",
+            "--help",
+            "--version",
+        }
+    ),
+    long_arg=frozenset({"--expression", "--file", "--line-length"}),
+    long_opt_arg=frozenset({"--in-place"}),
+    program_opts=frozenset({"-e", "--expression"}),
+    file_program_opts=frozenset({"-f", "--file"}),
+    program_words=1,
+)
+
+CUT_SPEC = ToolSpec(
+    short_no_arg=frozenset("nswz"),
+    short_arg=frozenset("bcdfFO"),
+    long_no_arg=frozenset(
+        {
+            "--complement",
+            "--no-partial",
+            "--only-delimited",
+            "--zero-terminated",
+            "--help",
+            "--version",
+        }
+    ),
+    long_arg=frozenset(
+        {"--bytes", "--characters", "--delimiter", "--fields", "--output-delimiter"}
+    ),
+    long_opt_arg=frozenset({"--whitespace-delimited"}),
+)
+
+HEAD_SPEC = ToolSpec(
+    short_no_arg=frozenset("qvz"),
+    short_arg=frozenset("cn"),
+    long_no_arg=frozenset(
+        {"--quiet", "--silent", "--verbose", "--zero-terminated", "--help", "--version"}
+    ),
+    long_arg=frozenset({"--bytes", "--lines"}),
+)
+
+TAIL_SPEC = ToolSpec(
+    short_no_arg=frozenset("fFqvz"),
+    short_arg=frozenset("cns"),
+    long_no_arg=frozenset(
+        {
+            "--debug",
+            "--quiet",
+            "--silent",
+            "--retry",
+            "--verbose",
+            "--zero-terminated",
+            "--help",
+            "--version",
+        }
+    ),
+    long_arg=frozenset(
+        {"--bytes", "--lines", "--max-unchanged-stats", "--pid", "--sleep-interval"}
+    ),
+    long_opt_arg=frozenset({"--follow"}),
+)
+
+SORT_SPEC = ToolSpec(
+    short_no_arg=frozenset("bdfgiMhnRrcCmsuzV"),
+    short_arg=frozenset("koStT"),
+    long_no_arg=frozenset(
+        {
+            "--ignore-leading-blanks",
+            "--dictionary-order",
+            "--ignore-case",
+            "--general-numeric-sort",
+            "--ignore-nonprinting",
+            "--month-sort",
+            "--human-numeric-sort",
+            "--numeric-sort",
+            "--random-sort",
+            "--reverse",
+            "--version-sort",
+            "--debug",
+            "--merge",
+            "--stable",
+            "--unique",
+            "--zero-terminated",
+            "--help",
+            "--version",
+        }
+    ),
+    long_arg=frozenset(
+        {
+            "--random-source",
+            "--sort",
+            "--batch-size",
+            "--compress-program",
+            "--files0-from",
+            "--key",
+            "--output",
+            "--buffer-size",
+            "--field-separator",
+            "--temporary-directory",
+            "--parallel",
+        }
+    ),
+    long_opt_arg=frozenset({"--check"}),
+    unnamed_file_opts=frozenset({"--files0-from"}),
+)
+
+UNIQ_SPEC = ToolSpec(
+    short_no_arg=frozenset("cdDiuz"),
+    short_arg=frozenset("fsw"),
+    long_no_arg=frozenset(
+        {
+            "--count",
+            "--repeated",
+            "--ignore-case",
+            "--unique",
+            "--zero-terminated",
+            "--help",
+            "--version",
+        }
+    ),
+    long_arg=frozenset({"--skip-fields", "--skip-chars", "--check-chars"}),
+    long_opt_arg=frozenset({"--all-repeated", "--group"}),
+)
+
+TR_SPEC = ToolSpec(
+    short_no_arg=frozenset("cCdst"),
+    long_no_arg=frozenset(
+        {
+            "--complement",
+            "--delete",
+            "--squeeze-repeats",
+            "--truncate-set1",
+            "--help",
+            "--version",
+        }
+    ),
+    ignore_operands=True,
+)
+
+CAT_SPEC = ToolSpec(
+    short_no_arg=frozenset("AbeEnstTuv"),
+    long_no_arg=frozenset(
+        {
+            "--show-all",
+            "--number-nonblank",
+            "--show-ends",
+            "--number",
+            "--squeeze-blank",
+            "--show-tabs",
+            "--show-nonprinting",
+            "--help",
+            "--version",
+        }
+    ),
+)
+
+TOOL_SPECS: dict[str, ToolSpec] = {
+    "wc": WC_SPEC,
+    "grep": GREP_SPEC,
+    "egrep": GREP_SPEC,
+    "fgrep": GREP_SPEC,
+    "rg": RG_SPEC,
+    "awk": AWK_SPEC,
+    "gawk": AWK_SPEC,
+    "mawk": AWK_SPEC,
+    "nawk": AWK_SPEC,
+    "sed": SED_SPEC,
+    "cut": CUT_SPEC,
+    "head": HEAD_SPEC,
+    "tail": TAIL_SPEC,
+    "sort": SORT_SPEC,
+    "uniq": UNIQ_SPEC,
+    "tr": TR_SPEC,
+    "cat": CAT_SPEC,
+}
+
+AWK_TOOL_NAMES = frozenset({"awk", "gawk", "mawk", "nawk"})
+AWK_LOAD_OPTS = frozenset({"-i", "--include", "-l", "--load"})
+AWK_FILE_CONSTRUCT = re.compile(r"\b(?:getline|system)\b|[<|]")
+ENV_ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+SED_FILE_COMMANDS = frozenset({"r", "R", "w", "W", "e"})
+SED_DELIMITED_COMMANDS = frozenset({"s", "y"})
+SED_LINE_ARG_COMMANDS = frozenset({":", "b", "t", "T", "l", "q", "Q", "v"})
+SED_TEXT_COMMANDS = frozenset({"a", "i", "c"})
+SED_SIMPLE_COMMANDS = frozenset(
+    {"d", "D", "g", "G", "h", "H", "n", "N", "p", "P", "x", "z", "=", "F"}
+)
+
+
 def length_tool_index(words: list[str]) -> int | None:
-    """Return the index of the first whole-file length program word."""
-    for index, token in enumerate(words):
-        if Path(token).name in LENGTH_TOOL_NAMES:
+    """Return the index of the first non-redirect whole-file length program word."""
+    limit = len(words)
+    index = 0
+    for _ in range(limit):
+        if index >= limit:
+            break
+        redirect = length_redirect_operands(words, index, limit)
+        if redirect is not None:
+            index, _ = redirect
+            continue
+        if Path(words[index]).name in LENGTH_TOOL_NAMES:
             return index
+        index += 1
     return None
+
+
+def stage_command_index(words: list[str]) -> int | None:
+    """Return the index of the command word of a stage after redirects and assignments."""
+    limit = len(words)
+    index = 0
+    for _ in range(limit):
+        if index >= limit:
+            break
+        redirect = length_redirect_operands(words, index, limit)
+        if redirect is not None:
+            index, _ = redirect
+            continue
+        if ENV_ASSIGNMENT.match(words[index]):
+            index += 1
+            continue
+        return index
+    return None
+
+
+def collect_prefix_redirects(words: list[str], tool_index: int) -> tuple[list[str], bool]:
+    """Collect input redirect targets and xargs presence before tool_index."""
+    redirects: list[str] = []
+    has_xargs = False
+    index = 0
+    for _ in range(tool_index):
+        if index >= tool_index:
+            break
+        redirect = length_redirect_operands(words, index, tool_index)
+        if redirect is not None:
+            index, extra = redirect
+            redirects.extend(extra)
+            continue
+        if Path(words[index]).name == "xargs":
+            has_xargs = True
+        index += 1
+    return redirects, has_xargs
+
+
+def record_option(spec: ToolSpec, opt: str, value: str | None, state: _StageState) -> None:
+    """Record one parsed option and any program, file-program, or unnamed-file effect."""
+    state.seen_opts.add(opt)
+    if opt in spec.unnamed_file_opts:
+        state.refused = True
+    if value is not None and (opt, value) in spec.unnamed_file_opt_values:
+        state.refused = True
+    if opt in spec.program_opts and value is not None:
+        state.opt_programs.append(value)
+    if opt in spec.file_program_opts:
+        state.uses_file = True
+
+
+def parse_long_option(
+    spec: ToolSpec, words: list[str], index: int, limit: int, state: _StageState
+) -> int:
+    """Parse one --long option token starting at index and return the next index."""
+    name, has_eq, inline_value = words[index].partition("=")
+    if name in spec.long_no_arg:
+        if has_eq:
+            state.refused = True
+        record_option(spec, name, None, state)
+        return index + 1
+    if name in spec.long_opt_arg:
+        record_option(spec, name, inline_value if has_eq else None, state)
+        return index + 1
+    if name in spec.long_arg:
+        if has_eq:
+            record_option(spec, name, inline_value, state)
+            return index + 1
+        if index + 1 < limit:
+            record_option(spec, name, words[index + 1], state)
+            return index + 2
+        state.refused = True
+        record_option(spec, name, None, state)
+        return index + 1
+    state.refused = True
+    return index + 1
+
+
+def parse_short_cluster(
+    spec: ToolSpec, words: list[str], index: int, limit: int, state: _StageState
+) -> int:
+    """Parse one short-option cluster starting at index and return the next index."""
+    cluster = words[index][1:]
+    for offset, letter in enumerate(cluster):
+        opt = f"-{letter}"
+        rest = cluster[offset + 1 :]
+        if letter in spec.short_no_arg:
+            record_option(spec, opt, None, state)
+            continue
+        if letter in spec.short_opt_arg:
+            record_option(spec, opt, rest or None, state)
+            return index + 1
+        if letter in spec.short_arg:
+            if rest:
+                record_option(spec, opt, rest, state)
+                return index + 1
+            if index + 1 < limit:
+                record_option(spec, opt, words[index + 1], state)
+                return index + 2
+            state.refused = True
+            record_option(spec, opt, None, state)
+            return index + 1
+        state.refused = True
+    return index + 1
+
+
+def step_stage_option(
+    spec: ToolSpec, words: list[str], index: int, limit: int, state: _StageState
+) -> int | None:
+    """Advance past one option token when words[index] is an option, else return None."""
+    token = words[index]
+    if token.startswith("--"):
+        return parse_long_option(spec, words, index, limit, state)
+    if token.startswith("-") and token != "-":
+        return parse_short_cluster(spec, words, index, limit, state)
+    return None
+
+
+def parse_stage_tokens(spec: ToolSpec, words: list[str], start: int, state: _StageState) -> None:
+    """Scan tokens from start for redirects, options, --, and positional arguments."""
+    limit = len(words)
+    index = start
+    options_ended = False
+    for _ in range(limit):
+        if index >= limit:
+            break
+        redirect = length_redirect_operands(words, index, limit)
+        if redirect is not None:
+            index, extra = redirect
+            state.input_redirects.extend(extra)
+            continue
+        if not options_ended and words[index] == "--":
+            options_ended = True
+            index += 1
+            continue
+        next_index = None if options_ended else step_stage_option(spec, words, index, limit, state)
+        if next_index is not None:
+            index = next_index
+            continue
+        state.positionals.append(words[index])
+        index += 1
+
+
+def finalize_stage_parse(tool: str, spec: ToolSpec, state: _StageState) -> StageParse:
+    """Build an immutable StageParse from accumulated options, operands, and redirects."""
+    program_given = bool(state.opt_programs) or state.uses_file
+    refused = state.refused
+    if spec.ignore_operands:
+        programs: tuple[str, ...] = ()
+        operands: tuple[str, ...] = ()
+    elif program_given:
+        programs = tuple(state.opt_programs)
+        operands = tuple(state.positionals)
+    else:
+        if len(state.positionals) < spec.program_words:
+            refused = True
+        programs = tuple(state.positionals[: spec.program_words])
+        operands = tuple(state.positionals[spec.program_words :])
+    return StageParse(
+        tool=tool,
+        seen_opts=frozenset(state.seen_opts),
+        programs=programs,
+        uses_file=state.uses_file,
+        operands=operands,
+        input_redirects=tuple(state.input_redirects),
+        refused=refused,
+    )
+
+
+def parse_tool_stage(words: list[str], tool_index: int) -> StageParse:
+    """Parse one stage around tool_index using the tool's getopt option spec."""
+    tool = Path(words[tool_index]).name
+    spec = TOOL_SPECS.get(tool)
+    prefix_redirects, has_xargs = collect_prefix_redirects(words, tool_index)
+    state = _StageState(
+        seen_opts=set(),
+        opt_programs=[],
+        uses_file=False,
+        positionals=[],
+        input_redirects=prefix_redirects,
+        refused=has_xargs or spec is None,
+    )
+    if spec is None:
+        return finalize_stage_parse(tool, ToolSpec(), state)
+    parse_stage_tokens(spec, words, tool_index + 1, state)
+    return finalize_stage_parse(tool, spec, state)
 
 
 def wc_is_length_check(words: list[str], tool_index: int) -> bool:
     """Return whether wc options request a max-line-length check."""
-    for token in words[tool_index + 1 :]:
-        if token == "--":
-            break
-        if token == "--max-line-length":
-            return True
-        if token.startswith("-") and not token.startswith("--") and "L" in token[1:]:
-            return True
-    return False
+    parsed = parse_tool_stage(words, tool_index)
+    return "-L" in parsed.seen_opts or "--max-line-length" in parsed.seen_opts
 
 
 def strip_awk_double_quotes(program: str) -> str:
@@ -520,43 +1249,37 @@ def strip_awk_double_quotes(program: str) -> str:
 
 
 def awk_program_token(words: list[str], tool_index: int) -> tuple[str | None, bool]:
-    """Return the inline awk program token and whether -f is present."""
-    uses_file = False
-    limit = len(words)
-    index = tool_index + 1
-    for _ in range(limit):
-        if index >= limit:
-            break
-        token = words[index]
-        if token == "--":
-            break
-        if token in ("-f", "--file"):
-            uses_file = True
-            index += 2
-            continue
-        if token in ("-F", "-v"):
-            index += 2
-            continue
-        if token.startswith("-"):
-            index += 1
-            continue
-        return token, uses_file
-    return None, uses_file
+    """Return the inline awk program token and whether a program file option is present."""
+    parsed = parse_tool_stage(words, tool_index)
+    program = "\n".join(parsed.programs) if parsed.programs else None
+    return program, parsed.uses_file
 
 
 def awk_is_length_check(words: list[str], tool_index: int) -> bool:
     """Return whether an awk invocation measures whole-line length."""
-    program, uses_file = awk_program_token(words, tool_index)
-    if uses_file:
-        return any(AWK_LENGTH_PROGRAM.search(token) for token in words)
-    if program is None:
+    parsed = parse_tool_stage(words, tool_index)
+    if parsed.uses_file:
+        return True
+    program = "\n".join(parsed.programs)
+    if program and AWK_LENGTH_PROGRAM.search(strip_awk_double_quotes(program)):
+        return True
+    if parsed.refused:
+        return any(
+            AWK_LENGTH_PROGRAM.search(strip_awk_double_quotes(word)) for word in parsed.operands
+        )
+    return False
+
+
+def grep_is_length_check(words: list[str], tool_index: int | None = None) -> bool:
+    """Return whether grep or rg uses a pattern file or counted-dot column-width pattern."""
+    resolved = length_tool_index(words) if tool_index is None else tool_index
+    if resolved is None:
         return False
-    return bool(AWK_LENGTH_PROGRAM.search(strip_awk_double_quotes(program)))
-
-
-def grep_is_length_check(words: list[str]) -> bool:
-    """Return whether grep or rg uses a counted-dot column-width pattern."""
-    return any(GREP_COUNTED_DOT.search(token) for token in words)
+    parsed = parse_tool_stage(words, resolved)
+    if parsed.uses_file:
+        return True
+    candidates = (*parsed.programs, *parsed.operands) if parsed.refused else parsed.programs
+    return any(GREP_COUNTED_DOT.search(token) for token in candidates)
 
 
 def command_is_length_check(words: list[str]) -> bool:
@@ -567,14 +1290,14 @@ def command_is_length_check(words: list[str]) -> bool:
     tool = Path(words[tool_index]).name
     if tool == "wc":
         return wc_is_length_check(words, tool_index)
-    if tool in ("awk", "gawk", "mawk", "nawk"):
+    if tool in AWK_TOOL_NAMES:
         return awk_is_length_check(words, tool_index)
-    return grep_is_length_check(words)
+    return grep_is_length_check(words, tool_index)
 
 
 def operand_is_lane_owned(operand: str) -> bool:
     """Return whether a file operand names a path under the worktree .lane/ tree."""
-    if operand == "\x00xargs_stdin":
+    if operand.startswith("\x00"):
         return False
     parts = operand.split("/")
     if ".." in parts:
@@ -582,26 +1305,6 @@ def operand_is_lane_owned(operand: str) -> bool:
     if operand.startswith(".lane/") or operand.startswith("./.lane/"):
         return True
     return operand.startswith("/") and "/.lane/" in operand
-
-
-LENGTH_OPTION_FLAGS = frozenset(
-    {
-        "-e",
-        "-f",
-        "--regexp",
-        "--file",
-        "-F",
-        "-v",
-        "-m",
-        "-A",
-        "-B",
-        "-C",
-        "-g",
-        "-t",
-        "-T",
-        "-M",
-    }
-)
 
 
 def length_redirect_advance(words: list[str], index: int, limit: int) -> tuple[list[str], int]:
@@ -640,57 +1343,194 @@ def length_redirect_operands(
     return advanced, extra
 
 
-def length_option_index(words: list[str], index: int, limit: int, token: str) -> int | None:
-    """Return the next index after a length-tool option token when applicable."""
-    if token.startswith("-") and token in LENGTH_OPTION_FLAGS and index + 1 < limit:
-        return index + 2
-    if token.startswith("-"):
-        return index + 1
-    return None
-
-
 def command_file_operands(words: list[str]) -> list[str]:
     """Collect file operands for a parsed whole-file length command."""
     tool_index = length_tool_index(words)
     if tool_index is None:
         return []
-    operands: list[str] = []
-    if any(Path(token).name == "xargs" for token in words[:tool_index]):
-        operands.append("\x00xargs_stdin")
-    index = tool_index + 1
-    tool = Path(words[tool_index]).name
-    awk_tool = tool in ("awk", "gawk", "mawk", "nawk")
-    grep_tool = tool in ("grep", "egrep", "fgrep", "rg")
-    program_seen = False
-    pattern_seen = False
-    limit = len(words)
-    for _ in range(limit):
-        if index >= limit:
-            break
-        token = words[index]
-        if token == "--":
-            operands.extend(words[index + 1 :])
-            break
-        redirect = length_redirect_operands(words, index, limit)
-        if redirect is not None:
-            index, extra = redirect
-            operands.extend(extra)
-            continue
-        option_index = length_option_index(words, index, limit, token)
-        if option_index is not None:
-            index = option_index
-            continue
-        if awk_tool and not program_seen:
-            program_seen = True
-            index += 1
-            continue
-        if grep_tool and not pattern_seen:
-            pattern_seen = True
-            index += 1
-            continue
-        operands.append(token)
-        index += 1
+    parsed = parse_tool_stage(words, tool_index)
+    operands = [*parsed.operands, *parsed.input_redirects]
+    if parsed.refused:
+        operands.append("\x00refused")
     return operands
+
+
+def awk_program_reads_files(source: str) -> bool:
+    """Return whether an awk program uses getline, system, or pipe/input redirection."""
+    return bool(AWK_FILE_CONSTRUCT.search(strip_awk_double_quotes(source)))
+
+
+def skip_sed_delimited(script: str, start: int, delim: str) -> int | None:
+    """Return index after the next unescaped delim in script, or None when unclosed."""
+    escaped = False
+    for index in range(start, len(script)):
+        char = script[index]
+        if escaped:
+            escaped = False
+            continue
+        if char == "\\":
+            escaped = True
+            continue
+        if char == delim:
+            return index + 1
+    return None
+
+
+def skip_sed_address_atom(script: str, index: int) -> int | None:
+    """Advance past one sed address atom at index, returning None on unclosed regex."""
+    limit = len(script)
+    char = script[index]
+    if char == "$":
+        return index + 1
+    if char == "/":
+        return skip_sed_delimited(script, index + 1, "/")
+    if char == "\\":
+        if index + 1 >= limit:
+            return None
+        return skip_sed_delimited(script, index + 2, script[index + 1])
+    if char.isdigit() or char in "+~":
+        end = index + 1
+        for pos in range(index + 1, limit):
+            if not (script[pos].isdigit() or script[pos] in "+~"):
+                break
+            end = pos + 1
+        return end
+    return index
+
+
+def skip_sed_line(script: str, start: int) -> int:
+    """Return index of the newline ending the current sed line or len(script)."""
+    newline = script.find("\n", start)
+    return len(script) if newline < 0 else newline + 1
+
+
+def skip_sed_prefix(script: str, start: int) -> int | None:
+    """Skip sed separators, comments, blocks, and addresses before a command letter."""
+    limit = len(script)
+    index = start
+    for _ in range(limit + 1):
+        if index >= limit:
+            return limit
+        char = script[index]
+        if char in " \t\r\n;{}!,":
+            index += 1
+            continue
+        if char == "#":
+            index = skip_sed_line(script, index + 1)
+            continue
+        advanced = skip_sed_address_atom(script, index)
+        if advanced is None:
+            return None
+        if advanced == index:
+            return index
+        index = advanced
+    return limit
+
+
+def step_sed_delimited(script: str, index: int) -> tuple[int, bool]:
+    """Advance past a sed s or y command and report whether its flags read or execute."""
+    cmd = script[index]
+    if index + 1 >= len(script):
+        return len(script), True
+    delim = script[index + 1]
+    mid = skip_sed_delimited(script, index + 2, delim)
+    end = None if mid is None else skip_sed_delimited(script, mid, delim)
+    if end is None:
+        return len(script), True
+    if cmd == "y":
+        return end, False
+    for pos in range(end, len(script)):
+        flag = script[pos]
+        if flag in ";\n}#":
+            return pos, False
+        if flag in ("w", "e") or flag not in "gpiImM0123456789 \t\r":
+            return len(script), True
+    return len(script), False
+
+
+def skip_sed_text_arg(script: str, start: int) -> int:
+    """Advance past a sed a, i, or c text argument honoring backslash-continued lines."""
+    escaped = False
+    for pos in range(start, len(script)):
+        char = script[pos]
+        if escaped:
+            escaped = False
+            continue
+        if char == "\\":
+            escaped = True
+            continue
+        if char == "\n":
+            return pos + 1
+    return len(script)
+
+
+def skip_sed_label_arg(script: str, start: int) -> int:
+    """Advance past a sed label, branch, or line-arg command to the next boundary."""
+    for pos in range(start, len(script)):
+        if script[pos] in ";\n}":
+            return pos
+    return len(script)
+
+
+def step_sed_other_command(program: str, index: int) -> int | None:
+    """Return next index after a non-file, non-s/y sed command, or None when unknown."""
+    cmd = program[index]
+    if cmd in SED_SIMPLE_COMMANDS:
+        return index + 1
+    if cmd in SED_LINE_ARG_COMMANDS:
+        return skip_sed_label_arg(program, index + 1)
+    if cmd in SED_TEXT_COMMANDS:
+        return skip_sed_text_arg(program, index + 1)
+    return None
+
+
+def sed_program_reads_files(program: str) -> bool:
+    """Return whether a sed script uses a file or shell-execution command or s flag."""
+    limit = len(program)
+    index = 0
+    for _ in range(limit + 1):
+        next_index = skip_sed_prefix(program, index)
+        if next_index is None:
+            return True
+        if next_index >= limit:
+            return False
+        cmd = program[next_index]
+        if cmd in SED_FILE_COMMANDS:
+            return True
+        if cmd in SED_DELIMITED_COMMANDS:
+            index, unsafe = step_sed_delimited(program, next_index)
+            if unsafe:
+                return True
+            continue
+        other_index = step_sed_other_command(program, next_index)
+        if other_index is None:
+            return True
+        index = other_index
+    return True
+
+
+def intermediate_program_safe(parsed: StageParse) -> bool:
+    """Return whether an intermediate awk or sed stage avoids external file constructs."""
+    if parsed.tool in AWK_TOOL_NAMES:
+        if parsed.uses_file or (parsed.seen_opts & AWK_LOAD_OPTS):
+            return False
+        return not any(awk_program_reads_files(prog) for prog in parsed.programs)
+    if parsed.tool == "sed":
+        if parsed.uses_file:
+            return False
+        return not any(sed_program_reads_files(prog) for prog in parsed.programs)
+    return True
+
+
+def stage_reads_only_pipe(words: list[str], *, is_final: bool) -> bool:
+    """Return whether one pipeline stage reads exclusively from its stdin pipe."""
+    cmd_index = stage_command_index(words)
+    if cmd_index is None or Path(words[cmd_index]).name not in TOOL_SPECS:
+        return False
+    parsed = parse_tool_stage(words, cmd_index)
+    if parsed.refused or parsed.input_redirects or any(op != "-" for op in parsed.operands):
+        return False
+    return True if is_final else intermediate_program_safe(parsed)
 
 
 def length_command_allowed(words: list[str], pipeline: list[list[str]], command_index: int) -> bool:
@@ -698,10 +1538,12 @@ def length_command_allowed(words: list[str], pipeline: list[list[str]], command_
     operands = command_file_operands(words)
     if operands and all(operand_is_lane_owned(operand) for operand in operands):
         return True
-    if operands or command_index == 0:
+    if command_index == 0 or not GIT_DIFF_COMMAND.search(" ".join(pipeline[0])):
         return False
-    first_text = " ".join(pipeline[0])
-    return bool(GIT_DIFF_COMMAND.search(first_text))
+    return all(
+        stage_reads_only_pipe(pipeline[idx], is_final=(idx == command_index))
+        for idx in range(1, command_index + 1)
+    )
 
 
 def span_whole_file_length_refused(span: str) -> bool:

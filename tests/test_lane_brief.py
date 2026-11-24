@@ -50,6 +50,234 @@ ARGS = [
     "2",
 ]
 
+FIX5_PROBE_CASES: tuple[tuple[str, str, bool], ...] = (
+    (
+        "g01 grep -e then repo file then lane file",
+        "grep -E -e '.{80}' scripts/lane_brief.py .lane/tmp/draft.txt",
+        True,
+    ),
+    (
+        "g02 grep -f then repo file then lane file",
+        "grep -E -f .lane/tmp/pat scripts/lane_brief.py .lane/tmp/d.txt",
+        True,
+    ),
+    (
+        "g03 grep --regexp= joined",
+        "grep -E --regexp='.{80}' scripts/a.py .lane/tmp/d.txt",
+        True,
+    ),
+    (
+        "g04 grep --regexp spaced",
+        "grep -E --regexp '.{80}' scripts/a.py .lane/tmp/d.txt",
+        True,
+    ),
+    (
+        "g05 grep --file spaced",
+        "grep -E --file .lane/tmp/pat scripts/a.py .lane/tmp/d.txt",
+        True,
+    ),
+    (
+        "g06 grep -e joined value",
+        "grep -E -e.{80} scripts/a.py .lane/tmp/d.txt",
+        True,
+    ),
+    (
+        "g07 grep two -e options",
+        "grep -E -e '.{80}' -e x scripts/a.py .lane/tmp/d.txt",
+        True,
+    ),
+    (
+        "g08 control grep -e lane file only",
+        "grep -E -e '.{80}' .lane/tmp/draft.txt",
+        False,
+    ),
+    (
+        "g09 control grep plain pattern repo file",
+        "grep -E '.{80}' scripts/a.py",
+        True,
+    ),
+    (
+        "g10 control grep plain pattern lane file",
+        "grep -E '.{80}' .lane/tmp/d.txt",
+        False,
+    ),
+    (
+        "p01 diff then grep repo file then awk",
+        "git diff -- scripts/a.py | grep '^' scripts/a.py | awk 'length > 72'",
+        True,
+    ),
+    (
+        "p02 diff then cat repo file then wc",
+        "git diff -- scripts/a.py | cat scripts/a.py | wc -L",
+        True,
+    ),
+    (
+        "p03 diff then sed repo file then awk",
+        "git diff -- scripts/a.py | sed -n p scripts/a.py | awk 'length > 72'",
+        True,
+    ),
+    (
+        "p04 diff then grep stdin redirect repo file",
+        "git diff | grep '^' < scripts/a.py | awk 'length > 72'",
+        True,
+    ),
+    (
+        "p05 control diff then grep stdin then awk",
+        "git diff -- scripts/a.py | grep '^+' | awk 'length > 72'",
+        False,
+    ),
+    (
+        "p06 control diff then wc",
+        "git diff -- scripts/a.py | wc -L",
+        False,
+    ),
+    (
+        "a01 gawk -- length program repo file",
+        "gawk -- 'length > 72' scripts/a.py",
+        True,
+    ),
+    (
+        "a02 awk -- length program repo file",
+        "awk -- 'length > 72' scripts/a.py",
+        True,
+    ),
+    (
+        "a03 awk -F, -- length program repo file",
+        "awk -F, -- 'length > 72' scripts/a.py",
+        True,
+    ),
+    (
+        "a04 control awk -- print program repo file",
+        "awk -- '{print $1}' scripts/a.py",
+        False,
+    ),
+    (
+        "a05 control awk -- length program lane file",
+        "awk -- 'length > 72' .lane/tmp/a.txt",
+        False,
+    ),
+    (
+        "w01 wc -L -m repo then lane",
+        "wc -L -m scripts/a.py .lane/tmp/a.txt",
+        True,
+    ),
+    (
+        "w02 wc -m -L repo then lane",
+        "wc -m -L scripts/a.py .lane/tmp/a.txt",
+        True,
+    ),
+    (
+        "w03 wc -L -c repo then lane",
+        "wc -L -c scripts/a.py .lane/tmp/a.txt",
+        True,
+    ),
+    (
+        "w04 wc -L -l repo then lane",
+        "wc -L -l scripts/a.py .lane/tmp/a.txt",
+        True,
+    ),
+    (
+        "w05 wc -L -w repo then lane",
+        "wc -L -w scripts/a.py .lane/tmp/a.txt",
+        True,
+    ),
+    (
+        "w06 control wc -L -m lane only",
+        "wc -L -m .lane/tmp/a.txt",
+        False,
+    ),
+    (
+        "w07 grep -m value then repo file",
+        "grep -E -m 5 '.{80}' scripts/a.py",
+        True,
+    ),
+    (
+        "w08 control grep -m value lane file",
+        "grep -E -m 5 '.{80}' .lane/tmp/a.txt",
+        False,
+    ),
+    (
+        "r01 diff then leading stdin redirect wc",
+        "git diff -- scripts/a.py | < scripts/a.py wc -L",
+        True,
+    ),
+    (
+        "r02 leading stdin redirect wc alone",
+        "< scripts/a.py wc -L",
+        True,
+    ),
+    (
+        "r03 joined leading stdin redirect wc",
+        "<scripts/a.py wc -L",
+        True,
+    ),
+    (
+        "r04 fd0 leading stdin redirect wc",
+        "0< scripts/a.py wc -L",
+        True,
+    ),
+    (
+        "r05 diff then leading redirect awk",
+        "git diff | < scripts/a.py awk 'length > 72'",
+        True,
+    ),
+    (
+        "r06 control leading lane redirect wc",
+        "< .lane/tmp/a.txt wc -L",
+        False,
+    ),
+    (
+        "r07 control trailing stdin redirect repo",
+        "wc -L < scripts/a.py",
+        True,
+    ),
+)
+
+FIX5_G1_PARSE_CASES: tuple[tuple[str, bool], ...] = (
+    ("wc -Lm file", True),
+    ("wc -Lm .lane/tmp/a.txt", False),
+    ("wc -L --files0-from=.lane/tmp/list", True),
+    ("wc -L --files0-from=.lane/tmp/list .lane/tmp/a.txt", True),
+    ("wc --max-line-length file", True),
+    ("wc --max-line-length .lane/tmp/a.txt", False),
+    ("grep -nA3 '.{80}' file", True),
+    ("grep -nA3 '.{80}' .lane/tmp/a.txt", False),
+    ("grep --regexp='.{80}' file", True),
+    ("grep --regexp='.{80}' .lane/tmp/a.txt", False),
+    ("grep -E -- '.{80}' .lane/tmp/a.txt", False),
+    ("grep -rE '.{80}'", True),
+    ("grep -rE '.{80}' .lane/tmp/a.txt", True),
+    ("grep -d recurse -E '.{80}' .lane/tmp/a.txt", True),
+    ("rg -g '*.py' '.{80}' scripts", True),
+    ("rg -g '*.py' '.{80}' .lane/tmp/a.txt", False),
+    ("awk -F, -v x=1 'length > 72' file", True),
+    ("awk -F, -v x=1 'length > 72' .lane/tmp/a.txt", False),
+    ("awk -f .lane/tmp/p.awk scripts/a.py", True),
+    ("awk -f .lane/tmp/p.awk .lane/tmp/a.txt", False),
+    ("wc -L --bogus .lane/tmp/a.txt", True),
+    ("wc -L -Z .lane/tmp/a.txt", True),
+)
+
+FIX5_G3_CHAIN_CASES: tuple[tuple[str, bool], ...] = (
+    ("git diff | grep '^+' | awk 'length > 72'", False),
+    ("git diff | sed 's/^+//' | wc -L", False),
+    ("git diff | sed 's/error/warn/g' | wc -L", False),
+    ("git diff | cat | wc -L", False),
+    ("git diff | cat - | wc -L", False),
+    ("git diff | tr -d '\\r' | wc -L", False),
+    ("git diff | tee .lane/tmp/x | wc -L", True),
+    ("git diff | awk '{ getline l < \"scripts/a.py\" } 1' | wc -L", True),
+    ("git diff | awk '{ getline } 1' | wc -L", True),
+    ("git diff | awk '{ system(\"true\") }' | wc -L", True),
+    ("git diff | awk '{ print | \"cat\" }' | wc -L", True),
+    ("git diff | sed 'r scripts/a.py' | wc -L", True),
+    ("git diff | sed 's/a/b/w .lane/tmp/x' | wc -L", True),
+    ("git diff | sed 's/a/b/e' | wc -L", True),
+    ("git diff | grep -r x | wc -L", True),
+    ("git diff | grep x scripts/a.py | wc -L", True),
+    ("git diff | sort --files0-from=.lane/tmp/list | wc -L", True),
+)
+
 
 def _signal_probe(pid: int) -> bool:
     """Return whether the signal probe finds the process."""
@@ -1242,7 +1470,7 @@ class LaneBriefTest(unittest.TestCase):
             (["awk", "-F", ":", "prog"], 0, ("prog", False)),
             (["awk", "-v", "x=1", "prog"], 0, ("prog", False)),
             (["awk", "-f", "file.awk"], 0, (None, True)),
-            (["awk", "--", "prog"], 0, (None, False)),
+            (["awk", "--", "prog"], 0, ("prog", False)),
         ]
         for words, tool_index, expected in cases:
             with self.subTest(words=words):
@@ -1296,6 +1524,24 @@ class LaneBriefTest(unittest.TestCase):
             f"`git -C sub log -1`\nHEAD {missing_id}\n", worktree=worktree
         )
         self.assertEqual(rc, 2, error)
+
+    def test_fix5_probe_cases_table(self) -> None:
+        """Exercise all round-5 probe spans through span_whole_file_length_refused."""
+        for tag, span, want in FIX5_PROBE_CASES:
+            with self.subTest(tag=tag, span=span):
+                self.assertEqual(lane_brief.span_whole_file_length_refused(span), want)
+
+    def test_fix5_g1_parse_table(self) -> None:
+        """Check G1 per-tool option clusters, -- terminators, and fail-closed flags."""
+        for span, want in FIX5_G1_PARSE_CASES:
+            with self.subTest(span=span):
+                self.assertEqual(lane_brief.span_whole_file_length_refused(span), want)
+
+    def test_fix5_g3_chain_table(self) -> None:
+        """Check G3 stdin-only pipeline filter chains and refused intermediate stages."""
+        for span, want in FIX5_G3_CHAIN_CASES:
+            with self.subTest(span=span):
+                self.assertEqual(lane_brief.span_whole_file_length_refused(span), want)
 
     def test_conflict_alternate_forms_refused(self) -> None:
         """Refuse alternate column-limit, one-line join, and ERE grep length forms."""

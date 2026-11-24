@@ -7,6 +7,7 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import re
 import tempfile
 import unittest
 import unittest.mock
@@ -136,6 +137,152 @@ DEPENDENCY_ALLOWLIST_CASES: tuple[tuple[str, list[tuple[int, str]] | None, str],
     ),
     ("r3-sibling-square-period", None, "Depends on #12 [old head aaaaaaa. New head bbbbbbb]."),
     ("r3-sibling-nested-brackets", None, "Depends on #12 (head aaaaaaa [e.g. rebased])."),
+)
+
+DEPENDENCY_ATTRIBUTION_CASES: tuple[tuple[str, list[tuple[int, str]] | None, str], ...] = (
+    (
+        "s-keep-345",
+        [],
+        "It builds on #344, so until #344 lands this pull request also shows that commit.",
+    ),
+    (
+        "s-keep-345-line",
+        [],
+        (
+            "Part of #340 (second of two stacked pull requests). It builds on #344, "
+            "so until #344 lands this pull request also shows that commit; after #344 "
+            "lands, main is merged in and only the commit below remains."
+        ),
+    ),
+    (
+        "s-keep-head",
+        [(344, "aaaaaaa")],
+        "Depends on #344 (head aaaaaaa), so until #344 lands this shows that commit.",
+    ),
+    (
+        "s-keep-second",
+        [(12, "aaaaaaa"), (13, "bbbbbbb")],
+        "Depends on #12 (head aaaaaaa) and #13 (head bbbbbbb), so once #13 lands this rebases.",
+    ),
+    (
+        "s-keep-first",
+        [(12, "aaaaaaa"), (13, "bbbbbbb")],
+        "Depends on #12 (head aaaaaaa) and #13 (head bbbbbbb), so until #12 lands this shows both.",
+    ),
+    (
+        "s-keep-which",
+        [(12, "aaaaaaa")],
+        "Depends on #12 (head aaaaaaa), which means #12 must land first.",
+    ),
+    (
+        "s-keep-bracket-note",
+        [(12, "aaaaaaa")],
+        "Depends on #12 (head aaaaaaa), so until #12 (the parser change) lands this waits.",
+    ),
+    (
+        "s-keep-historical",
+        [],
+        "Previously stacked on #12 (head aaaaaaa), so until #12 lands this showed that commit.",
+    ),
+    (
+        "s-control-see-same",
+        [(12, "aaaaaaa")],
+        "Depends on #12 (head aaaaaaa), see #12 for the plan.",
+    ),
+    (
+        "s-refuse-new-head",
+        None,
+        "Depends on #12 (head aaaaaaa), so until #12 (head bbbbbbb) lands this waits.",
+    ),
+    (
+        "s-refuse-same-head",
+        None,
+        "Depends on #12 (head aaaaaaa), so until #12 at head aaaaaaa lands this waits.",
+    ),
+    (
+        "s-refuse-chain-and",
+        None,
+        "Depends on #12 (head aaaaaaa), so until #12 and #13 land this waits.",
+    ),
+    (
+        "s-refuse-chain-comma",
+        None,
+        "Depends on #12 (head aaaaaaa), so until #12, #13 land this waits.",
+    ),
+    (
+        "s-refuse-other",
+        None,
+        "Depends on #12 (head aaaaaaa), so until #13 lands this shows that commit.",
+    ),
+    ("s-refuse-depth", None, "Depends on #12 (head aaaaaaa), so until it (#12) lands this waits."),
+    ("s-refuse-dedupe", None, "Depends on #12 (head aaaaaaa) or #13, see #13."),
+    ("c-refuse-semicolon", None, "Depends on #12 {head aaaaaaa; now head bbbbbbb}."),
+    ("c-refuse-period", None, "Depends on #12 {old head aaaaaaa. New head bbbbbbb}."),
+    ("c-refuse-member", None, "Depends on #12 (head aaaaaaa) {and #13 head bbbbbbb}."),
+    ("c-keep-plain", [(12, "aaaaaaa")], "Depends on #12 {head aaaaaaa}."),
+    ("c-keep-nested", [(12, "aaaaaaa")], "Depends on #12 (head aaaaaaa {rebased})."),
+    (
+        "c-keep-next-sentence",
+        [(12, "aaaaaaa")],
+        "Depends on #12 (head aaaaaaa). {Draft} notes follow.",
+    ),
+    ("h-refuse-pull", None, "Depends on #12 (head aaaaaaa) and pull 13 (head bbbbbbb)."),
+    ("h-refuse-pr-nospace", None, "Depends on #12 (head aaaaaaa) and PR13 (head bbbbbbb)."),
+    ("h-refuse-then", None, "Depends on #12 (head aaaaaaa), then head bbbbbbb after the rebase."),
+    ("h-refuse-lone-pull", None, "Depends on #12 and pull 13 (head bbbbbbb)."),
+    ("h-refuse-gh", None, "Depends on #12 and GH-13 at head bbbbbbb."),
+    ("h-refuse-date", None, "Depends on #12, rebased on 2026-11-20, now at head 5d6e7f8."),
+    (
+        "h-keep-ending",
+        [(25664, "c35b0e1fce")],
+        (
+            "Depends on #25664: the first three commits are that PR's series, "
+            "currently ending at c35b0e1fce."
+        ),
+    ),
+    (
+        "h-keep-hist-now",
+        [(12, "bbbbbbb")],
+        "Depends on #12, previously at head aaaaaaa, now head bbbbbbb",
+    ),
+    (
+        "h-keep-hist-hex",
+        [(12, "5d6e7f8")],
+        "Depends on #12, previously at head 1a2b3c4, now head 5d6e7f8",
+    ),
+    ("h-keep-tilde", [(12, "aaaaaaa")], "Depends on #12 ~ head aaaaaaa."),
+    ("h-keep-at", [(12, "aaaaaaa")], "Depends on #12 at head aaaaaaa."),
+    (
+        "h-keep-annotation-hist",
+        [(12, "aaaaaaa")],
+        "Depends on #12 (head aaaaaaa, previously head bbbbbbb).",
+    ),
+    ("h-keep-version", [(12, "aaaaaaa")], "Depends on #12 (v2, head aaaaaaa)."),
+    (
+        "s-sibling-word-repeat",
+        [(12, "aaaaaaa")],
+        "Stacked on PR 12 (head aaaaaaa), so once pull request #12 merges this rebases.",
+    ),
+    (
+        "s-sibling-chain-ampersand",
+        None,
+        "Depends on #12 (head aaaaaaa), so until #12 & PR 13 land this waits.",
+    ),
+    (
+        "s-sibling-see-chain-break",
+        None,
+        "Depends on #12 (head aaaaaaa), see #14 and #12 and #15 for context.",
+    ),
+    ("c-sibling-bang", None, "Depends on #12 {old head aaaaaaa! new head bbbbbbb}."),
+    ("c-sibling-question", None, "Depends on #12 {old head aaaaaaa? new head bbbbbbb}."),
+    (
+        "c-sibling-old-brace-scope",
+        [(12, "bbbbbbb")],
+        "Depends on #12 {old head aaaaaaa} at head bbbbbbb.",
+    ),
+    ("h-sibling-two-tips", None, "Builds on PR 12 (tip aaaaaaa, now tip bbbbbbb)."),
+    ("h-sibling-pulls-slash", None, "Stacked on PR 12 and pulls/13 (ending at bbbbbbb)."),
+    ("h-sibling-issue-ref", None, "Based on pull request 12 and issue 13, ends at 5d6e7f8."),
 )
 
 
@@ -1557,6 +1704,42 @@ class BaseClaimsTest(unittest.TestCase):
                     self.assertIn("ambiguous dependency", err)
                     self.assertIn("#12", err)
                     self.assertIn("#13", err)
+
+    def assert_ambiguous_dependency_refusal(self, sentence: str) -> None:
+        """Assert a refusal starts with ambiguous dependency and names each member once."""
+        with self.assertRaises(ValueError) as caught:
+            base_claims.find_dependency_claims(sentence)
+        message = str(caught.exception)
+        self.assertTrue(message.startswith("ambiguous dependency"), message)
+        for match in base_claims.DEPENDENCY_MEMBER.finditer(sentence):
+            self.assertIn(f"#{match.group(1)}", message)
+        listed = re.findall(r"#([0-9]{1,7})\b", message)
+        self.assertEqual(len(listed), len(set(listed)), message)
+
+    def test_dependency_attribution_cases(self) -> None:
+        """Repeat references, brace annotations and head attribution match table cases."""
+        for label, want, sentence in DEPENDENCY_ATTRIBUTION_CASES:
+            with self.subTest(case=label):
+                if want is None:
+                    self.assert_ambiguous_dependency_refusal(sentence)
+                    continue
+                try:
+                    actual = base_claims.find_dependency_claims(sentence)
+                except ValueError as error:
+                    self.fail(f"unexpected ValueError: {error}")
+                self.assertEqual(actual, want)
+
+    def test_dependency_allowlist_refusal_numbers_are_unique(self) -> None:
+        """Every allow-list refusal names each member reference number at most once."""
+        for label, want, sentence in DEPENDENCY_ALLOWLIST_CASES:
+            if want is not None:
+                continue
+            with self.subTest(case=label):
+                with self.assertRaises(ValueError) as caught:
+                    base_claims.find_dependency_claims(sentence)
+                message = str(caught.exception)
+                listed = re.findall(r"#([0-9]{1,7})\b", message)
+                self.assertEqual(len(listed), len(set(listed)), message)
 
 
 if __name__ == "__main__":

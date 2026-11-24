@@ -3043,5 +3043,134 @@ class MakeTargetsTest(unittest.TestCase):
         self.assertNotIn("SKIPPED", result.stderr)
 
 
+REVISIT_GOES_UPSTREAM = "category D, revisit when the patch goes upstream or at the expiry"
+REVISIT_PR_MERGE = "category D, revisit at the 25879 merge or at a review round"
+REVISIT_BOTH_FORMS = (
+    "category D, revisit when the patch goes upstream or revisit at the 25879 merge"
+)
+REVISIT_BASE_BUMP = "category D, revisit at the base bump that drops the patch or at the expiry"
+
+REVISIT_TRIGGER_CASES: tuple[tuple[str, str, dict[int, str] | None, int], ...] = (
+    ("unsubmitted", REVISIT_GOES_UPSTREAM, {25879: "open"}, 0),
+    ("submitted", REVISIT_GOES_UPSTREAM, {25879: "open"}, 0),
+    ("merged", REVISIT_GOES_UPSTREAM, {25879: "open"}, 1),
+    ("rejected", REVISIT_GOES_UPSTREAM, {25879: "open"}, 1),
+    ("unsubmitted", REVISIT_PR_MERGE, {25879: "open"}, 0),
+    ("submitted", REVISIT_PR_MERGE, {25879: "open"}, 0),
+    ("submitted", REVISIT_PR_MERGE, {25879: "merged"}, 1),
+    ("submitted", REVISIT_PR_MERGE, {25879: "closed"}, 1),
+    ("submitted", REVISIT_PR_MERGE, {24970: "open"}, 1),
+    ("submitted", REVISIT_PR_MERGE, None, 1),
+    ("unsubmitted", REVISIT_GOES_UPSTREAM, None, 0),
+    ("submitted", REVISIT_GOES_UPSTREAM, None, 0),
+    ("merged", REVISIT_BOTH_FORMS, {25879: "open"}, 1),
+    ("submitted", REVISIT_BOTH_FORMS, {25879: "merged"}, 1),
+    ("unsubmitted", REVISIT_BASE_BUMP, None, 0),
+    ("submitted", REVISIT_BASE_BUMP, None, 0),
+    ("merged", REVISIT_BASE_BUMP, None, 0),
+    ("rejected", REVISIT_BASE_BUMP, None, 0),
+)
+
+
+def _write_revisit_sidecar(root: Path, status: str, reason: str) -> Path:
+    """Write a temporary patch sidecar carrying one exception reason."""
+    patches = root / "patches"
+    patches.mkdir(parents=True, exist_ok=True)
+    upstream = "" if status == "unsubmitted" else "https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/1"
+    sidecar = patches / "0001-revisit.toml"
+    content = (
+        f'status = "{status}"\n'
+        f'upstream = "{upstream}"\n'
+        'consumers = ["vmafx"]\n\n'
+        "[[exceptions]]\n"
+        'rule = "HISS-04"\n'
+        'path = "lib.c"\n'
+        'function = "f"\n'
+        "lines = 61\n"
+        'category = "D"\n'
+        'entered = "2026-10-31"\n'
+        'expires = "2027-02-28"\n'
+        f"reason = {json.dumps(reason)}\n"
+    )
+    sidecar.write_text(content, encoding="utf-8")
+    return sidecar
+
+
+def _write_revisit_records(root: Path, states: dict[int, str]) -> Path:
+    """Write a temporary upstream-contributions.json from a number-to-state map."""
+    entries = []
+    for number, state in sorted(states.items()):
+        merged = state == "merged"
+        entries.append(
+            {
+                "number": number,
+                "url": f"https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/{number}",
+                "title": f"avcodec: change {number}",
+                "base": "master",
+                "state": state,
+                "merged_at": "2026-11-24T05:15:49Z" if merged else "",
+                "merged_commit": "e" * 40 if merged else "",
+                "in_release": "",
+                "patch": "",
+                "project": "vmafx",
+                "note": "",
+            }
+        )
+    record_path = root / series.CONTRIBUTIONS
+    payload = {"checked": "2026-11-24", "contributions": entries}
+    record_path.write_text(json.dumps(payload), encoding="utf-8")
+    return record_path
+
+
+class RevisitTriggerTest(unittest.TestCase):
+    """Verify fired revisit-trigger detection in sidecar exception reasons."""
+
+    PREFIX = "0001-revisit.toml: exception (HISS-04, f): revisit trigger fired"
+
+    def _check_case(
+        self, status: str, reason: str, record_states: dict[int, str] | None
+    ) -> tuple[series.Findings, Path]:
+        """Run check_metadata on one temporary sidecar and optional record."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sidecar = _write_revisit_sidecar(root, status, reason)
+            if record_states is not None:
+                _write_revisit_records(root, record_states)
+            findings = series.Findings()
+            series.check_metadata(sidecar, findings, today=date(2026, 11, 24))
+            return findings, root / series.CONTRIBUTIONS
+
+    def test_revisit_trigger_cases(self) -> None:
+        """Check live, fired, missing-entry and missing-record revisit trigger rows."""
+        for index, (status, reason, record_states, expected) in enumerate(REVISIT_TRIGGER_CASES):
+            with self.subTest(row=index, status=status, record_states=record_states, reason=reason):
+                findings, record_path = self._check_case(status, reason, record_states)
+                self.assertEqual(len(findings.errors), expected, findings.errors)
+                for error in findings.errors:
+                    self.assertTrue(error.startswith(self.PREFIX), error)
+                if record_states is None and expected > 0:
+                    self.assertIn(str(record_path), findings.errors[0])
+
+    def test_revisit_trigger_unreadable_record_names_path(self) -> None:
+        """Report an unreadable contribution record with its path when a number trigger runs."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sidecar = _write_revisit_sidecar(root, "submitted", REVISIT_PR_MERGE)
+            record_path = root / series.CONTRIBUTIONS
+            record_path.write_text("{", encoding="utf-8")
+            findings = series.Findings()
+            series.check_metadata(sidecar, findings, today=date(2026, 11, 24))
+            self.assertEqual(len(findings.errors), 1, findings.errors)
+            self.assertTrue(findings.errors[0].startswith(self.PREFIX), findings.errors[0])
+            self.assertIn(str(record_path), findings.errors[0])
+
+    def test_worktree_series_has_no_revisit_trigger_errors(self) -> None:
+        """Confirm the worktree patches and contribution record pass with no fired triggers."""
+        findings = series.check(series.ROOT, today=date(2026, 11, 24))
+        fired = [err for err in findings.errors if "revisit trigger fired" in err]
+        self.assertEqual(fired, [])
+        self.assertEqual(findings.errors, [])
+
+
 if __name__ == "__main__":
     unittest.main()

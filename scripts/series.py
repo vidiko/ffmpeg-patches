@@ -108,6 +108,16 @@ REQUIRED_EXCEPTION_KEYS = {
 }
 VALID_CATEGORIES = {"A", "B", "C", "D"}
 CATEGORY_INTERVALS = {"B": 3, "C": 10, "D": 120}
+GOES_UPSTREAM_TRIGGER = "revisit when the patch goes upstream"
+GOES_UPSTREAM_PATTERN = re.compile(rf"\b{re.escape(GOES_UPSTREAM_TRIGGER)}\b", re.ASCII)
+GOES_UPSTREAM_LIVE_STATUSES = ("unsubmitted", "submitted")
+MERGE_TRIGGER_PATTERN = re.compile(r"\brevisit at the (\d+) merge\b", re.ASCII)
+MERGE_TRIGGER_LIVE_STATES = ("open",)
+REVISIT_FIRED_PREFIX = "revisit trigger fired"
+MAX_TRIGGER_MATCHES = 32
+MAX_SERIES_EXCEPTIONS = 4096
+MAX_CONTRIBUTION_ENTRIES = 4096
+MAX_REASON_SCAN_CHARS = 4096
 DIFF_HUNK = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
 PATCH_NAME = re.compile(r"^(\d{4})-([A-Za-z0-9._-]+)\.patch$")
 FROM_LINE = re.compile(r"^From [0-9a-f]{40} Mon Sep 17 00:00:00 2001$")
@@ -494,6 +504,108 @@ def check_exceptions_metadata(data: dict, name: str, findings: Findings, today: 
             seen_pairs.add(pair)
 
 
+def _parse_contribution_states(
+    entries: list[object], record_path: Path
+) -> tuple[dict[int, str] | None, str | None]:
+    """Map contribution numbers to states, rejecting oversized or malformed lists."""
+    if len(entries) > MAX_CONTRIBUTION_ENTRIES:
+        return (
+            None,
+            f"unreadable record {record_path}: exceeds {MAX_CONTRIBUTION_ENTRIES} entries",
+        )
+    states: dict[int, str] = {}
+    for item in entries[:MAX_CONTRIBUTION_ENTRIES]:
+        if not isinstance(item, dict):
+            return None, f"unreadable record {record_path}: contribution entry is not an object"
+        number = item.get("number")
+        state = item.get("state")
+        if type(number) is not int or number <= 0 or not isinstance(state, str):
+            return None, f"unreadable record {record_path}: malformed contribution entry"
+        if number in states:
+            return None, f"unreadable record {record_path}: duplicate contribution {number}"
+        states[number] = state
+    return states, None
+
+
+def _read_contribution_states(record_path: Path) -> tuple[dict[int, str] | None, str | None]:
+    """Read contribution states from record_path, returning (states, error_detail)."""
+    if not record_path.is_file():
+        return None, f"missing record {record_path}"
+    try:
+        raw = record_path.read_text(encoding="utf-8")
+        data = json.loads(raw, object_pairs_hook=refuse_duplicates)
+    except (OSError, UnicodeDecodeError, ValueError) as exc:
+        return None, f"unreadable record {record_path}: {exc}"
+    if not isinstance(data, dict) or not isinstance(data.get("contributions"), list):
+        return None, f"unreadable record {record_path}: invalid contributions list"
+    return _parse_contribution_states(data["contributions"], record_path)
+
+
+def _revisit_trigger_error(entry: dict[str, object], trigger: str, cause: str) -> str:
+    """Format one fired revisit-trigger diagnostic with its rule, function and fix."""
+    return (
+        f"exception ({entry.get('rule')}, {entry.get('function')}): "
+        f"{REVISIT_FIRED_PREFIX} for {trigger!r} ({cause}); "
+        "restate the reason and its revisit trigger"
+    )
+
+
+def _merge_trigger_cause(
+    number: int, states: dict[int, str] | None, record_error: str | None
+) -> str | None:
+    """Return the firing cause for a numbered merge trigger, or None while live."""
+    if record_error is not None or states is None:
+        return record_error or f"missing record {CONTRIBUTIONS}"
+    if number not in states:
+        return f"record {number} is not listed in {CONTRIBUTIONS}"
+    state = states[number]
+    if state not in MERGE_TRIGGER_LIVE_STATES:
+        return f"record {number} state is {state!r}"
+    return None
+
+
+def _reason_revisit_errors(
+    entry: dict[str, object],
+    status: object,
+    record_path: Path,
+    record_cache: list[tuple[dict[int, str] | None, str | None]],
+) -> list[str]:
+    """Return fired revisit-trigger messages for one exception entry."""
+    reason = entry.get("reason")
+    if not isinstance(reason, str):
+        return []
+    bounded = reason[:MAX_REASON_SCAN_CHARS]
+    errors: list[str] = []
+    if GOES_UPSTREAM_PATTERN.search(bounded) and status not in GOES_UPSTREAM_LIVE_STATUSES:
+        errors.append(
+            _revisit_trigger_error(entry, GOES_UPSTREAM_TRIGGER, f"sidecar status is {status!r}")
+        )
+    matches = list(MERGE_TRIGGER_PATTERN.finditer(bounded))[:MAX_TRIGGER_MATCHES]
+    for match in matches:
+        if not record_cache:
+            record_cache.append(_read_contribution_states(record_path))
+        states, record_error = record_cache[0]
+        cause = _merge_trigger_cause(int(match.group(1)), states, record_error)
+        if cause is not None:
+            errors.append(_revisit_trigger_error(entry, match.group(0), cause))
+    return errors
+
+
+def check_revisit_triggers(data: dict[str, object], path: Path, findings: Findings) -> None:
+    """Report exception reasons whose upstream or pull-request revisit trigger has fired."""
+    exceptions = data.get("exceptions")
+    if not isinstance(exceptions, list):
+        return
+    status = data.get("status")
+    record_path = path.parent.parent / CONTRIBUTIONS
+    record_cache: list[tuple[dict[int, str] | None, str | None]] = []
+    for entry in exceptions[:MAX_SERIES_EXCEPTIONS]:
+        if not isinstance(entry, dict):
+            continue
+        for message in _reason_revisit_errors(entry, status, record_path, record_cache):
+            findings.error(path.name, message)
+
+
 def check_metadata(path: Path, findings: Findings, today: date | None = None) -> None:
     """Validate one patch sidecar and record every metadata finding."""
     name = path.name
@@ -524,6 +636,7 @@ def check_metadata(path: Path, findings: Findings, today: date | None = None) ->
     check_master_metadata(data, name, findings)
     check_covered_by(data, name, findings)
     check_exceptions_metadata(data, name, findings, today)
+    check_revisit_triggers(data, path, findings)
 
 
 def check_covered_by(data: dict, name: str, findings: Findings) -> None:

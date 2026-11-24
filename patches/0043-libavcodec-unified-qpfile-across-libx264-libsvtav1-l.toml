@@ -26,8 +26,10 @@ while header-only records clear ROI offsets from that frame onward.
 
 Generic: carries no VMAFx or vmaf-tune identifiers and no downstream ADR \
 references. Sent upstream as FFmpeg pull request 25875 on 2026-11-08, one \
-commit per encoder (libaomenc, libsvtav1, libx264). Its head bd873d3a45 adds \
-what this patch does not carry yet: a configure check that limits the libaom \
+commit per encoder (libaomenc, libsvtav1, libx264). FFmpeg merged its head \
+bd873d3a45 on 2026-11-24 as master commits 90b56f64cee3, c605d33b0174 and \
+e5b51e8b609e; that merged form adds what this patch does not carry \
+yet: a configure check that limits the libaom \
 qpfile to libaom 3.13.0 or newer (older libaom refuses it with ENOSYS); a \
 libaom refusal of lag-in-frames other than 0; a libaom speed check that also \
 reads cpu-used set through aom-params; libx264 refusals without adaptive \
@@ -70,7 +72,7 @@ lines = 329
 category = "D"
 entered = "2026-10-31"
 expires = "2027-02-28"
-reason = "upstream function, 294 lines at the pinned base; the patch adds the -qpfile load inside it and keeps the upstream structure so the patch stays a small, reviewable change for upstream submission; splitting upstream code would make every FFmpeg release refresh conflict; category D, revisit when the patch goes upstream or at the expiry"
+reason = "upstream function, 294 lines at the pinned base; the patch adds the -qpfile load inside it and keeps the upstream structure; FFmpeg merged a later form of this change in pull request 25875 (master e5b51e8b609e), and the patch drops once the pinned base contains that commit; splitting upstream code would make every FFmpeg release refresh conflict; category D, revisit at the base bump that drops the patch or at the expiry"
 
 [[exceptions]]
 rule = "HISS-04"
@@ -80,7 +82,7 @@ lines = 142
 category = "D"
 entered = "2026-10-31"
 expires = "2027-02-28"
-reason = "upstream function, 136 lines at the pinned base; the patch adds the per-frame qpfile ROI apply call inside it and keeps the upstream structure so the patch stays a small, reviewable change for upstream submission; splitting upstream code would make every FFmpeg release refresh conflict; category D, revisit when the patch goes upstream or at the expiry"
+reason = "upstream function, 136 lines at the pinned base; the patch adds the per-frame qpfile ROI apply call inside it and keeps the upstream structure; FFmpeg merged a later form of this change in pull request 25875 (master e5b51e8b609e), and the patch drops once the pinned base contains that commit; splitting upstream code would make every FFmpeg release refresh conflict; category D, revisit at the base bump that drops the patch or at the expiry"
 
 [[exceptions]]
 rule = "HISS-04"
@@ -90,7 +92,7 @@ lines = 100
 category = "D"
 entered = "2026-10-31"
 expires = "2027-02-28"
-reason = "upstream function, 68 lines at the pinned base; the patch adds the -qpfile load inside it and keeps the upstream structure so the patch stays a small, reviewable change for upstream submission; splitting upstream code would make every FFmpeg release refresh conflict; category D, revisit when the patch goes upstream or at the expiry"
+reason = "upstream function, 68 lines at the pinned base; the patch adds the -qpfile load inside it and keeps the upstream structure; FFmpeg merged a later form of this change in pull request 25875 (master e5b51e8b609e), and the patch drops once the pinned base contains that commit; splitting upstream code would make every FFmpeg release refresh conflict; category D, revisit at the base bump that drops the patch or at the expiry"
 
 [[exceptions]]
 rule = "HISS-04"
@@ -100,7 +102,7 @@ lines = 101
 category = "D"
 entered = "2026-10-31"
 expires = "2027-02-28"
-reason = "upstream function, 69 lines at the pinned base; the patch adds the per-frame ROI event attach inside it and keeps the upstream structure so the patch stays a small, reviewable change for upstream submission; splitting upstream code would make every FFmpeg release refresh conflict; category D, revisit when the patch goes upstream or at the expiry"
+reason = "upstream function, 69 lines at the pinned base; the patch adds the per-frame ROI event attach inside it and keeps the upstream structure; FFmpeg merged a later form of this change in pull request 25875 (master e5b51e8b609e), and the patch drops once the pinned base contains that commit; splitting upstream code would make every FFmpeg release refresh conflict; category D, revisit at the base bump that drops the patch or at the expiry"
 
 [[exceptions]]
 rule = "HISS-04"
@@ -110,7 +112,7 @@ lines = 148
 category = "D"
 entered = "2026-10-31"
 expires = "2027-02-28"
-reason = "upstream function, 142 lines at the pinned base; the patch adds the per-frame qpfile offsets inside it and keeps the upstream structure so the patch stays a small, reviewable change for upstream submission; splitting upstream code would make every FFmpeg release refresh conflict; category D, revisit when the patch goes upstream or at the expiry"
+reason = "upstream function, 142 lines at the pinned base; the patch adds the per-frame qpfile offsets inside it and keeps the upstream structure; FFmpeg merged a later form of this change in pull request 25875 (master e5b51e8b609e), and the patch drops once the pinned base contains that commit; splitting upstream code would make every FFmpeg release refresh conflict; category D, revisit at the base bump that drops the patch or at the expiry"
 
 [[exceptions]]
 rule = "HISS-04"
@@ -120,4 +122,4 @@ lines = 397
 category = "D"
 entered = "2026-10-31"
 expires = "2027-02-28"
-reason = "upstream function, 372 lines at the pinned base; the patch adds the -qpfile load and macroblock-grid setup inside it and keeps the upstream structure so the patch stays a small, reviewable change for upstream submission; splitting upstream code would make every FFmpeg release refresh conflict; category D, revisit when the patch goes upstream or at the expiry"
+reason = "upstream function, 372 lines at the pinned base; the patch adds the -qpfile load and macroblock-grid setup inside it and keeps the upstream structure; FFmpeg merged a later form of this change in pull request 25875 (master e5b51e8b609e), and the patch drops once the pinned base contains that commit; splitting upstream code would make every FFmpeg release refresh conflict; category D, revisit at the base bump that drops the patch or at the expiry"

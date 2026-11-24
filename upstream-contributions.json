@@ -1,5 +1,5 @@
 {
-  "checked": "2026-11-20",
+  "checked": "2026-11-24",
   "contributions": [
     {
       "number": 24045,
@@ -2160,9 +2160,9 @@
       "url": "https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25875",
       "title": "avcodec: add a qpfile option to libaom-av1, libsvtav1 and libx264",
       "base": "master",
-      "state": "open",
-      "merged_at": "",
-      "merged_commit": "",
+      "state": "merged",
+      "merged_at": "2026-11-24T05:15:49Z",
+      "merged_commit": "e5b51e8b609e8bc5667f07d4c5a6eaeccedb9f1c",
       "in_release": "",
       "patch": "0043-libavcodec-unified-qpfile-across-libx264-libsvtav1-l.patch",
       "project": "vmafx",

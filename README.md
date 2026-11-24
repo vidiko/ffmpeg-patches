@@ -501,11 +501,11 @@ without a series patch is a change the series does not carry.
 | [25536](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25536) | `master` | open | avcodec/wmalosslessdec: Clear subframe flags as an array | 0039 |
 | [25708](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25708) | `master` | open | avfilter/vf_libvmaf: accept more planar CUDA formats and copy all planes | 0040, 0041 |
 | [25867](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25867) | `master` | open | avfilter/vf_zscale: keep the light levels when linearising | 0014 |
-| [25875](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25875) | `master` | open | avcodec: add a qpfile option to libaom-av1, libsvtav1 and libx264 | 0043 |
+| [25875](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25875) | `master` | merged 2026-11-24 (`e5b51e8b609e`), in no release yet | avcodec: add a qpfile option to libaom-av1, libsvtav1 and libx264 | 0043 |
 | [25879](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25879) | `master` | open | avfilter/vf_hqdn3d_vulkan: add a Vulkan hqdn3d filter | 0023 |
 | [25885](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/25885) | `master` | open | avfilter/vf_tonemap: add the bt2408_hable tone map | 0012, 0013 |
 
-State read from the FFmpeg forge on 2026-11-20.
+State read from the FFmpeg forge on 2026-11-24.
 <!-- upstream-contributions:end -->
 
 A pull request against a release branch is a backport. It reaches a pinned

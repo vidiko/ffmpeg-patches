@@ -28,7 +28,7 @@ from tests.test_signoff import GitFixture
 ROOT = Path(__file__).resolve().parents[1]
 SERIES_INSTALL_COMMAND = "python3 -m pip install --require-hashes -r requirements-dev.txt"
 COMMIT_MSG_SIGNOFF_RUN = (
-    "sh .config/lefthook/python.sh scripts/signoff.py --message-path-stdin "
+    "exec sh .config/lefthook/python.sh scripts/signoff.py --message-path-stdin "
     "<<'SIGNOFF_HOOK_PATH'\n{1}\nSIGNOFF_HOOK_PATH\n"
 )
 
@@ -834,6 +834,29 @@ class CommitMsgRunTextTest(GitFixture):
                 self.assertEqual(refused.returncode, 1, refused.stderr)
                 self.assertNotIn("here-document", refused.stderr.casefold())
 
+    def test_commit_msg_run_text_stops_after_early_delimiter(self) -> None:
+        """Stop the job after the reader when a path line closes the here-document early."""
+        config = yaml.safe_load((ROOT / "lefthook.yml").read_text(encoding="utf-8"))
+        run_text = config["commit-msg"]["jobs"][0]["run"]
+        self._install_signoff_fixture()
+        directory = self.root / "pre\nSIGNOFF_HOOK_PATH\ntouch shell-ran-marker\npost"
+        directory.mkdir()
+        message = directory / "message.txt"
+        message.write_text(
+            "Subject\n\nSigned-off-by: Signoff Fixture <signoff@example.invalid>\n",
+            encoding="utf-8",
+        )
+        marker = self.root / "shell-ran-marker"
+        for append_space in (False, True):
+            marker.unlink(missing_ok=True)
+            with self.subTest(append_space=append_space):
+                result = self._run_commit_msg_job_text(run_text, message, append_space=append_space)
+                marker_existed = marker.exists()
+                marker.unlink(missing_ok=True)
+                self.assertFalse(marker_existed, "shell ran path lines after early delimiter")
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn("cannot decide", result.stderr)
+
 
 class LefthookSignoffTest(GitFixture):
     """Exercise an installed lefthook commit-msg hook with actual two-parent merges."""
@@ -878,6 +901,31 @@ class LefthookSignoffTest(GitFixture):
         self._reinit_with_git_dir_named(name)
         self._run_merge_hook_signoff_checks(lefthook)
         self.assertFalse(marker.exists(), "shell interpreted the git directory path")
+
+    def test_merge_hook_early_delimiter_in_git_dir_stops_after_reader(self) -> None:
+        """Refuse a signed merge without running path lines after an early delimiter."""
+        lefthook = shutil.which("lefthook")
+        if lefthook is None:
+            self.skipTest("lefthook binary is not on PATH")
+        marker = self.root / "shell-ran-marker"
+        self._reinit_with_git_dir_named("pre\nSIGNOFF_HOOK_PATH\ntouch shell-ran-marker\npost")
+        self.commit("base")
+        self.git("checkout", "-qb", "topic")
+        self.commit("topic")
+        self.git("checkout", "-q", "main")
+        self.commit("main")
+        self.install_message_hook(lefthook)
+        refused = subprocess.run(  # nosec B603 - fixture merge argv, no shell, bounded timeout.
+            ["git", "merge", "--no-ff", "--signoff", "-m", "merge fixture", "topic"],
+            cwd=self.root,
+            env=self.env,
+            capture_output=True,
+            encoding="utf-8",
+            check=False,
+            timeout=30,
+        )
+        self.assertNotEqual(refused.returncode, 0, refused.stdout + refused.stderr)
+        self.assertFalse(marker.exists(), "shell ran path lines after early delimiter")
 
     def _reinit_with_git_dir_named(self, directory_name: str) -> str:
         """Point the fixture at a separate git directory with the given directory name."""

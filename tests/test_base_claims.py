@@ -913,6 +913,112 @@ class BaseClaimsTest(unittest.TestCase):
         depths = base_claims._dependency_bracket_depths("x)y")
         self.assertEqual(depths[2], 0)
 
+    def test_dependency_nested_bracket_annotation_rejects_hidden_member(self) -> None:
+        """An inner bracket inside an annotation does not shorten hidden-member rejection."""
+        text = "Depends on #12 ([notes], and #13 head bbbbbbb)."
+        with self.assertRaisesRegex(ValueError, r"#12.*#13"):
+            base_claims.find_dependency_claims(text)
+        with self.assertRaisesRegex(ValueError, r"#12.*#13"):
+            base_claims._dependency_numbers([("body", text)])
+
+    def test_dependency_closed_nested_annotation_stops_at_see_prose(self) -> None:
+        """A closed nested annotation keeps its claim while flat hidden prose still fails."""
+        boundary = "Depends on #12 (head aaaaaaa [rebased]), see #14 for benchmarks."
+        self.assertEqual(base_claims.find_dependency_claims(boundary), [(12, "aaaaaaa")])
+        self.assertEqual(base_claims._dependency_numbers([("body", boundary)]), [12])
+        with self.assertRaisesRegex(ValueError, r"#12.*#13"):
+            base_claims.find_dependency_claims("Depends on #12 (notes, and #13 head bbbbbbb).")
+
+    def test_dependency_truncated_list_joined_by_and_raises(self) -> None:
+        """A truncated list joined by and rejects the hidden following member."""
+        text = "Depends on #12 ~ head aaaaaaa and #13 (head bbbbbbb)."
+        with self.assertRaisesRegex(ValueError, r"#12.*#13"):
+            base_claims.find_dependency_claims(text)
+        with self.assertRaisesRegex(ValueError, r"#12.*#13"):
+            base_claims._dependency_numbers([("body", text)])
+
+    def test_dependency_truncated_list_joined_by_ampersand_raises(self) -> None:
+        """A truncated list joined by ampersand rejects the hidden following member."""
+        text = "Depends on #12 ~ head aaaaaaa & #13 (head bbbbbbb)."
+        with self.assertRaisesRegex(ValueError, r"#12.*#13"):
+            base_claims.find_dependency_claims(text)
+        with self.assertRaisesRegex(ValueError, r"#12.*#13"):
+            base_claims._dependency_numbers([("body", text)])
+
+    def test_dependency_truncated_list_continuation_without_brackets_raises(self) -> None:
+        """Truncated continuations across and or ampersand fail without outer brackets."""
+        cases = (
+            ("Depends on #12 ~ head aaaaaaa and #13.", r"#12.*#13"),
+            ("Depends on #12 ~ head aaaaaaa & #13.", r"#12.*#13"),
+            ("Depends on #12 (head aaaaaaa), #13: aaaaaaa and #14 (head bbbbbbb).", r"#12.*#14"),
+            ("Depends on #12 ~ [notes, see more] and #13 (head bbbbbbb).", r"#12.*#13"),
+        )
+        for text, pattern in cases:
+            with self.subTest(text=text), self.assertRaisesRegex(ValueError, pattern):
+                base_claims.find_dependency_claims(text)
+
+    def test_dependency_separator_prose_stops_and_valid_and_member(self) -> None:
+        """Prose after comma or and stops the list while valid and members claim both."""
+        for text in (
+            "Depends on #12 (head aaaaaaa), see #14 for benchmarks.",
+            "Depends on #12 (head aaaaaaa) and see #14 for benchmarks.",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(base_claims.find_dependency_claims(text), [(12, "aaaaaaa")])
+                self.assertEqual(base_claims._dependency_numbers([("body", text)]), [12])
+        both = "Depends on #12 (head aaaaaaa) and #13 (head bbbbbbb)."
+        self.assertEqual(
+            base_claims.find_dependency_claims(both), [(12, "aaaaaaa"), (13, "bbbbbbb")]
+        )
+        self.assertEqual(base_claims._dependency_numbers([("body", both)]), [12, 13])
+
+    def test_dependency_separated_member_helper(self) -> None:
+        """The shared separator helper distinguishes members, prose, brackets and empty tails."""
+        for separator in (", ", " and ", " & ", ", and "):
+            sample = f"Depends on #12{separator}#13"
+            depths = base_claims._dependency_bracket_depths(sample)
+            match = base_claims._dependency_separated_member(sample, depths, 14, len(sample))
+            self.assertEqual(None if match is None else match.group(1), "13")
+        for prose in ("Depends on #12, see #14 and #15", "Depends on #12 and see #14"):
+            depths = base_claims._dependency_bracket_depths(prose)
+            self.assertIsNone(
+                base_claims._dependency_separated_member(prose, depths, 14, len(prose))
+            )
+        bracketed = "Depends on #12 (notes, and #13"
+        depths = base_claims._dependency_bracket_depths(bracketed)
+        self.assertIsNone(
+            base_claims._dependency_separated_member(bracketed, depths, 14, len(bracketed))
+        )
+        empty = "Depends on #12"
+        depths = base_claims._dependency_bracket_depths(empty)
+        self.assertIsNone(
+            base_claims._dependency_separated_member(empty, depths, len(empty), len(empty))
+        )
+
+    def test_dependency_comma_previously_before_later_lead_is_historical(self) -> None:
+        """A comma-separated previously marker before a later lead suppresses its head."""
+        text = "Depends on #12 (head aaaaaaa), previously stacked on #13 (head bbbbbbb)."
+        self.assertEqual(base_claims.find_dependency_claims(text), [(12, "aaaaaaa")])
+        self.assertEqual(base_claims._dependency_numbers([("body", text)]), [12])
+
+    def test_dependency_semicolon_previously_before_later_lead_is_historical(self) -> None:
+        """A semicolon-separated previously marker before a later lead suppresses its head."""
+        text = "Depends on #12 (head aaaaaaa); previously stacked on #13 (head bbbbbbb)."
+        self.assertEqual(base_claims.find_dependency_claims(text), [(12, "aaaaaaa")])
+        self.assertEqual(base_claims._dependency_numbers([("body", text)]), [12])
+        self.assertEqual(base_claims._sentence_dependencies(text), [(12, "aaaaaaa")])
+
+    def test_dependency_later_current_lead_keeps_claim_after_first_lead(self) -> None:
+        """Later coordinated current leads keep their claims without inheriting first history."""
+        both = "Depends on #12 (head aaaaaaa), and now depends on #13 (head bbbbbbb)."
+        self.assertEqual(
+            base_claims.find_dependency_claims(both), [(12, "aaaaaaa"), (13, "bbbbbbb")]
+        )
+        self.assertEqual(base_claims._dependency_numbers([("body", both)]), [12, 13])
+        split = "Previously stacked on #12 and now depends on #13 (head bbbbbbb)."
+        self.assertEqual(base_claims.find_dependency_claims(split), [(13, "bbbbbbb")])
+        self.assertEqual(base_claims._dependency_numbers([("body", split)]), [13])
+
     def test_dependency_list_current_depends_on_two_members_unchanged(self) -> None:
         """Depends on #12 and #13 still lists both numbers without a historical lead."""
         text = "Depends on #12 and #13."
@@ -1130,9 +1236,13 @@ class BaseClaimsTest(unittest.TestCase):
         """Malformed dependency mappings and stdin paths return input errors."""
         for value in ("12", "x=file", "0=file", "-1=file", "12345678=file", "12=", "12=-"):
             with self.subTest(value=value):
-                rc, err = self.run_cli("--merge-base", MERGE_BASE, "--dependency-json", value)
+                rc, err = self.run_cli("--merge-base", MERGE_BASE, f"--dependency-json={value}")
                 self.assertEqual(rc, 2)
                 self.assertIn("N=PATH", err)
+        with self.subTest(separated="x=file"):
+            rc, err = self.run_cli("--merge-base", MERGE_BASE, "--dependency-json", "x=file")
+            self.assertEqual(rc, 2)
+            self.assertIn("N=PATH", err)
 
     def test_dependency_cli_repeated_number(self) -> None:
         """Repeated dependency PR options are rejected even for the same file."""

@@ -32,7 +32,7 @@ DEPENDENCY_REFERENCE = re.compile(
     r"\s+" + DEPENDENCY_MEMBER.pattern,
     re.IGNORECASE,
 )
-DEPENDENCY_SEPARATOR = re.compile(r"\s*(?:,\s*(?:and\s+)?|and\s+|&\s*)", re.IGNORECASE)
+DEPENDENCY_SEPARATOR = re.compile(r"\s*(?:,\s*(?:and\s+)?|\band\s+|&\s*)", re.IGNORECASE)
 DEPENDENCY_HEAD = re.compile(
     r"\b(?:head|ending\s+at|ends\s+at|tip)\b[\s:(]*([0-9a-f]{7,40})\b", re.IGNORECASE
 )
@@ -259,14 +259,25 @@ def _dependency_list_lead_historical(
 def _dependency_lead_annotation_end(
     sentence: str, depths: list[int], member_start: int, end: int
 ) -> int:
-    """Return the end of any bracketed annotation opened before the first depth-zero prose gap."""
+    """Return the furthest bracketed annotation end before any depth-zero prose gap."""
     cursor = member_start
     for index in range(member_start, end):
         if _dependency_prose_break(sentence, depths, index):
             return cursor
         if sentence[index] in "([":
-            cursor = _dependency_bracket_extent(sentence, index, end)
+            cursor = max(cursor, _dependency_bracket_extent(sentence, index, end))
     return cursor
+
+
+def _dependency_separated_member(
+    sentence: str, depths: list[int], start: int, end: int
+) -> re.Match[str] | None:
+    """Return the member after the next depth-zero list separator, or None on prose."""
+    for separator in DEPENDENCY_SEPARATOR.finditer(sentence, start, end):
+        if depths[separator.start()] != 0:
+            continue
+        return DEPENDENCY_MEMBER.match(sentence, separator.end(), end)
+    return None
 
 
 def _dependency_hidden_scan_end(
@@ -275,36 +286,25 @@ def _dependency_hidden_scan_end(
     """Extend hidden-member scans through unparsed depth-zero separator-led continuations."""
     cursor = list_parse_end
     for _ in range(end - list_parse_end + 1):
-        extended = False
-        for separator in DEPENDENCY_SEPARATOR.finditer(sentence, cursor, end):
-            if not _dependency_prose_break(sentence, depths, separator.start()):
-                continue
-            member = DEPENDENCY_MEMBER.match(sentence, separator.end(), end)
-            if member is None:
-                break
-            next_end = _dependency_member_end(sentence, depths, member.end(), end)
-            cursor = max(member.end(), next_end)
-            extended = True
+        member = _dependency_separated_member(sentence, depths, cursor, end)
+        if member is None:
             break
-        if not extended:
-            break
+        next_end = _dependency_member_end(sentence, depths, member.end(), end)
+        cursor = max(member.end(), next_end)
     return cursor
 
 
 def _reject_hidden_dependency_members(
     sentence: str,
     depths: list[int],
-    first: re.Match[str],
+    members: list[tuple[re.Match[str], int]],
     end: int,
-    parsed_starts: set[int],
 ) -> None:
-    """Reject unparsed members at prose boundaries or inside lead annotations."""
-    for separator in DEPENDENCY_SEPARATOR.finditer(sentence, first.end(), end):
-        if not _dependency_prose_break(sentence, depths, separator.start()):
-            continue
-        member = DEPENDENCY_MEMBER.match(sentence, separator.end(), end)
-        if member is not None and member.start() not in parsed_starts:
-            raise _dependency_attribution_error(sentence, first, end)
+    """Reject unparsed members after depth-zero separators or inside lead annotations."""
+    first = members[0][0]
+    if _dependency_separated_member(sentence, depths, members[-1][1], end) is not None:
+        raise _dependency_attribution_error(sentence, first, end)
+    parsed_starts = {reference.start() for reference, _ in members[1:]}
     for member in DEPENDENCY_MEMBER.finditer(sentence, first.end(), end):
         if member.start() in parsed_starts or member.start() <= first.start():
             continue
@@ -341,6 +341,21 @@ def _reject_unpaired_dependency_heads(
                 )
 
 
+def _dependency_lead_start(
+    sentence: str,
+    depths: list[int],
+    references: list[re.Match[str]],
+    index: int,
+) -> int:
+    """Start a dependency lead's history window at its depth-zero clause boundary."""
+    first = references[index]
+    if index == 0:
+        return _dependency_clause_start(sentence, depths, 0, first.start())
+    return _dependency_clause_start(
+        sentence, depths, references[index - 1].end(), first.start(), first.start()
+    )
+
+
 def _dependency_lists(
     sentence: str, depths: list[int] | None = None
 ) -> Iterator[tuple[list[tuple[re.Match[str], int]], int, int]]:
@@ -350,11 +365,7 @@ def _dependency_lists(
     references = list(DEPENDENCY_REFERENCE.finditer(sentence))
     for index, first in enumerate(references):
         list_end = references[index + 1].start() if index + 1 < len(references) else len(sentence)
-        lead_start = (
-            first.start()
-            if index > 0
-            else _dependency_clause_start(sentence, depths, 0, first.start())
-        )
+        lead_start = _dependency_lead_start(sentence, depths, references, index)
         reference = first
         members = []
         for _ in range(list_end - reference.end() + 1):
@@ -367,18 +378,17 @@ def _dependency_lists(
             if following is None:
                 break
             reference = following
-        parsed_starts = {reference.start() for reference, _ in members[1:]}
-        list_parse_end = members[-1][1]
         lead_historical = _dependency_list_lead_historical(
             sentence, depths, first, lead_start, list_end
         )
         if not lead_historical:
-            prose_end = _dependency_hidden_scan_end(sentence, depths, list_parse_end, list_end)
+            prose_end = _dependency_hidden_scan_end(sentence, depths, members[-1][1], list_end)
             annotation_end = _dependency_lead_annotation_end(
                 sentence, depths, first.end(), list_end
             )
-            scan_end = max(prose_end, annotation_end)
-            _reject_hidden_dependency_members(sentence, depths, first, scan_end, parsed_starts)
+            _reject_hidden_dependency_members(
+                sentence, depths, members, max(prose_end, annotation_end)
+            )
         if len(members) == 1:
             members[0] = (members[0][0], list_end)
         if not lead_historical:

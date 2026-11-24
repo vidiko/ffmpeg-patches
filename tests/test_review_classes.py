@@ -6,8 +6,10 @@ from __future__ import annotations
 
 import ast
 import copy
+import sys
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 
 import yaml
@@ -232,3 +234,86 @@ class ReviewClassesTest(unittest.TestCase):
         self.path.write_bytes(data + padding + b"x")
         with self.assertRaisesRegex(ValueError, "size exceeds"):
             review_classes.load_classes(self.path)
+
+
+class SiblingModuleTest(unittest.TestCase):
+    """Verify sys.modules registration and error cleanup in sibling_module."""
+
+    def test_sibling_module_registers_frozen_dataclass(self) -> None:
+        """Register a sibling helper before exec_module so frozen dataclasses load."""
+        with tempfile.TemporaryDirectory() as scratch:
+            root = Path(scratch)
+            (root / "sample_helper.py").write_text(
+                "from __future__ import annotations\n"
+                "from dataclasses import KW_ONLY, dataclass\n\n"
+                "@dataclass(frozen=True)\n"
+                "class Item:\n"
+                "    _: KW_ONLY\n"
+                "    label: str = 'ok'\n",
+                encoding="utf-8",
+            )
+            spec_name = "_ffmpeg_sample_helper"
+            self.addCleanup(sys.modules.pop, spec_name, None)
+            self.addCleanup(sys.modules.pop, "sample_helper", None)
+            sys.modules.pop(spec_name, None)
+            fake_file = str(root / "review_classes.py")
+            with unittest.mock.patch.object(review_classes, "__file__", fake_file):
+                module = review_classes.sibling_module("sample_helper")
+            item = module.Item()
+            self.assertEqual(item.label, "ok")
+            self.assertIs(sys.modules.get(spec_name), module)
+
+    def test_sibling_module_clears_entry_on_exec_error(self) -> None:
+        """Remove the spec entry from sys.modules when helper execution raises."""
+        with tempfile.TemporaryDirectory() as scratch:
+            root = Path(scratch)
+            (root / "broken_helper.py").write_text(
+                "from __future__ import annotations\n"
+                "from dataclasses import KW_ONLY, dataclass\n\n"
+                "@dataclass(frozen=True)\n"
+                "class Item:\n"
+                "    _: KW_ONLY\n"
+                "    label: str = 'ok'\n\n"
+                "Item()\n"
+                'raise RuntimeError("planted")\n',
+                encoding="utf-8",
+            )
+            spec_name = "_ffmpeg_broken_helper"
+            self.addCleanup(sys.modules.pop, spec_name, None)
+            self.addCleanup(sys.modules.pop, "broken_helper", None)
+            sys.modules.pop(spec_name, None)
+            fake_file = str(root / "review_classes.py")
+            with (
+                unittest.mock.patch.object(review_classes, "__file__", fake_file),
+                self.assertRaisesRegex(RuntimeError, "^planted$"),
+            ):
+                review_classes.sibling_module("broken_helper")
+            self.assertNotIn(spec_name, sys.modules)
+
+    def test_sibling_module_missing_file_leaves_no_entry(self) -> None:
+        """Raise on a missing sibling helper and leave no sys.modules entry behind."""
+        with tempfile.TemporaryDirectory() as scratch:
+            root = Path(scratch)
+            spec_name = "_ffmpeg_missing_helper"
+            self.addCleanup(sys.modules.pop, spec_name, None)
+            self.addCleanup(sys.modules.pop, "missing_helper", None)
+            sys.modules.pop(spec_name, None)
+            fake_file = str(root / "review_classes.py")
+            with (
+                unittest.mock.patch.object(review_classes, "__file__", fake_file),
+                self.assertRaises((FileNotFoundError, ValueError)),
+            ):
+                review_classes.sibling_module("missing_helper")
+            self.assertNotIn(spec_name, sys.modules)
+
+    def test_sibling_module_loads_lane_brief_tool_spec(self) -> None:
+        """Load lane_brief via sibling_module and construct an empty ToolSpec."""
+        spec_name = "_ffmpeg_lane_brief"
+        self.addCleanup(sys.modules.pop, spec_name, None)
+        if "lane_brief" not in sys.modules:
+            self.addCleanup(sys.modules.pop, "lane_brief", None)
+        sys.modules.pop(spec_name, None)
+        module = review_classes.sibling_module("lane_brief")
+        tool_spec = module.ToolSpec()
+        self.assertIsInstance(tool_spec, module.ToolSpec)
+        self.assertIs(sys.modules.get(spec_name), module)

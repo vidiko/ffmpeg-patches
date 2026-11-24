@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import importlib.util
 import re
+import sys
 from pathlib import Path
 from types import ModuleType
 
@@ -17,13 +18,18 @@ CHECK = re.compile(r"(?:upstream-lint|variant-sweep):[a-z][a-z0-9-]*|script:[\w.
 
 
 def sibling_module(name: str) -> ModuleType:
-    """Load a trusted helper by resolved sibling path under isolated Python."""
+    """Load and register a trusted sibling helper, clearing its entry on failure."""
     path = Path(__file__).resolve().with_name(f"{name}.py")
     spec = importlib.util.spec_from_file_location(f"_ffmpeg_{name}", path)
     if spec is None or spec.loader is None:
         raise ValueError(f"cannot load helper: {path}")
     module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    sys.modules[spec.name] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        sys.modules.pop(spec.name, None)
+        raise
     return module
 
 

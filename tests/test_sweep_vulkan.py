@@ -1551,6 +1551,102 @@ class VulkanSweepTest(unittest.TestCase):
             with self.subTest(label=label):
                 self.assertEqual(sweep_port_parity.cpu_sites(source), expected)
 
+    def test_cr20_for_init_member_mask_ignored(self) -> None:
+        """CR20 F1-F2: for-init bound read ignores masks on arrow and dot struct members."""
+        cases = [
+            (
+                "arrow_member",
+                "void f(void)\n{\n    for (int v = src[0]; (p->v & 0xff) != 0; v++) {}\n}\n",
+                [],
+            ),
+            (
+                "dot_member",
+                "void f(void)\n{\n    for (int v = src[0]; (s.v & 0xff) != 0; v++) {}\n}\n",
+                [],
+            ),
+        ]
+        for label, source, expected in cases:
+            with self.subTest(label=label):
+                self.assertEqual(sweep_port_parity.cpu_sites(source), expected)
+
+    def test_cr20_for_init_spaced_member_mask_ignored(self) -> None:
+        """CR20 F3-F4: for-init bound read ignores masks on spaced arrow and dot members."""
+        cases = [
+            (
+                "spaced_arrow_member",
+                "void f(void)\n{\n    for (int v = src[0]; (p -> v & 0xff) != 0; v++) {}\n}\n",
+                [],
+            ),
+            (
+                "spaced_dot_member",
+                "void f(void)\n{\n    for (int v = src[0]; (s . v & 0xff) != 0; v++) {}\n}\n",
+                [],
+            ),
+        ]
+        for label, source, expected in cases:
+            with self.subTest(label=label):
+                self.assertEqual(sweep_port_parity.cpu_sites(source), expected)
+
+    def test_cr20_for_init_member_shift_ignored(self) -> None:
+        """CR20 F5: for-init bound read ignores shift on an arrow struct member."""
+        source = "void f(void)\n{\n    for (int v = src[0]; (p->v >> 2) != 0; v++) {}\n}\n"
+        self.assertEqual(sweep_port_parity.cpu_sites(source), [])
+
+    def test_cr20_for_init_increment_member_mask_ignored(self) -> None:
+        """CR20 F6: for-init bound read ignores member mask in the increment clause."""
+        source = "void f(void)\n{\n    for (int v = src[0]; v; p->v = p->v & 0x0f) {}\n}\n"
+        self.assertEqual(sweep_port_parity.cpu_sites(source), [])
+
+    def test_cr20_for_init_member_skipped_keeps_later_bound_use(self) -> None:
+        """CR20 F7: skipping a member mask preserves a later shift on the loop variable."""
+        source = (
+            "void f(void)\n{\n    for (int v = src[0]; (p->v & 0xff) != 0 && (v >> 1); v++) {}\n}\n"
+        )
+        self.assertEqual(sweep_port_parity.cpu_sites(source), [(3, "shift")])
+
+    def test_cr20_for_init_bound_use_regressions(self) -> None:
+        """CR20 F8: non-member bound uses and non-matching member bases keep expected sites."""
+        cases = [
+            (
+                "cond_mask",
+                "void f(void)\n{\n    for (int v = src[0]; (v & 0xff) != 0; v++) {}\n}\n",
+                [(3, "mask")],
+            ),
+            (
+                "incr_mask",
+                "void f(void)\n{\n    for (int v = src[0]; v; v = v & 0x0f) {}\n}\n",
+                [(3, "mask")],
+            ),
+            (
+                "other_member_then_bound_mask",
+                (
+                    "void f(void)\n"
+                    "{\n"
+                    "    for (int v = src[0]; (p->w & 0xff) != 0 && (v & 0xff); v++) {}\n"
+                    "}\n"
+                ),
+                [(3, "mask")],
+            ),
+            (
+                "index_by_bound",
+                "void f(void)\n{\n    for (int v = src[0]; (a[v] & 0xff) != 0; v++) {}\n}\n",
+                [],
+            ),
+            (
+                "bound_arrow_base",
+                "void f(void)\n{\n    for (int v = src[0]; (v->x & 0xff) != 0; v++) {}\n}\n",
+                [],
+            ),
+            (
+                "bound_dot_base",
+                "void f(void)\n{\n    for (int v = src[0]; (v.x & 0xff) != 0; v++) {}\n}\n",
+                [],
+            ),
+        ]
+        for label, source, expected in cases:
+            with self.subTest(label=label):
+                self.assertEqual(sweep_port_parity.cpu_sites(source), expected)
+
     def test_cr10_4658985429_linked_shaders_dedupes_repeated_symbols(self) -> None:
         """CR10-5429: repeated extern and use symbols link one shader path in first-seen order."""
         c_source = (

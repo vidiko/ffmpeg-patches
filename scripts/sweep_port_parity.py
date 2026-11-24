@@ -364,8 +364,18 @@ def for_init_bound_name(
     return None
 
 
+def _follows_member_operator(statement: str, name_start: int, floor: int) -> bool:
+    """Return whether non-space text before name_start ends with '->' or '.'."""
+    precede = _non_space_index(statement, name_start - 1, floor)
+    if precede is None:
+        return False
+    if statement[precede] == ".":
+        return True
+    return precede > 0 and statement[precede - 1 : precede + 1] == "->"
+
+
 def bound_variable_operator_focus(statement: str, name: str, init_end: int, header_end: int) -> str:
-    """Return attached mask or shift text from later whole-word uses of one loop variable."""
+    """Return attached mask or shift text from later non-member uses of one loop variable."""
     pieces: list[str] = []
     index = init_end
     name_len = len(name)
@@ -376,6 +386,9 @@ def bound_variable_operator_focus(statement: str, name: str, init_end: int, head
         if hit < 0:
             break
         if not _whole_word_at(statement, hit, name):
+            index = hit + 1
+            continue
+        if _follows_member_operator(statement, hit, init_end):
             index = hit + 1
             continue
         pieces.append(attached_operator_text(statement, hit, hit + name_len))

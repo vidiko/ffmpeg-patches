@@ -1488,6 +1488,69 @@ class VulkanSweepTest(unittest.TestCase):
             with self.subTest(label=label):
                 self.assertEqual(sweep_port_parity.cpu_sites(source), expected)
 
+    def test_cr19_for_init_member_assign_not_bound(self) -> None:
+        """CR19 F1: for-init on p->x does not bind mask on unrelated identifier x."""
+        source = "void f(void)\n{\n    for (p->x = src[0]; (x & 0xff) != 0; ) {}\n}\n"
+        self.assertEqual(sweep_port_parity.cpu_sites(source), [])
+
+    def test_cr19_for_init_dot_member_assign_not_bound(self) -> None:
+        """CR19 F2: for-init on s.x does not bind mask on unrelated identifier x."""
+        source = "void f(void)\n{\n    for (s.x = src[0]; (x & 0xff) != 0; ) {}\n}\n"
+        self.assertEqual(sweep_port_parity.cpu_sites(source), [])
+
+    def test_cr19_for_init_deref_assign_not_bound(self) -> None:
+        """CR19 F3: for-init on *q does not bind mask on unrelated identifier q."""
+        source = "void f(void)\n{\n    for (*q = src[0]; (q & 0xff) != 0; ) {}\n}\n"
+        self.assertEqual(sweep_port_parity.cpu_sites(source), [])
+
+    def test_cr19_for_init_declarator_binding_regressions(self) -> None:
+        """CR19 F4: declared for-init names still bind and classify header operand reads."""
+        cases = [
+            (
+                "mask_int_v",
+                "void f(void)\n{\n    for (int v = src[0]; (v & 0xFFF0u) != 0; v++) {}\n}\n",
+                [(3, "mask")],
+            ),
+            (
+                "mask_multi_init",
+                "void f(void)\n{\n    for (int i = 0, v = src[0]; (v & 0xff) != 0; i++) {}\n}\n",
+                [(3, "mask")],
+            ),
+            (
+                "shift_multi_decl",
+                "void f(void)\n{\n    for (int v = src[0], w = 0; (v >> 2) != 0; v++) {}\n}\n",
+                [(3, "shift")],
+            ),
+            (
+                "mask_uint8",
+                "void f(void)\n{\n    for (uint8_t v = src[0]; (v & 0x0f) != 0; v++) {}\n}\n",
+                [(3, "mask")],
+            ),
+            (
+                "shift_const_int",
+                "void f(void)\n{\n    for (const int v = src[0]; (v >> 1) != 0; ) {}\n}\n",
+                [(3, "shift")],
+            ),
+            (
+                "mask_cond_only",
+                "void f(void)\n{\n    for (int v = src[0]; v; v = v & 0x0f) {}\n}\n",
+                [(3, "mask")],
+            ),
+            (
+                "mask_plain_assign",
+                "void f(void)\n{\n    for (v = src[0]; v & 0x3ff; v--) {}\n}\n",
+                [(3, "mask")],
+            ),
+            (
+                "no_bind_rhs_arithmetic",
+                "void f(void)\n{\n    for (int v = src[0] + 1; (v & 0xff) != 0; v++) {}\n}\n",
+                [],
+            ),
+        ]
+        for label, source, expected in cases:
+            with self.subTest(label=label):
+                self.assertEqual(sweep_port_parity.cpu_sites(source), expected)
+
     def test_cr10_4658985429_linked_shaders_dedupes_repeated_symbols(self) -> None:
         """CR10-5429: repeated extern and use symbols link one shader path in first-seen order."""
         c_source = (

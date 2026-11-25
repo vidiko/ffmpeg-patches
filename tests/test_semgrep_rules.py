@@ -12,6 +12,7 @@ import shutil
 import subprocess  # nosec B404 - subprocess run for semgrep CLI tool.
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 
 from scripts import upstream_lint
@@ -442,6 +443,145 @@ def case_ok_cleanup_after_with_block(self):
     path.unlink()
 """
 
+BASE_EXCEPTION_HANDLER_FIXTURE = """# SPDX-License-Identifier: EUPL-1.2
+\"\"\"Fixture functions for base-exception-handler-without-reraise semgrep rule testing.\"\"\"
+
+failure = None
+
+
+def case_flagged_base_exception_swallow():
+    \"\"\"Flagged: except BaseException assigns without re-raise.\"\"\"
+    global failure
+    try:
+        raise RuntimeError("boom")
+    except BaseException as exc:
+        failure = exc
+
+
+def case_flagged_base_exception_record_return():
+    \"\"\"Flagged: except BaseException records then returns instead of re-raising.\"\"\"
+    global failure
+    try:
+        raise RuntimeError("boom")
+    except BaseException as exc:
+        failure = exc
+        return
+
+
+def case_flagged_base_exception_record_nested_raise():
+    \"\"\"Flagged: except BaseException records then raises only under a nested block.\"\"\"
+    try:
+        raise RuntimeError("boom")
+    except BaseException as exc:
+        failure = exc
+        if True:
+            raise
+
+
+def case_ok_base_exception_record_raise():
+    \"\"\"OK: except BaseException records the exception then re-raises at the same indent.\"\"\"
+    global failure
+    try:
+        raise RuntimeError("boom")
+    except BaseException as exc:
+        failure = exc
+        raise
+
+
+def case_ok_base_exception_append_raise():
+    \"\"\"OK: except BaseException appends the exception then re-raises at the same indent.\"\"\"
+    recorded: list[object] = []
+    try:
+        raise RuntimeError("boom")
+    except BaseException as exc:
+        recorded.append(exc)
+        raise
+
+
+def case_flagged_bare_except_swallow():
+    \"\"\"Flagged: bare except assigns without re-raise.\"\"\"
+    global failure
+    try:
+        raise RuntimeError("boom")
+    except:
+        failure = True
+
+
+def case_ok_tuple_handler():
+    \"\"\"OK: repository tuple defers until cleanup outside the handler.\"\"\"
+    global failure
+    try:
+        raise RuntimeError("boom")
+    except (Exception, KeyboardInterrupt, SystemExit) as exc:
+        failure = exc
+
+
+def case_ok_base_exception_reraise():
+    \"\"\"OK: BaseException handler ends with a bare raise.\"\"\"
+    try:
+        raise RuntimeError("boom")
+    except BaseException:
+        raise
+
+
+def case_ok_exception_handler():
+    \"\"\"OK: Exception alone is not BaseException for CodeQL.\"\"\"
+    try:
+        raise RuntimeError("boom")
+    except Exception as exc:
+        failure = exc
+"""
+
+ASSERT_RAISES_BODY_FIXTURE = """# SPDX-License-Identifier: EUPL-1.2
+\"\"\"Fixture functions for assert-raises-body-bare-raise semgrep rule testing.\"\"\"
+
+import unittest
+from contextlib import contextmanager
+
+
+@contextmanager
+def other_context():
+    \"\"\"Secondary context manager for multi-with fixtures.\"\"\"
+    yield
+
+
+def case_flagged_assert_raises_bare_raise(self):
+    \"\"\"Flagged: assertRaises body is only a raise statement.\"\"\"
+    with self.assertRaises(RuntimeError):
+        raise RuntimeError("planted")
+
+
+def case_flagged_assert_raises_regex_bare_raise(self):
+    \"\"\"Flagged: assertRaisesRegex body is only a raise statement.\"\"\"
+    with self.assertRaisesRegex(RuntimeError, "planted"):
+        raise RuntimeError("planted")
+
+
+def case_flagged_multi_with_bare_raise(self):
+    \"\"\"Flagged: combined with assertRaises as still uses a bare raise body.\"\"\"
+    with other_context(), self.assertRaises(RuntimeError) as caught, other_context():
+        raise RuntimeError("planted")
+
+
+def _call_raise_runtime() -> None:
+    \"\"\"Helper that raises for assertRaises bodies.\"\"\"
+    raise RuntimeError("planted")
+
+
+def case_ok_assert_raises_call(self):
+    \"\"\"OK: assertRaises body calls a helper instead of bare raise.\"\"\"
+    with self.assertRaises(RuntimeError):
+        _call_raise_runtime()
+
+
+def case_ok_if_before_raise(self):
+    \"\"\"OK: raise after another statement inside an if.\"\"\"
+    with self.assertRaises(RuntimeError):
+        if True:
+            self.assertTrue(True)
+            raise RuntimeError("planted")
+"""
+
 NEGATED_STATUS_FIXTURE = (
     "#!/usr/bin/env bash\n"
     "# SPDX-"
@@ -615,7 +755,56 @@ def _flagged_in_fixture(source: str, rule_id: str) -> set[str]:
         return _flagged_functions(data.get("results", []), source, rule_id=rule_id)
 
 
-@unittest.skipUnless(shutil.which("semgrep"), "semgrep not installed; make semgrep needs it")
+def _should_run_semgrep_fixtures() -> bool:
+    """Run fixtures when semgrep is required or available."""
+    return os.environ.get("SEMGREP_FIXTURES_REQUIRED") == "1" or shutil.which("semgrep") is not None
+
+
+class SemgrepFixtureAvailabilityTest(unittest.TestCase):
+    """Verify when the semgrep fixture classes run."""
+
+    def test_unset_switch_skips_when_semgrep_is_missing(self) -> None:
+        """Skip fixtures when the switch is unset and semgrep is missing."""
+        with (
+            unittest.mock.patch.object(os, "environ", {}),
+            unittest.mock.patch.object(shutil, "which", return_value=None),
+        ):
+            self.assertFalse(_should_run_semgrep_fixtures())
+
+    def test_required_switch_runs_when_semgrep_is_missing(self) -> None:
+        """Run fixtures when the switch requires semgrep and it is missing."""
+        with (
+            unittest.mock.patch.object(os, "environ", {"SEMGREP_FIXTURES_REQUIRED": "1"}),
+            unittest.mock.patch.object(shutil, "which", return_value=None),
+        ):
+            self.assertTrue(_should_run_semgrep_fixtures())
+
+    def test_required_switch_runs_when_semgrep_is_present(self) -> None:
+        """Run fixtures when the switch requires semgrep and it is available."""
+        with (
+            unittest.mock.patch.object(os, "environ", {"SEMGREP_FIXTURES_REQUIRED": "1"}),
+            unittest.mock.patch.object(shutil, "which", return_value="/fixture/bin/semgrep"),
+        ):
+            self.assertTrue(_should_run_semgrep_fixtures())
+
+    def test_zero_switch_skips_when_semgrep_is_missing(self) -> None:
+        """Treat zero as optional when semgrep is missing."""
+        with (
+            unittest.mock.patch.object(os, "environ", {"SEMGREP_FIXTURES_REQUIRED": "0"}),
+            unittest.mock.patch.object(shutil, "which", return_value=None),
+        ):
+            self.assertFalse(_should_run_semgrep_fixtures())
+
+    def test_unset_switch_runs_when_semgrep_is_present(self) -> None:
+        """Run fixtures when semgrep is available and the switch is unset."""
+        with (
+            unittest.mock.patch.object(os, "environ", {}),
+            unittest.mock.patch.object(shutil, "which", return_value="/fixture/bin/semgrep"),
+        ):
+            self.assertTrue(_should_run_semgrep_fixtures())
+
+
+@unittest.skipUnless(_should_run_semgrep_fixtures(), "semgrep not installed; make semgrep needs it")
 class SemgrepRulesTest(unittest.TestCase):
     """Verify repository semgrep rule behavior against test fixtures."""
 
@@ -721,6 +910,35 @@ class SemgrepRulesTest(unittest.TestCase):
         self.assertEqual(
             _flagged_in_fixture(SUBTEST_CLEANUP_FIXTURE, "subtest-cleanup-outside-finally"),
             _expected_flagged(SUBTEST_CLEANUP_FIXTURE),
+        )
+
+    def test_base_exception_handler_without_reraise_rule(self) -> None:
+        """Rule base-exception-handler-without-reraise flags swallowing BaseException."""
+        self.assertEqual(
+            _flagged_in_fixture(
+                BASE_EXCEPTION_HANDLER_FIXTURE, "base-exception-handler-without-reraise"
+            ),
+            _expected_flagged(BASE_EXCEPTION_HANDLER_FIXTURE),
+        )
+
+    def test_base_exception_handler_rule_ignores_self_module(self) -> None:
+        """Explicit scan of this module must not hit the fixture strings embedded here."""
+        with tempfile.TemporaryDirectory() as scratch_name:
+            scratch_path = Path(scratch_name)
+            target = ROOT / "tests" / "test_semgrep_rules.py"
+            data = _run_semgrep(target, scratch_path)
+            hits = [
+                item
+                for item in data.get("results", [])
+                if item.get("check_id", "").endswith("base-exception-handler-without-reraise")
+            ]
+            self.assertEqual(hits, [])
+
+    def test_assert_raises_body_bare_raise_rule(self) -> None:
+        """Rule assert-raises-body-bare-raise flags a with body that is only raise."""
+        self.assertEqual(
+            _flagged_in_fixture(ASSERT_RAISES_BODY_FIXTURE, "assert-raises-body-bare-raise"),
+            _expected_flagged(ASSERT_RAISES_BODY_FIXTURE),
         )
 
     def test_os_open_create_mode_wider_than_owner_rule(self) -> None:
@@ -830,7 +1048,7 @@ class FfmpegRuleIdTest(unittest.TestCase):
         self.assertEqual([rule_id for rule_id in ids if "." in rule_id], [])
 
 
-@unittest.skipUnless(shutil.which("semgrep"), "semgrep not installed; make semgrep needs it")
+@unittest.skipUnless(_should_run_semgrep_fixtures(), "semgrep not installed; make semgrep needs it")
 class FfmpegSemgrepRulesTest(unittest.TestCase):
     """Verify .semgrep-ffmpeg.yml C rules against synthetic FFmpeg call fixtures."""
 

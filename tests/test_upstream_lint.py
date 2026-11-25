@@ -23,7 +23,8 @@ import unittest.mock
 from dataclasses import FrozenInstanceError
 from pathlib import Path
 
-from tests.helpers import GIT_ENVIRONMENT_NAMES, isolated_git_environment
+from tests.helpers import GIT_ENVIRONMENT_NAMES, isolated_git_environment, run_git
+from tests.revert_proof_helpers import clone_shallow_side_fix, configure_ssh_signing
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 import upstream_lint  # noqa: E402
@@ -453,6 +454,31 @@ class TestReachTest(unittest.TestCase):
             upstream_lint.reach_names(["libavcodec/aom_film_grain.c", "doc/x.texi"], patch),
             frozenset({"aom_film_grain", "parse_sets"}),
         )
+
+    def test_added_source_line_supplies_function_without_hunk_name(self) -> None:
+        """Added source definitions contribute function names when the hunk header has none."""
+        patch = (
+            "diff --git a/libavfilter/vf_root.c b/libavfilter/vf_root.c\n"
+            "new file mode 100644\n"
+            "--- /dev/null\n"
+            "+++ b/libavfilter/vf_root.c\n"
+            "@@ -0,0 +1,4 @@\n"
+            "+int ff_value(void)\n"
+            "+{\n"
+            "+    return 1;\n"
+            "+}\n"
+        )
+        self.assertIn("ff_value", upstream_lint.reach_names(["libavfilter/vf_root.c"], patch))
+
+    def test_control_words_do_not_hide_function_reach_names(self) -> None:
+        """Hunk headings and added lines skip control words before real function names."""
+        for keyword in ("if", "while", "for", "switch", "return", "sizeof"):
+            with self.subTest(keyword=keyword):
+                line = f"{keyword} (ff_value(x))"
+                self.assertEqual(
+                    upstream_lint._hunk_functions([f"@@ -1 +1 @@ {line}"]), ["ff_value"]
+                )
+                self.assertEqual(upstream_lint._function_names_from_added([line]), ["ff_value"])
 
     def test_deleted_source_file_keeps_old_path_and_function(self) -> None:
         """Deleted source diffs retain the --- a/ path for hunk function extraction."""
@@ -1509,6 +1535,368 @@ class ClaimScopeTest(unittest.TestCase):
         self.assertEqual(upstream_lint.source_hunks(""), 0)
 
 
+class ErrorScopeClaimTest(unittest.TestCase):
+    """Positive, negative and boundary coverage of error-handling scope claims."""
+
+    def test_dashenc_before_reword_body_is_flagged(self) -> None:
+        """Loose retain-or-stays wording does not qualify an error-handling subject."""
+        message = (
+            "avformat/dashenc: propagate output close errors\n\n"
+            "Other rename sites retain their existing error handling.\n"
+            "The sticky AVIO error stays.\n"
+        )
+        self.assertEqual(upstream_lint.error_scope_claim(message), "propagate output close errors")
+
+    def test_dashenc_remain_outside_sentence_qualifies(self) -> None:
+        """A remain-outside sentence split across lines qualifies the subject claim."""
+        message = (
+            "avformat/dashenc: propagate output close errors\n\n"
+            "Other rename sites retain their existing error handling.\n"
+            "Errors reported only by the single-file close in dash_free() and\n"
+            "damaged segments left by ignored multi-file streaming write failures\n"
+            "remain outside this change.\n"
+        )
+        self.assertIsNone(upstream_lint.error_scope_claim(message))
+
+    def test_hlsplaylist_unchanged_behavior_qualifies(self) -> None:
+        """As-on-master and unchanged-behavior sentences qualify playlist error subjects."""
+        message = (
+            "avformat/hlsplaylist: return playlist write errors\n\n"
+            "The fail label still overwrites ret with hlsenc_io_close's\n"
+            "result, as on master; close, retry and trailer behavior are unchanged.\n"
+        )
+        self.assertIsNone(upstream_lint.error_scope_claim(message))
+
+    def test_unchanged_without_scope_noun_is_flagged(self) -> None:
+        """An unchanged sentence without a scope noun does not qualify."""
+        message = "avfilter/vf_x: propagate write errors\n\nOutput is unchanged.\n"
+        self.assertEqual(upstream_lint.error_scope_claim(message), "propagate write errors")
+
+    def test_no_other_error_path_remains_qualifies(self) -> None:
+        """A no-other-error-path completeness sentence qualifies the subject."""
+        message = "avfilter/vf_x: report write errors\n\nNo other error path remains.\n"
+        self.assertIsNone(upstream_lint.error_scope_claim(message))
+
+    def test_subject_without_error_noun_is_not_a_claim(self) -> None:
+        """Subjects that propagate timestamps without an error noun pass."""
+        self.assertIsNone(upstream_lint.error_scope_claim("avformat/x: propagate timestamps\n"))
+
+    def test_negated_error_subject_is_not_a_claim(self) -> None:
+        """A negated return-errors subject is not treated as a claim."""
+        self.assertIsNone(
+            upstream_lint.error_scope_claim("avformat/x: do not return write errors\n")
+        )
+
+    def test_signoff_remain_outside_does_not_qualify(self) -> None:
+        """A Signed-off-by line carrying remain-outside text does not qualify."""
+        message = (
+            "avfilter/vf_x: propagate write errors\n\n"
+            "Signed-off-by: Paths remain outside this change <x@invalid>\n"
+        )
+        self.assertEqual(upstream_lint.error_scope_claim(message), "propagate write errors")
+
+    def test_member_access_dot_does_not_split_qualifying_sentence(self) -> None:
+        """A dot inside an identifier keeps one qualification sentence intact."""
+        message = (
+            "avfilter/vf_x: propagate write errors\n\n"
+            "Close errors in pkg.dash_free() remain outside this change.\n"
+        )
+        self.assertIsNone(upstream_lint.error_scope_claim(message))
+
+    def test_error_scope_finding_names_the_fix(self) -> None:
+        """The claim-scope finding for an error subject asks for an exclusion sentence."""
+        findings = upstream_lint._unverified_findings(
+            "0123456789abcdef", "avfilter/vf_x: propagate write errors\n"
+        )
+        self.assertEqual(len(findings), 1)
+        self.assertIn('subject claims error handling ("propagate write errors")', findings[0])
+        self.assertIn("remain outside this change", findings[0])
+
+    def test_avutil_check_av_strerror_failures_flagged(self) -> None:
+        """A check-verb summary after an area error prefix is still a claim."""
+        message = "avutil/error: check av_strerror() failures\n"
+        self.assertEqual(upstream_lint.error_scope_claim(message), "check av_strerror() failures")
+
+    def test_nvenc_avoid_surface_not_claim(self) -> None:
+        """An allow-listed word out of verb position makes no claim."""
+        message = "avcodec/nvenc: avoid invalid surface destruction after init error\n"
+        self.assertIsNone(upstream_lint.error_scope_claim(message))
+
+    def test_fix_leak_and_return_write_errors_flagged(self) -> None:
+        """A return-verb clause after and still claims when error nouns follow."""
+        message = "avcodec/x: fix a leak and return write errors\n"
+        self.assertEqual(upstream_lint.error_scope_claim(message), "return write errors")
+
+    def test_propagate_write_errors_no_prefix_flagged(self) -> None:
+        """A subject summary without an area prefix can still claim error handling."""
+        message = "propagate write errors\n"
+        self.assertEqual(upstream_lint.error_scope_claim(message), "propagate write errors")
+
+    def test_returned_and_catch_inflections_flagged(self) -> None:
+        """Past-tense returned and every inflection of catch claim error handling."""
+        cases = (
+            ("avcodec/foo: returned encode errors\n", "returned encode errors"),
+            ("avcodec/foo: catch write errors\n", "catch write errors"),
+            ("avcodec/foo: catches write errors\n", "catches write errors"),
+            ("avcodec/foo: caught write errors\n", "caught write errors"),
+            ("avcodec/foo: catching write errors\n", "catching write errors"),
+        )
+        for message, expected in cases:
+            with self.subTest(message=message):
+                self.assertEqual(upstream_lint.error_scope_claim(message), expected)
+
+    def test_nominal_error_handling_claims_flagged(self) -> None:
+        """Closed-list nominal verbs before error or failure handling nouns are claims."""
+        cases = (
+            ("avcodec/foo: add error checks\n", "add error checks"),
+            ("avcodec/foo: fix error propagation\n", "fix error propagation"),
+            ("avcodec/foo: fix error handling in init\n", "fix error handling in init"),
+            ("avcodec/foo: improve failure reporting\n", "improve failure reporting"),
+            ("avcodec/foo: rework error checking\n", "rework error checking"),
+            ("avcodec/foo: complete failure check\n", "complete failure check"),
+        )
+        for message, expected in cases:
+            with self.subTest(message=message):
+                self.assertEqual(upstream_lint.error_scope_claim(message), expected)
+
+    def test_surface_noun_adjunct_not_flagged(self) -> None:
+        """A leading surface noun adjunct is not treated as an error-handling verb."""
+        subject = "avcodec/foo: surface format check after init failure\n"
+        self.assertIsNone(upstream_lint.error_scope_claim(subject))
+
+    def test_earlier_clause_negation_does_not_suppress_claim(self) -> None:
+        """Negation in an earlier clause does not suppress a later affirmative claim."""
+        cases = (
+            (
+                "avcodec/foo: do not leak frame and return write errors\n",
+                "return write errors",
+            ),
+            (
+                "avcodec/foo: fix non-monotonic PTS without B-frames and propagate decode errors\n",
+                "propagate decode errors",
+            ),
+            ("avcodec/foo: do not crash, check init failure\n", "check init failure"),
+            ("avcodec/foo: never block; report decode errors\n", "report decode errors"),
+        )
+        for message, expected in cases:
+            with self.subTest(message=message):
+                self.assertEqual(upstream_lint.error_scope_claim(message), expected)
+
+    def test_same_clause_negations_not_flagged(self) -> None:
+        """Negation before the verb inside the same clause suppresses that clause."""
+        for message in (
+            "avformat/foo: do not report errors twice\n",
+            "avformat/foo: never propagate benign EOF errors\n",
+            "avformat/foo: without checking write errors, free frame\n",
+            "avformat/foo: don't return encode errors\n",
+        ):
+            with self.subTest(message=message):
+                self.assertIsNone(upstream_lint.error_scope_claim(message))
+
+    def test_clause_bound_stops_cross_clause_noun_pairing(self) -> None:
+        """An error noun in a later clause does not pair with a verb in an earlier clause."""
+        for message in (
+            "avcodec/foo: check frame size and avoid error log spam\n",
+            "avcodec/foo: check frame size and avoid init failure\n",
+            "avcodec/foo: check frame size, do not return write errors\n",
+            "avcodec/foo: return 0; log write failure\n",
+        ):
+            with self.subTest(message=message):
+                self.assertIsNone(upstream_lint.error_scope_claim(message))
+
+    def test_post_verb_clause_nonclaims_not_flagged(self) -> None:
+        """Post-verb no-error, instead-of, unchanged and no-more-than clauses make no claim."""
+        for message in (
+            "avcodec/foo: return the error code of foo unchanged\n",
+            "avcodec/foo: return 0 when no error occurred\n",
+            "avcodec/foo: return 0 when no failure occurred\n",
+            "avcodec/foo: report errors no more than once\n",
+            "avcodec/foo: return 0 instead of error on empty packet\n",
+        ):
+            with self.subTest(message=message):
+                self.assertIsNone(upstream_lint.error_scope_claim(message))
+
+    def test_error_compound_nouns_not_flagged(self) -> None:
+        """Closed-list compound nouns after error do not count as failure claims."""
+        for message in (
+            "avcodec/foo: check error resilience flags\n",
+            "avcodec/foo: handle error concealment in B-frames\n",
+            "avcodec/foo: forward error callback pointer to context\n",
+            "avcodec/foo: check if error callback is set\n",
+            "avcodec/foo: return standard error string from table\n",
+            "avcodec/foo: check error message format\n",
+            "avcodec/foo: return error text for status\n",
+            "avcodec/foo: report error log level\n",
+            "avcodec/foo: return error name from code\n",
+            "avcodec/foo: check error table bounds\n",
+        ):
+            with self.subTest(message=message):
+                self.assertIsNone(upstream_lint.error_scope_claim(message))
+        self.assertEqual(
+            upstream_lint.error_scope_claim("avcodec/foo: report error message on write failure\n"),
+            "report error message on write failure",
+        )
+
+    def test_multiple_leading_prefixes_skipped(self) -> None:
+        """Every leading area prefix without spaces is skipped before reading the summary."""
+        for message in (
+            "check: fix typo in failure message\n",
+            "avcodec/x: check: fix typo in failure message\n",
+            "avutil/error: document av_strerror() return value\n",
+            "avcodec/error_resilience: return early on skip\n",
+        ):
+            with self.subTest(message=message):
+                self.assertIsNone(upstream_lint.error_scope_claim(message))
+        self.assertEqual(
+            upstream_lint.error_scope_claim("avcodec/x: subsys: propagate write errors\n"),
+            "propagate write errors",
+        )
+
+    def test_abbreviation_and_colon_keep_qualifying_sentence_intact(self) -> None:
+        """Abbreviation dots and colons keep one scope sentence intact while semicolons split."""
+        for body in (
+            "Other error paths, e.g. close, remain outside this change.",
+            "Other error paths, i.e. close, remain outside this change.",
+            "Other error paths (cf. close) remain outside this change.",
+            "Other error paths vs. master remain outside this change.",
+            "Other error paths, close, etc. remain outside this change.",
+            "Other error paths: close and flush remain outside this change.",
+        ):
+            with self.subTest(body=body):
+                message = f"avfilter/vf_x: propagate write errors\n\n{body}\n"
+                self.assertIsNone(upstream_lint.error_scope_claim(message))
+        split_semicolon = (
+            "avfilter/vf_x: propagate write errors\n\nThis stays out of scope; error handling.\n"
+        )
+        self.assertEqual(upstream_lint.error_scope_claim(split_semicolon), "propagate write errors")
+
+    def test_exclamation_question_split_flags_unqualified_claim(self) -> None:
+        """Exclamation and question marks split sentences so missing qualification is flagged."""
+        for body in (
+            "Errors are reported! Output remains unchanged.",
+            "Errors are reported? Output remains unchanged.",
+        ):
+            with self.subTest(body=body):
+                message = f"avfilter/vf_x: propagate write errors\n\n{body}\n"
+                self.assertEqual(upstream_lint.error_scope_claim(message), "propagate write errors")
+
+    def test_exclamation_question_split_qualifies_error_scope(self) -> None:
+        """Split qualification sentences after exclamation or question marks qualify the claim."""
+        for body in (
+            "Is this right? Other error paths remain outside this change.",
+            "Errors are reported! Other error paths remain outside this change.",
+            "Other error paths remain outside this change!",
+        ):
+            with self.subTest(body=body):
+                message = f"avfilter/vf_x: propagate write errors\n\n{body}\n"
+                self.assertIsNone(upstream_lint.error_scope_claim(message))
+
+    def test_in_word_exclamation_question_do_not_split(self) -> None:
+        """In-word exclamation and question marks do not split qualification sentences."""
+        body = "Other error paths in a?b and x!=y remain outside this change."
+        sentences = upstream_lint._qualification_sentences(body)
+        self.assertEqual(len(sentences), 1)
+        self.assertEqual(
+            sentences[0],
+            "Other error paths in a?b and x!=y remain outside this change",
+        )
+        message = f"avfilter/vf_x: propagate write errors\n\n{body}\n"
+        self.assertIsNone(upstream_lint.error_scope_claim(message))
+
+    def test_bare_unchanged_without_other_marker_does_not_qualify(self) -> None:
+        """Bare unchanged, as-before and as-on-master phrases require an other-scope word."""
+        for body in (
+            "The error message text is unchanged.",
+            "Error messages are unchanged.",
+            "Log an error as before when opening the file.",
+            "On failure, free the context as on master.",
+        ):
+            with self.subTest(body=body):
+                message = f"avfilter/vf_x: propagate write errors\n\n{body}\n"
+                self.assertEqual(upstream_lint.error_scope_claim(message), "propagate write errors")
+        for body in (
+            "Other error paths are unchanged.",
+            "Remaining error paths behave as on master.",
+            "The rest of the error handling is unchanged.",
+            "Existing failure handling works as before.",
+        ):
+            with self.subTest(body=body):
+                message = f"avfilter/vf_x: propagate write errors\n\n{body}\n"
+                self.assertIsNone(upstream_lint.error_scope_claim(message))
+
+    def test_quoted_diff_and_trailer_lines_do_not_qualify(self) -> None:
+        """Quoted lines, hunk blocks, -by trailers and address or URL trailers do not qualify."""
+        for line in (
+            "> error handling is unchanged",
+            "> Other error paths remain outside this change.",
+            "@@ -1 +1 @@\n+ // Other error paths remain outside this change.",
+            "diff --git a/x b/x\n- // Other error paths remain outside this change.",
+            "Reviewed-by: Other error paths remain outside this change <x@invalid>",
+            "Suggested-by: Other error paths remain outside this change",
+            "Cc: Other error paths remain outside this change <x@invalid>",
+            "Link: https://example.invalid/other-error-paths-remain-outside-this-change",
+        ):
+            with self.subTest(line=line):
+                message = f"avfilter/vf_x: propagate write errors\n\n{line}\n"
+                self.assertEqual(upstream_lint.error_scope_claim(message), "propagate write errors")
+
+    def test_unchanged_behaviour_nouns_qualify(self) -> None:
+        """Named behaviour, path, case and site nouns qualify conditional unchanged phrases."""
+        for body in (
+            "Read paths are unchanged.",
+            "Seek cases are unchanged.",
+            "Flush path is unchanged.",
+            "Close case works as before.",
+            "Retry site behaves as on master.",
+            "Close sites are unchanged.",
+            "Trailer behavior is unchanged.",
+            "Trailer behaviour is unchanged.",
+        ):
+            with self.subTest(body=body):
+                message = f"avformat/x: return write errors\n\n{body}\n"
+                self.assertIsNone(upstream_lint.error_scope_claim(message))
+        unchanged_message = (
+            "avformat/x: return write errors\n\nThe error message text is unchanged.\n"
+        )
+        self.assertEqual(upstream_lint.error_scope_claim(unchanged_message), "return write errors")
+
+    def test_body_bullets_qualify(self) -> None:
+        """Body bullet lines outside quoted hunk blocks qualify error-handling subjects."""
+        for line in (
+            "- Other close and flush error paths are unchanged.",
+            "+ Other close and flush error paths are unchanged.",
+        ):
+            with self.subTest(line=line):
+                message = f"avfilter/vf_x: propagate write errors\n\n{line}\n"
+                self.assertIsNone(upstream_lint.error_scope_claim(message))
+
+    def test_quoted_hunk_blocks_dropped_until_empty_line(self) -> None:
+        """Quoted diff and hunk blocks drop every line until the next empty line."""
+        for hunk in (
+            "@@ -1 +1 @@\n+ Other error paths are unchanged.",
+            "diff --git a/x b/x\n- Other error paths are unchanged.",
+            "@@ -1 +1 @@ Other error paths are unchanged.\n+Other error paths are unchanged.",
+            "diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n Other error paths are unchanged.",
+        ):
+            with self.subTest(hunk=hunk):
+                message = f"avfilter/vf_x: propagate write errors\n\n{hunk}\n"
+                self.assertEqual(upstream_lint.error_scope_claim(message), "propagate write errors")
+        after_empty = (
+            "avfilter/vf_x: propagate write errors\n\n"
+            "@@ -1 +1 @@\n"
+            "+ Ignored hunk line.\n\n"
+            "Other error paths are unchanged.\n"
+        )
+        self.assertIsNone(upstream_lint.error_scope_claim(after_empty))
+        after_diff_empty = (
+            "avfilter/vf_x: propagate write errors\n\n"
+            "diff --git a/x b/x\n"
+            "- Ignored hunk line.\n\n"
+            "Other error paths are unchanged.\n"
+        )
+        self.assertIsNone(upstream_lint.error_scope_claim(after_diff_empty))
+
+
 class DocTermTest(unittest.TestCase):
     """Positive, negative and boundary coverage of doc terms the added code requires."""
 
@@ -2043,6 +2431,8 @@ class FixtureTest(unittest.TestCase):
                 "-c",
                 "commit.gpgsign=false",
                 "-c",
+                "tag.gpgsign=false",
+                "-c",
                 "core.hooksPath=/dev/null",
                 *args,
             ],
@@ -2106,6 +2496,16 @@ class FixtureTest(unittest.TestCase):
 class PipelineTest(FixtureTest):
     """Run Git and base tools in a throwaway repository; stub external hooks and engine."""
 
+    def test_command_environment_is_independent_of_path_bound(self) -> None:
+        """Lowering the path bound to one still accepts every fixture environment entry."""
+        environment = {"FIXTURE_FIRST": "first", "FIXTURE_LAST": "last"}
+        with unittest.mock.patch.object(upstream_lint, "MAX_PATHS", 1):
+            result = upstream_lint._command_environment(environment, self.root)
+        self.assertEqual(
+            result,
+            {**environment, "PRE_COMMIT_NO_CONCURRENCY": "1", "PWD": str(self.root.resolve())},
+        )
+
     def test_clean_commit_passes_and_collects_all_steps(self) -> None:
         """A correctly named clean commit passes every collected check."""
         self.write("libavfilter/vf_x.c", SOURCE.replace("return 1", "return 2"))
@@ -2119,6 +2519,7 @@ class PipelineTest(FixtureTest):
             "developer.texi",
             "fate-deps",
             "regression-test",
+            "revert-proof",
             "diagnostic-citation",
             "claim-scope",
             "doc-terms",
@@ -2152,10 +2553,13 @@ class PipelineTest(FixtureTest):
         rc, output = self.check()
         self.assertEqual(rc, 1, output)
         self.assertIn("step: c-rules rc: 1", output)
-        self.assertIn(
+        expected_finding = (
             "finding: libavfilter/vf_x.c:3: "
             "ffmpeg-rtsp-connect-failure-without-network-close: "
-            "call ff_network_close() before returning",
+            "call ff_network_close() before returning"
+        )
+        self.assertIn(
+            expected_finding,
             output,
         )
         self.assertIn("fix the flagged path, or pass --c-rule-reason", output)
@@ -2287,9 +2691,24 @@ class PipelineTest(FixtureTest):
         self.write("libavfilter/vf_x.c", SOURCE.replace("return 1", "return 2"))
         self.write("tests/ref/fate/filter-x", "0\n")
         self.commit("avfilter/vf_x: fix y")
-        rc, output = self.check()
+        rc, output = self.check("--no-revert-proof-reason", "regression-test fixture")
         self.assertEqual(rc, 0, output)
         self.assertIn("step: regression-test rc: 0", output)
+
+    def test_unrelated_test_control_word_does_not_reach_source_guard(self) -> None:
+        """A shared C control word cannot make an unrelated test reach a source fix."""
+        source = "libavfilter/vf_x.c"
+        self.write(
+            source, SOURCE.replace("    return 1;", "    if (1) {\n        return 2;\n    }")
+        )
+        self.commit("avfilter/vf_x: fix missing guard")
+        self.write("tests/ref/fate/filter-unrelated", "if (other_case)\n")
+        self.commit("tests/fate: add unrelated guard")
+        head = self.git("rev-parse", "HEAD").strip()
+        step = upstream_lint._regression_test(self.root, self.base, head, "")
+        self.assertEqual(step.rc, 1, step.output)
+        self.assertIn("test paths changed but none names", step.output)
+        self.assertIn("vf_x", step.output)
 
     def test_fix_with_test_in_later_commit_passes(self) -> None:
         """A test added in a separate commit within the same range satisfies the check."""
@@ -2297,7 +2716,7 @@ class PipelineTest(FixtureTest):
         self.commit("avfilter/vf_x: fix y")
         self.write("tests/ref/fate/filter-x", "0\n")
         self.commit("tests/fate: add filter-x")
-        rc, output = self.check()
+        rc, output = self.check("--no-revert-proof-reason", "regression-test fixture")
         self.assertEqual(rc, 0, output)
         self.assertIn("step: regression-test rc: 0", output)
 
@@ -2328,10 +2747,16 @@ class PipelineTest(FixtureTest):
         rc, output = self.check()
         self.assertEqual(rc, 1, output)
         self.assertIn("step: regression-test rc: 1", output)
-        rc, output = self.check("--no-test-reason", "needs a live RTSP server")
+        rc, output = self.check(
+            "--no-test-reason",
+            "needs a live RTSP server",
+            "--no-revert-proof-reason",
+            "needs a live RTSP server",
+        )
         self.assertEqual(rc, 0, output)
         self.assertIn("step: regression-test rc: 0", output)
-        self.assertIn("waived: needs a live RTSP server", output)
+        self.assertIn("step: regression-test rc: 0\nwaived: needs a live RTSP server\n", output)
+        self.assertIn("step: revert-proof rc: 0\nwaived: needs a live RTSP server\n", output)
         self.git("commit", "--amend", "-qm", f"{subject}\n\nRename the reply helper.")
         rc, output = self.check()
         self.assertEqual(rc, 0, output)
@@ -2344,10 +2769,20 @@ class PipelineTest(FixtureTest):
         rc, output = self.check()
         self.assertEqual(rc, 1, output)
         self.assertIn("step: regression-test rc: 1", output)
-        rc, output = self.check("--no-test-reason", "reproducer requires MemorySanitizer")
+        rc, output = self.check(
+            "--no-test-reason",
+            "reproducer requires MemorySanitizer",
+            "--no-revert-proof-reason",
+            "reproducer requires MemorySanitizer",
+        )
         self.assertEqual(rc, 0, output)
         self.assertIn("step: regression-test rc: 0", output)
-        self.assertIn("waived: reproducer requires MemorySanitizer", output)
+        self.assertIn(
+            "step: regression-test rc: 0\nwaived: reproducer requires MemorySanitizer\n", output
+        )
+        self.assertIn(
+            "step: revert-proof rc: 0\nwaived: reproducer requires MemorySanitizer\n", output
+        )
         self.git("commit", "--amend", "-qm", "avformat/x: clear keybuffer")
         rc, output = self.check()
         self.assertEqual(rc, 0, output)
@@ -2373,17 +2808,29 @@ class PipelineTest(FixtureTest):
         """A non-blank --no-test-reason waives a source commit whose body says fix."""
         self.write("libavfilter/vf_x.c", SOURCE.replace("return 1", "return 2"))
         self.commit("avfilter/vf_x: do not delete y\n\nFix this by skipping y.")
-        rc, output = self.check("--no-test-reason", "hardware-only path")
+        rc, output = self.check(
+            "--no-test-reason",
+            "hardware-only path",
+            "--no-revert-proof-reason",
+            "hardware-only path",
+        )
         self.assertEqual(rc, 0, output)
-        self.assertIn("waived: hardware-only path", output)
+        self.assertIn("step: regression-test rc: 0\nwaived: hardware-only path\n", output)
+        self.assertIn("step: revert-proof rc: 0\nwaived: hardware-only path\n", output)
 
     def test_fix_waiver_passes(self) -> None:
         """A non-blank --no-test-reason waives a source fix without a test path."""
         self.write("libavfilter/vf_x.c", SOURCE.replace("return 1", "return 2"))
         self.commit("avfilter/vf_x: fix y")
-        rc, output = self.check("--no-test-reason", "hardware-only path")
+        rc, output = self.check(
+            "--no-test-reason",
+            "hardware-only path",
+            "--no-revert-proof-reason",
+            "hardware-only path",
+        )
         self.assertEqual(rc, 0, output)
-        self.assertIn("waived: hardware-only path", output)
+        self.assertIn("step: regression-test rc: 0\nwaived: hardware-only path\n", output)
+        self.assertIn("step: revert-proof rc: 0\nwaived: hardware-only path\n", output)
 
     def test_blank_waiver_fails(self) -> None:
         """Whitespace-only --no-test-reason does not waive a missing regression test."""
@@ -2419,7 +2866,7 @@ class PipelineTest(FixtureTest):
             "int main(void)\n{\n    return ff_value();\n}\n",
         )
         self.commit("avfilter/vf_x: fix y")
-        rc, output = self.check()
+        rc, output = self.check("--no-revert-proof-reason", "regression-test fixture")
         self.assertEqual(rc, 0, output)
         self.assertIn("step: regression-test rc: 0", output)
 
@@ -2431,9 +2878,18 @@ class PipelineTest(FixtureTest):
         rc, output = self.check(
             "--no-test-reason",
             "the parser runs only behind a hardware decoder",
+            "--no-revert-proof-reason",
+            "the parser runs only behind a hardware decoder",
         )
         self.assertEqual(rc, 0, output)
-        self.assertIn("waived: the parser runs only behind a hardware decoder", output)
+        self.assertIn(
+            "step: regression-test rc: 0\nwaived: the parser runs only behind a hardware decoder\n",
+            output,
+        )
+        self.assertIn(
+            "step: revert-proof rc: 0\nwaived: the parser runs only behind a hardware decoder\n",
+            output,
+        )
 
     def test_unreached_fix_blank_waiver_fails(self) -> None:
         """Whitespace-only --no-test-reason does not waive an unreached source fix."""
@@ -2453,7 +2909,9 @@ class PipelineTest(FixtureTest):
         self.commit("avfilter/vf_y: fix z")
         rc, output = self.check()
         self.assertEqual(rc, 1, output)
-        self.assertIn("avfilter/vf_y: fix z: test paths changed but none names vf_y, y", output)
+        self.assertIn(
+            "avfilter/vf_y: fix z: test paths changed but none names ff_other, vf_y, y", output
+        )
         self.assertNotIn("avfilter/vf_x: fix y: test paths changed", output)
 
     def test_fix_with_binary_test_fixture_passes(self) -> None:
@@ -2461,7 +2919,7 @@ class PipelineTest(FixtureTest):
         self.write("libavfilter/vf_x.c", SOURCE.replace("return 1", "return 2"))
         self.write("tests/data/filter-x.bin", "\x00\x01\x02")
         self.commit("avfilter/vf_x: fix y")
-        rc, output = self.check()
+        rc, output = self.check("--no-revert-proof-reason", "regression-test fixture")
         self.assertEqual(rc, 0, output)
         self.assertIn("step: regression-test rc: 0", output)
 
@@ -2470,7 +2928,7 @@ class PipelineTest(FixtureTest):
         self.write("libavfilter/vf_x.c", SOURCE.replace("return 1", "return 2"))
         self.write("tests/café_x.c", "int main(void)\n{\n    return ff_value();\n}\n")
         self.commit("avfilter/vf_x: fix y")
-        rc, output = self.check()
+        rc, output = self.check("--no-revert-proof-reason", "regression-test fixture")
         self.assertEqual(rc, 0, output)
         self.assertIn("step: regression-test rc: 0", output)
 
@@ -2483,7 +2941,7 @@ class PipelineTest(FixtureTest):
             "int main(void)\n{\n    return ff_value();\n}\n",
         )
         self.commit("avfilter/vf_x: fix y")
-        rc, output = self.check()
+        rc, output = self.check("--no-revert-proof-reason", "regression-test fixture")
         self.assertEqual(rc, 0, output)
         self.assertIn("step: regression-test rc: 0", output)
 
@@ -2500,10 +2958,11 @@ class PipelineTest(FixtureTest):
     def test_cited_diagnostic_workaround_passes(self) -> None:
         """A compiler-diagnostic workaround with an upstream bug URL passes."""
         self.write("libavfilter/vf_x.c", SOURCE.replace("return 1", "return 2"))
-        self.commit(
+        message = (
             "avfilter/vf_x: silence -Wmaybe-uninitialized false positive\n\n"
             "https://gcc.gnu.org/bugzilla/show_bug.cgi?id=109999"
         )
+        self.commit(message)
         rc, output = self.check()
         self.assertEqual(rc, 0, output)
         self.assertIn("step: diagnostic-citation rc: 0", output)
@@ -2522,6 +2981,7 @@ class PipelineTest(FixtureTest):
             "developer.texi",
             "fate-deps",
             "regression-test",
+            "revert-proof",
             "diagnostic-citation",
         ):
             self.assertIn(f"step: {name} rc: 0", output)
@@ -2647,10 +3107,11 @@ class PipelineTest(FixtureTest):
     def test_speed_claim_fails(self) -> None:
         """An encode speed claim without an end-to-end figure fails claim-scope."""
         self.write("libavfilter/vf_x.c", SOURCE.replace("return 1", "return 2"))
-        self.commit(
+        message = (
             "avfilter/vf_x: paint maps once\n\n"
             "The map painter benchmark ran seven rounds, so encoding is faster."
         )
+        self.commit(message)
         rc, output = self.check()
         self.assertEqual(rc, 1, output)
         self.assertIn("step: claim-scope rc: 1", output)
@@ -2668,6 +3129,34 @@ class PipelineTest(FixtureTest):
         """An encode speed claim with an fps figure passes claim-scope."""
         self.write("libavfilter/vf_x.c", SOURCE.replace("return 1", "return 2"))
         self.commit("avfilter/vf_x: paint maps once\n\nEncoding runs at 120 fps, not 100 fps.")
+        rc, output = self.check()
+        self.assertEqual(rc, 0, output)
+        self.assertIn("step: claim-scope rc: 0", output)
+
+    def test_error_scope_claim_fails(self) -> None:
+        """An error-handling subject without a scope sentence fails claim-scope."""
+        self.write("libavfilter/vf_x.c", SOURCE.replace("return 1", "return 2"))
+        self.commit("avfilter/vf_x: propagate write errors")
+        rc, output = self.check()
+        self.assertEqual(rc, 1, output)
+        self.assertIn("step: claim-scope rc: 1", output)
+        self.assertIn('subject claims error handling ("propagate write errors")', output)
+
+    def test_error_scope_claim_is_not_waived(self) -> None:
+        """Passing --claim-reason cannot waive an error-handling scope claim."""
+        self.write("libavfilter/vf_x.c", SOURCE.replace("return 1", "return 2"))
+        self.commit("avfilter/vf_x: propagate write errors")
+        rc, output = self.check("--claim-reason", "only one path changed")
+        self.assertEqual(rc, 1, output)
+        self.assertIn("step: claim-scope rc: 1", output)
+
+    def test_error_scope_remain_outside_passes(self) -> None:
+        """A body sentence that leaves close-path errors outside passes claim-scope."""
+        self.write("libavfilter/vf_x.c", SOURCE.replace("return 1", "return 2"))
+        self.commit(
+            "avfilter/vf_x: propagate write errors\n\n"
+            "Errors from the close path remain outside this change."
+        )
         rc, output = self.check()
         self.assertEqual(rc, 0, output)
         self.assertIn("step: claim-scope rc: 0", output)
@@ -2914,15 +3403,21 @@ class PipelineTest(FixtureTest):
     def test_fate_macro_catalog_and_missing_file(self) -> None:
         """Head macro definitions grant only ALLYES wrappers and missing catalogs fail."""
         self.write("tests/Makefile", "ALLYES = $(strip $(1))\nVIDEO = $(call ALLYES, $(1))\n")
+        video_makefile = (
+            "FATE_X-$(call VIDEO, LAVFI_INDEV WRAPPED_AVFRAME_DECODER) += fate-x\n"
+            "fate-x: CMD = -f lavfi -i testsrc2\n"
+        )
         self.write(
             "tests/fate/filter-video.mak",
-            "FATE_X-$(call VIDEO, LAVFI_INDEV WRAPPED_AVFRAME_DECODER) += fate-x\n"
-            "fate-x: CMD = -f lavfi -i testsrc2\n",
+            video_makefile,
+        )
+        indirect_makefile = (
+            "GUARD = $(call VIDEO, LAVFI_INDEV WRAPPED_AVFRAME_DECODER)\n"
+            "FATE_Y-$(GUARD) += fate-y\nfate-y: CMD = -f lavfi -i testsrc2\n"
         )
         self.write(
             "tests/fate/other.mak",
-            "GUARD = $(call VIDEO, LAVFI_INDEV WRAPPED_AVFRAME_DECODER)\n"
-            "FATE_Y-$(GUARD) += fate-y\nfate-y: CMD = -f lavfi -i testsrc2\n",
+            indirect_makefile,
         )
         self.commit()
         with unittest.mock.patch.object(upstream_lint, "_git", wraps=upstream_lint._git) as git:
@@ -3006,10 +3501,12 @@ class PipelineTest(FixtureTest):
 
     def test_patcheck_zero_exit_with_added_hint_fails(self):
         """A zero process exit cannot hide an allow-listed double semicolon."""
+        program = (
+            "#!/bin/sh\ncat > patcheck.stdout\nprintf 'double ;\\npatcheck.stdout:23:+bad();;\\n'\n"
+        )
         self.write(
             "tools/patcheck",
-            "#!/bin/sh\ncat > patcheck.stdout\n"
-            "printf 'double ;\\npatcheck.stdout:23:+bad();;\\n'\n",
+            program,
         )
         self.commit()
         self.base = self.git("rev-parse", "HEAD").strip()
@@ -3023,10 +3520,13 @@ class PipelineTest(FixtureTest):
 
     def test_patcheck_zero_exit_with_printf_hint_passes(self):
         """Added printf output stays a review hint in the complete report."""
+        program = (
+            "#!/bin/sh\ncat > patcheck.stdout\n"
+            "printf 'Please use av_log\\npatcheck.stdout:23:+printf(\"hello\");\\n'\n"
+        )
         self.write(
             "tools/patcheck",
-            "#!/bin/sh\ncat > patcheck.stdout\n"
-            "printf 'Please use av_log\\npatcheck.stdout:23:+printf(\"hello\");\\n'\n",
+            program,
         )
         self.commit()
         self.base = self.git("rev-parse", "HEAD").strip()
@@ -3287,12 +3787,22 @@ class RealToolsTest(FixtureTest):
 class RunnerTest(unittest.TestCase):
     """Exercise real subprocess deadlines and byte-preserving Git output."""
 
+    def test_git_result_rejects_timeout_with_zero_exit(self) -> None:
+        """A timed-out Git result is refused even if the child raced to exit zero."""
+        result = upstream_lint.RunResult(("git", "show"), 0, "partial", timed_out=True)
+        with (
+            unittest.mock.patch.object(upstream_lint, "_run", return_value=result),
+            self.assertRaisesRegex(RuntimeError, r"rc=0.*timed out"),
+        ):
+            upstream_lint._git_result(Path.cwd(), "show", "HEAD:config")
+
     def test_non_allow_listed_executable_refused(self) -> None:
         """Unknown executable basenames return rc 2 without invoking Popen."""
         with unittest.mock.patch.object(upstream_lint.subprocess, "Popen") as popen:
             popen.return_value.__enter__.return_value.communicate.return_value = (b"", None)
             result = upstream_lint._run(["/unused/not-allowed"], Path.cwd())
         self.assertEqual(result.returncode, 2)
+        self.assertFalse(result.started)
         self.assertIn("executable refused", result.stdout)
         popen.assert_not_called()
         self.assertIsInstance(result, upstream_lint.RunResult)
@@ -3359,6 +3869,44 @@ class RunnerTest(unittest.TestCase):
         self.assertTrue(overrides.keys().isdisjoint(environment))
         self.assertEqual(environment["PRE_COMMIT_NO_CONCURRENCY"], "1")
 
+    def test_command_environment_above_bound_is_refused(self) -> None:
+        """An oversized fixture environment fails before any command starts."""
+        environment = {f"FIXTURE_{i}": str(i) for i in range(upstream_lint.MAX_ENV_ENTRIES)}
+        environment["REQUIRED_LAST"] = "present"
+        with self.assertRaises(ValueError) as caught:
+            upstream_lint._command_environment(environment, Path.cwd())
+        self.assertIn(f"MAX_ENV_ENTRIES={upstream_lint.MAX_ENV_ENTRIES}", str(caught.exception))
+        self.assertIn(str(upstream_lint.MAX_ENV_ENTRIES + 1), str(caught.exception))
+
+    def test_command_environment_exact_bound_preserves_last_entry(self) -> None:
+        """The exact environment bound accepts and preserves the final required entry."""
+        environment = {f"FIXTURE_{i}": str(i) for i in range(upstream_lint.MAX_ENV_ENTRIES - 1)}
+        environment["REQUIRED_LAST"] = "present"
+        result = upstream_lint._command_environment(environment, Path.cwd())
+        self.assertEqual(result["REQUIRED_LAST"], "present")
+        self.assertEqual(len(result), upstream_lint.MAX_ENV_ENTRIES + 2)
+
+    def test_command_environment_overflow_returns_usage_error(self) -> None:
+        """The runner reports environment overflow as usage error without spawning."""
+        environment = {f"FIXTURE_{i}": str(i) for i in range(upstream_lint.MAX_ENV_ENTRIES + 1)}
+        command_environment = upstream_lint._command_environment
+        with (
+            unittest.mock.patch.object(
+                upstream_lint,
+                "_command_environment",
+                side_effect=lambda source, cwd: command_environment(environment, cwd),
+            ),
+            unittest.mock.patch.object(upstream_lint.subprocess, "Popen") as popen,
+        ):
+            result = upstream_lint._run(["git", "--version"], Path.cwd())
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(
+            result.stdout,
+            f"command environment exceeds MAX_ENV_ENTRIES={upstream_lint.MAX_ENV_ENTRIES}: "
+            f"{len(environment)}",
+        )
+        popen.assert_not_called()
+
     def test_fixture_git_uses_isolated_environment(self) -> None:
         """Fixture Git receives the shared isolation helper's environment."""
         fixture = FixtureTest()
@@ -3405,8 +3953,21 @@ class RunnerTest(unittest.TestCase):
             popen.return_value.__enter__.return_value = process
             result = upstream_lint._run(["git", "--version"], Path.cwd(), timeout=1)
         self.assertEqual(result.returncode, 7)
+        self.assertTrue(result.timed_out)
         self.assertEqual(result.stdout, "finished\n")
         self.assertEqual(process.communicate.call_count, 2)
+
+    def test_completed_command_is_not_timed_out(self) -> None:
+        """An ordinary completed command retains a false timeout marker."""
+        process = unittest.mock.MagicMock()
+        process.communicate.return_value = (b"finished\n", None)
+        process.returncode = 7
+        with unittest.mock.patch.object(upstream_lint.subprocess, "Popen") as popen:
+            popen.return_value.__enter__.return_value = process
+            result = upstream_lint._run(["git", "--version"], Path.cwd(), timeout=1)
+        self.assertEqual(result.returncode, 7)
+        self.assertFalse(result.timed_out)
+        self.assertEqual(process.communicate.call_count, 1)
 
     def test_timeout_returns_failure(self):
         """A planted slow subprocess is killed and reported with rc 124."""
@@ -3427,6 +3988,51 @@ class RunnerTest(unittest.TestCase):
                 Path(directory),
             )
         self.assertEqual(result.stdout, "line\r\n")
+
+    def test_git_settings_applies_command_line_config(self) -> None:
+        """Per-invocation -c settings expose values without persisting repository config."""
+        with tempfile.TemporaryDirectory() as directory:
+            tree = Path(directory)
+            run_git(tree, "init", "-q", preserve_config=True)
+            hooks = tree / "hooks-empty"
+            hooks.mkdir()
+            setting = f"core.hooksPath={hooks}"
+            result = upstream_lint._run(
+                ["git", "config", "--get", "core.hooksPath"],
+                tree,
+                git_settings=(setting,),
+            )
+            self.assertEqual(result.returncode, 0)
+            self.assertEqual(result.stdout.strip(), str(hooks))
+            missing = upstream_lint._run(["git", "config", "--get", "core.hooksPath"], tree)
+            self.assertEqual(missing.returncode, 1)
+
+    def test_git_settings_with_attr_source_prepend_globals(self) -> None:
+        """Both keywords insert globals before the subcommand and leave the input argv intact."""
+        argv = ["git", "status", "--porcelain"]
+        original = list(argv)
+        process = unittest.mock.MagicMock()
+        process.communicate.return_value = (b"", None)
+        process.returncode = 0
+        with unittest.mock.patch.object(upstream_lint.subprocess, "Popen") as popen:
+            popen.return_value.__enter__.return_value = process
+            result = upstream_lint._run(
+                argv,
+                Path.cwd(),
+                git_attr_source="deadbeef",
+                git_settings=("core.hooksPath=/tmp/empty",),
+            )
+        self.assertEqual(argv, original)
+        self.assertEqual(result.args[0], "git")
+        status_index = result.args.index("status")
+        for prefix in ("-c", "core.hooksPath=/tmp/empty", "--no-replace-objects"):
+            self.assertIn(prefix, result.args)
+        config_index = result.args.index("-c")
+        attr_index = next(
+            index for index, value in enumerate(result.args) if value.startswith("--attr-source=")
+        )
+        self.assertLess(config_index, status_index)
+        self.assertLess(attr_index, status_index)
 
     def test_reap_timeout_pid_guards(self) -> None:
         """Prove _reap_timeout guards against invalid and current-group PIDs."""
@@ -3723,9 +4329,12 @@ class CRulesTest(unittest.TestCase):
         )
         step = self.run_c_rules()
         self.assertEqual(step.rc, 1, step.output)
-        self.assertIn(
+        expected_finding = (
             "finding: libavformat/rtspenc.c:10: "
-            "ffmpeg-rtsp-connect-failure-without-network-close: first message line",
+            "ffmpeg-rtsp-connect-failure-without-network-close: first message line"
+        )
+        self.assertIn(
+            expected_finding,
             step.output,
         )
         self.assertNotIn("second detail line", step.output)
@@ -3777,9 +4386,12 @@ class CRulesTest(unittest.TestCase):
         )
         step = self.run_c_rules()
         self.assertEqual(step.rc, 0, step.output)
-        self.assertIn(
+        expected_finding = (
             "pre-existing (untouched): libavformat/rtspenc.c:3: "
-            "ffmpeg-rtsp-connect-failure-without-network-close: missing ff_network_close()",
+            "ffmpeg-rtsp-connect-failure-without-network-close: missing ff_network_close()"
+        )
+        self.assertIn(
+            expected_finding,
             step.output,
         )
         self.assertNotIn("finding:", step.output)
@@ -4000,6 +4612,967 @@ class CRulesTest(unittest.TestCase):
                 )
                 step = self.run_c_rules()
                 self.assertEqual(step.rc, 2, step.output)
+
+
+class RevertProofStepTest(FixtureTest):
+    """Test the revert-proof step in scripts/upstream_lint.py with temporary Git repositories."""
+
+    def test_tree_replacement_cannot_hide_source_fix(self) -> None:
+        """A documentation-only replacement tree cannot hide a stored source-only fix."""
+        self.git("rm", "-rf", ".")
+        self.commit("empty fixture base")
+        self.base = self.git("rev-parse", "HEAD").strip()
+        self.write("libavfilter/vf_x.c", SOURCE)
+        self.commit("avfilter/vf_x: fix source value")
+        fix = self.git("rev-parse", "HEAD").strip()
+        stored_tree = self.git("rev-parse", "HEAD^{tree}").strip()
+        plain = self.proof_step()
+        self.assertEqual(plain.rc, 1, plain.output)
+        self.assertIn("no revert-proof record", plain.output)
+        self.git("checkout", "--detach", self.base)
+        self.write("doc/manual.txt", "replacement documentation\n")
+        self.commit("doc: replacement fixture")
+        replacement_tree = self.git("rev-parse", "HEAD^{tree}").strip()
+        self.git("checkout", "--detach", fix)
+        self.git("replace", stored_tree, replacement_tree)
+        self.assertEqual(
+            self.git("diff-tree", "--name-only", "-r", fix).splitlines()[1:], ["doc/manual.txt"]
+        )
+        replaced = self.proof_step()
+        self.assertEqual((replaced.rc, replaced.output), (plain.rc, plain.output))
+
+    def test_tree_replacement_cannot_change_fix_patch(self) -> None:
+        """Replacing a fix tree with its parent cannot remove stored patch function names."""
+        self.write("libavfilter/vf_x.c", SOURCE.replace("return 1", "return 2"))
+        self.commit("avfilter/vf_x: fix source value")
+        fix = self.git("rev-parse", "HEAD").strip()
+        stored_tree = self.git("rev-parse", "HEAD^{tree}").strip()
+        parent_tree = self.git("rev-parse", f"{self.base}^{{tree}}").strip()
+        plain = upstream_lint._fix_commits(self.root, self.base, fix)
+        self.assertIn("ff_value", plain[0][2])
+        self.git("replace", stored_tree, parent_tree)
+        self.assertEqual(upstream_lint._fix_commits(self.root, self.base, fix), plain)
+
+    def test_loaded_records_retain_only_verdicts_and_pass_status(self) -> None:
+        """Mixed duplicate records retain verdict strings and pass status without payloads."""
+        commit, head, head_tree = self.add_fix_commit()
+        failing = self.write_record(
+            "failing.json", self.valid_record(commit, head, head_tree, rc_reverted=0)
+        )
+        passing = self.write_record("passing.json", self.valid_record(commit, head, head_tree))
+        loaded = []
+        real_load = upstream_lint._load_revert_proofs
+
+        def capture_load(*args):
+            """Capture the actual retained structure without depending on private arguments."""
+            result = real_load(*args)
+            loaded.append(result)
+            return result
+
+        with unittest.mock.patch.object(upstream_lint, "_load_revert_proofs", capture_load):
+            step = self.proof_step(failing, passing)
+        self.assertEqual((step.rc, step.output), (0, "1 fix commit(s), 2 revert-proof record(s)"))
+        self.assertEqual(
+            loaded,
+            [({commit: (["rc_reverted is 0 (test passes without the fix)"], True)}, {}, [])],
+        )
+
+    def test_signature_display_keeps_fix_and_parent_records_parseable(self) -> None:
+        """Signed commits yield identical proof findings with signature display enabled."""
+        configure_ssh_signing(self.root, self.root.parent)
+        self.write("libavfilter/vf_x.c", SOURCE.replace("return 1", "return 2"))
+        self.git("add", ".")
+        run_git(
+            self.root,
+            "-c",
+            "commit.gpgsign=true",
+            "commit",
+            "-qm",
+            "avfilter/vf_x: fix signed value",
+            preserve_config=True,
+        )
+        commit = self.git("rev-parse", "HEAD").strip()
+        self.assertIn("gpgsig", self.git("cat-file", "commit", commit))
+        self.git("config", "log.showSignature", "false")
+        unsigned_display = self.proof_step()
+        plain_parents = upstream_lint._commit_history_error(self.root, commit)
+        self.git("config", "log.showSignature", "true")
+        signed_display = self.proof_step()
+        self.assertEqual(
+            (signed_display.rc, signed_display.output),
+            (unsigned_display.rc, unsigned_display.output),
+        )
+        self.assertEqual(upstream_lint._commit_history_error(self.root, commit), plain_parents)
+
+    def test_scan_limits_respect_only_nonblank_waivers(self) -> None:
+        """Path and commit scan caps admit nonblank waivers while retaining their diagnostics."""
+        self.add_fix_commit()
+        for cap, diagnostic in (
+            (1, "commit paths exceed MAX_PATHS=1"),
+            (0, "commit scan exceeds MAX_PATHS=0"),
+        ):
+            with unittest.mock.patch.object(upstream_lint, "MAX_PATHS", cap):
+                for reason, expected in (("manual verification", 0), ("", 1), (" \t ", 1)):
+                    with self.subTest(cap=cap, reason=reason):
+                        step = upstream_lint._revert_proof(
+                            self.root, self.base, "HEAD", waiver=reason
+                        )
+                        self.assertEqual(step.rc, expected, step.output)
+                        self.assertIn(diagnostic, step.output)
+                        if expected == 0:
+                            self.assertTrue(step.output.startswith("waived: manual verification\n"))
+                        else:
+                            self.assertNotIn("waived:", step.output)
+
+    def test_git_runtime_error_cannot_be_waived(self) -> None:
+        """A plain Git failure remains a failing step even with an explicit waiver."""
+        with unittest.mock.patch.object(
+            upstream_lint, "_git", side_effect=RuntimeError("git failed")
+        ):
+            step = upstream_lint._revert_proof(self.root, self.base, "HEAD", waiver="manual")
+        self.assertEqual((step.rc, step.output), (1, "git failed"))
+
+    def test_fifo_record_is_refused_without_waiting_for_writer(self) -> None:
+        """A writerless FIFO produces a regular-file diagnostic within a bounded child."""
+        if not hasattr(os, "mkfifo"):
+            self.skipTest("os.mkfifo is unavailable; writerless FIFO fixture unsupported")
+        record = self.root.parent / "record.fifo"
+        os.mkfifo(record)
+        program = (
+            "import sys; from pathlib import Path; from scripts import upstream_lint; "
+            "step = upstream_lint._revert_proof(Path(sys.argv[1]), sys.argv[2], 'HEAD', "
+            "(Path(sys.argv[3]),)); print(step.output); sys.exit(step.rc)"
+        )
+        result = subprocess.run(  # nosec B603 - fixed Python and fixture paths, no shell.
+            [sys.executable, "-B", "-c", program, str(self.root), self.base, str(record)],
+            cwd=upstream_lint.REPO_ROOT,
+            env=isolated_git_environment(),
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30,
+        )
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn(f"{record}: not a regular file", result.stdout)
+
+    def test_directory_record_is_refused_as_nonregular(self) -> None:
+        """A directory receives the same explicit regular-file diagnostic as a FIFO."""
+        step = self.proof_step(self.root)
+        self.assertEqual(step.rc, 1, step.output)
+        self.assertIn(f"{self.root}: not a regular file", step.output)
+
+    def test_record_descriptors_close_on_success_and_errors(self) -> None:
+        """Regular reads, nonregular refusals and descriptor errors never leak an open file."""
+        record = self.write_record("regular.json", self.valid_record(*self.add_fix_commit()))
+        for path in (record, self.root):
+            with (
+                self.subTest(path=path),
+                unittest.mock.patch.object(os, "close", wraps=os.close) as close,
+            ):
+                upstream_lint._read_revert_proof(path)
+                close.assert_called_once()
+                with self.assertRaises(OSError):
+                    os.fstat(close.call_args.args[0])
+        for operation in ("fstat", "fdopen"):
+            with (
+                self.subTest(operation=operation),
+                unittest.mock.patch.object(
+                    os, operation, side_effect=OSError("planted read failure")
+                ),
+                unittest.mock.patch.object(os, "close", wraps=os.close) as close,
+            ):
+                result = upstream_lint._read_revert_proof(record)
+                self.assertEqual(result[2], f"{record}: not valid JSON")
+                close.assert_called_once()
+
+    def test_record_hex_width_and_case_boundaries(self) -> None:
+        """Lowercase SHA-256 IDs validate while short and uppercase IDs remain type errors."""
+        commit, head, head_tree = self.add_fix_commit()
+        for field in ("commit", "head", "head_tree"):
+            with self.subTest(field=field):
+                payload = self.valid_record(commit, head, head_tree, **{field: "a" * 64})
+                self.assertIsNone(upstream_lint._revert_proof_schema_error(payload))
+                for invalid in ("a" * 63, "A" * 40):
+                    payload[field] = invalid
+                    self.assertEqual(
+                        upstream_lint._revert_proof_schema_error(payload),
+                        f"wrong value type for {field}",
+                    )
+
+    def test_sha256_unmatched_record_is_silent_in_sha1_range(self) -> None:
+        """A valid 64-hex record outside a SHA-1 fix range produces no schema finding."""
+        self.add_fix_commit()
+        record = self.write_record("unmatched.json", self.valid_record(*(["a" * 64] * 3)))
+        step = self.proof_step(record)
+        self.assertEqual(step.rc, 1, step.output)
+        self.assertIn("no revert-proof record", step.output)
+        self.assertNotIn(str(record), step.output)
+        self.assertNotIn("wrong value type", step.output)
+
+    def test_docs_only_range_validates_supplied_records(self) -> None:
+        """Neutral ranges report malformed records while accepting absent or unrelated records."""
+        self.write("doc/manual.txt", "neutral documentation\n")
+        self.commit("doc: update manual")
+        self.assertEqual(self.proof_step().rc, 0)
+        record = self.write_record("unmatched.json", self.valid_record(*([self.base] * 3)))
+        self.assertEqual(self.proof_step(record).rc, 0)
+        for text, diagnostic in (("broken JSON", "not valid JSON"), ("{}", "missing key")):
+            with self.subTest(text=text):
+                record.write_text(text, encoding="utf-8")
+                step = self.proof_step(record)
+                self.assertEqual(step.rc, 1, step.output)
+                self.assertIn(f"{record}: {diagnostic}", step.output)
+                self.assertEqual(len(step.output.splitlines()), 1)
+                waived = upstream_lint._revert_proof(
+                    self.root, self.base, "HEAD", (record,), "manual verification"
+                )
+                self.assertEqual(waived.rc, 0, waived.output)
+                self.assertIn("waived: manual verification", waived.output)
+
+    def test_fix_cap_respects_nonblank_waiver(self) -> None:
+        """Only a nonblank waiver overrides the fix cap and skips per-fix validation."""
+        self.add_fix_commit()
+        self.add_fix_commit("libavfilter/vf_y.c", "avfilter/vf_y: fix second")
+        cap = "fix commits exceed MAX_CLAIM_COMMITS=1: 2"
+        with (
+            unittest.mock.patch.object(upstream_lint, "MAX_CLAIM_COMMITS", 1),
+            unittest.mock.patch.object(
+                upstream_lint, "_load_revert_proofs", side_effect=AssertionError("over cap")
+            ),
+        ):
+            for reason, expected in (("manual verification", 0), ("", 1), (" \t ", 1)):
+                with self.subTest(reason=reason):
+                    step = upstream_lint._revert_proof(self.root, self.base, "HEAD", waiver=reason)
+                    self.assertEqual(step.rc, expected, step.output)
+                    self.assertEqual(
+                        step.output, f"waived: {reason}\n{cap}" if expected == 0 else cap
+                    )
+
+    def test_record_byte_limit_refuses_before_json_parse(self) -> None:
+        """Exactly the limit parses, while one byte more is refused before JSON parsing."""
+        commit, head, head_tree = self.add_fix_commit()
+        record = self.write_record("oversized.json", self.valid_record(commit, head, head_tree))
+        encoded = record.read_bytes()
+        limit = len(encoded) + 16
+        record.write_bytes(encoded + b" " * 16)
+        with unittest.mock.patch.object(upstream_lint, "MAX_RECORD_BYTES", limit, create=True):
+            step = self.proof_step(record)
+        self.assertEqual(step.rc, 0, step.output)
+        record.write_bytes(encoded + b" " * 17)
+        with (
+            unittest.mock.patch.object(upstream_lint, "MAX_RECORD_BYTES", limit, create=True),
+            unittest.mock.patch.object(json, "loads", side_effect=AssertionError("parsed")),
+        ):
+            payload, bound_commit, error = upstream_lint._read_revert_proof(record)
+        self.assertIsNone(payload)
+        self.assertIsNone(bound_commit)
+        self.assertEqual(error, f"{record}: record exceeds MAX_RECORD_BYTES={limit}")
+
+    def test_noop_graft_cli_demands_source_record(self) -> None:
+        """Full CLI preflight admits a no-op graft and demands the source fix record."""
+        self.write("libavfilter/vf_x.c", SOURCE.replace("return 1", "return 2"))
+        self.commit("avfilter/vf_x: fix value")
+        commit = self.git("rev-parse", "HEAD").strip()
+        self.write(".git/info/grafts", f"{self.base}\n")
+        self.git("config", "advice.graftFileDeprecated", "true")
+        rc, output = self.check("--no-test-reason", "fixture exercises proof demand")
+        self.assertEqual(rc, 1, output)
+        self.assertNotIn("step: preflight", output)
+        self.assertIn("step: revert-proof rc: 1", output)
+        self.assertIn(f"{commit[:12]}: avfilter/vf_x: fix value", output)
+        self.assertIn("no revert-proof record", output)
+        self.assertNotIn("history is incomplete", output)
+
+    def test_hidden_graft_cli_reports_named_history_finding(self) -> None:
+        """Full CLI reaches the named history finding when a side graft hides its parent."""
+        branch = self.git("symbolic-ref", "--short", "HEAD").strip()
+        self.git("commit", "--allow-empty", "-qm", "main: advance base")
+        base = self.git("rev-parse", "HEAD").strip()
+        self.git("checkout", "-qb", "side", self.base)
+        self.write("libavfilter/vf_x.c", SOURCE.replace("return 1", "return 2"))
+        self.commit("avfilter/vf_x: fix side value")
+        commit = self.git("rev-parse", "HEAD").strip()
+        self.git("checkout", "-q", branch)
+        self.git("merge", "--no-ff", "-qm", "merge side history", "side")
+        self.base = base
+        self.write(".git/info/grafts", f"{commit}\n")
+        self.git("config", "advice.graftFileDeprecated", "true")
+        rc, output = self.check()
+        self.assertEqual(rc, 1, output)
+        self.assertNotIn("step: preflight", output)
+        self.assertIn("step: revert-proof rc: 1", output)
+        self.assertIn(f"{commit[:12]}: avfilter/vf_x: fix side value: {commit}", output)
+        self.assertIn("history is incomplete", output)
+        self.assertIn("git fetch --unshallow", output)
+        self.assertNotIn("no revert-proof record", output)
+
+    def test_shallow_docs_fix_reports_incomplete_history(self) -> None:
+        """A docs-only side boundary produces its own history finding without a proof demand."""
+        clone = self.root.parent / "shallow"
+        base, commit = clone_shallow_side_fix(self.root, clone, "doc/manual.txt")
+        self.root, self.base = clone, base
+        step = self.proof_step()
+        self.assertEqual(step.rc, 1, step.output)
+        self.assertEqual(len(step.output.splitlines()), 1, step.output)
+        self.assertIn(commit, step.output)
+        self.assertIn("history is incomplete", step.output)
+        self.assertIn("fetch --unshallow", step.output)
+        self.assertNotIn("no revert-proof record", step.output)
+        self.assertNotIn("merge commit", step.output)
+
+    def test_shallow_source_fix_cannot_accept_record_until_history_is_complete(self) -> None:
+        """A matching source proof fails at a shallow boundary and passes after local deepening."""
+        clone = self.root.parent / "shallow"
+        base, commit = clone_shallow_side_fix(self.root, clone, "libavfilter/vf_x.c")
+        self.root, self.base = clone, base
+        head = self.git("rev-parse", "HEAD").strip()
+        head_tree = self.git("rev-parse", "HEAD^{tree}").strip()
+        record = self.write_record("shallow.json", self.valid_record(commit, head, head_tree))
+        step = self.proof_step(record)
+        self.assertEqual(step.rc, 1, step.output)
+        self.assertEqual(len(step.output.splitlines()), 1, step.output)
+        self.assertIn(commit, step.output)
+        self.assertIn("history is incomplete", step.output)
+        self.assertNotIn("no revert-proof record", step.output)
+        self.git("fetch", "-q", "--unshallow", "origin")
+        complete = self.proof_step(record)
+        self.assertEqual(complete.rc, 0, complete.output)
+        self.assertIn("1 fix commit(s), 1 revert-proof record(s)", complete.output)
+
+    def test_neutral_shallow_boundary_is_not_silently_skipped(self) -> None:
+        """A boundary with no fix wording still reports unknown parents by commit."""
+        clone = self.root.parent / "shallow"
+        base, commit = clone_shallow_side_fix(
+            self.root, clone, "doc/manual.txt", "doc: update wording"
+        )
+        self.root, self.base = clone, base
+        step = self.proof_step()
+        self.assertEqual(step.rc, 1, step.output)
+        self.assertIn(commit, step.output)
+        self.assertIn("history is incomplete", step.output)
+
+    def test_imported_true_root_remains_provable_after_history_check(self) -> None:
+        """A stored zero-parent source fix keeps the round-seven required-proof result."""
+        commit, _, _ = self.import_root_commit(
+            "libavfilter/vf_root.c", "avfilter/vf_root: fix imported value"
+        )
+        step = self.proof_step()
+        self.assertEqual(step.rc, 1, step.output)
+        self.assertIn(commit[:12], step.output)
+        self.assertIn("no revert-proof record", step.output)
+        self.assertNotIn("history is incomplete", step.output)
+
+    def import_root_commit(self, path: str, subject: str) -> tuple[str, str, str]:
+        """Merge an unrelated root into a range whose base remains an ancestor."""
+        branch = self.git("symbolic-ref", "--short", "HEAD").strip()
+        self.git("checkout", "--orphan", "imported-root")
+        self.git("rm", "-rf", ".")
+        self.write(path, SOURCE)
+        self.commit(subject)
+        commit = self.git("rev-parse", "HEAD").strip()
+        self.git("checkout", "-q", branch)
+        self.git(
+            "merge",
+            "--allow-unrelated-histories",
+            "--no-ff",
+            "-qm",
+            "merge imported history",
+            "imported-root",
+        )
+        head = self.git("rev-parse", "HEAD").strip()
+        self.git("merge-base", "--is-ancestor", self.base, head)
+        return commit, head, self.git("rev-parse", "HEAD^{tree}").strip()
+
+    def test_imported_root_regression_reaches_function_only_test_reference(self) -> None:
+        """An imported root fix passes regression-test when a changed test names only ff_value."""
+        self.import_root_commit("libavfilter/vf_root.c", "avfilter/vf_root: fix imported value")
+        self.write(
+            "libavutil/tests/film_grain_params.c",
+            "int main(void)\n{\n    return ff_value();\n}\n",
+        )
+        self.commit("tests: exercise imported root function")
+        rc, output = self.check(
+            "--no-revert-proof-reason",
+            "regression-test fixture",
+            "--no-revert-proof-reason",
+            "imported-root fixture",
+        )
+        self.assertEqual(rc, 0, output)
+        self.assertIn("step: regression-test rc: 0", output)
+        self.assertIn("1 fix commit(s), 1 test path(s) changed", output)
+
+    def test_imported_root_source_fix_requires_record(self) -> None:
+        """An imported root source fix cannot silently pass as a zero-fix range."""
+        commit, _, _ = self.import_root_commit(
+            "libavfilter/vf_root.c", "avfilter/vf_root: fix imported value"
+        )
+        step = self.proof_step()
+        self.assertEqual(step.rc, 1, step.output)
+        self.assertIn(f"{commit[:12]}: avfilter/vf_root: fix imported value", step.output)
+        self.assertIn("no revert-proof record", step.output)
+
+    def test_imported_root_source_fix_accepts_valid_record(self) -> None:
+        """A complete matching record satisfies an imported root source fix."""
+        commit, head, head_tree = self.import_root_commit(
+            "libavfilter/vf_root.c", "avfilter/vf_root: fix imported value"
+        )
+        record = self.write_record(
+            "root.json",
+            self.valid_record(commit, head, head_tree, reverted_paths=["libavfilter/vf_root.c"]),
+        )
+        step = self.proof_step(record)
+        self.assertEqual(step.rc, 0, step.output)
+        self.assertIn("1 fix commit(s), 1 revert-proof record(s)", step.output)
+
+    def test_imported_root_without_fix_wording_is_exempt(self) -> None:
+        """An imported root source addition without fix wording remains exempt."""
+        self.import_root_commit("libavfilter/vf_root.c", "avfilter/vf_root: add imported value")
+        step = self.proof_step()
+        self.assertEqual(step.rc, 0, step.output)
+        self.assertIn("0 fix commit(s)", step.output)
+
+    def test_imported_root_without_library_source_is_exempt(self) -> None:
+        """An imported root documentation fix remains exempt from source proof."""
+        self.import_root_commit("doc/imported.txt", "doc: fix imported wording")
+        step = self.proof_step()
+        self.assertEqual(step.rc, 0, step.output)
+        self.assertIn("0 fix commit(s)", step.output)
+
+    def test_record_keys_are_independent_of_path_bound(self) -> None:
+        """A valid seven-key proof object remains readable with a one-path bound."""
+        payload = self.valid_record("a" * 40, "b" * 40, "c" * 40, command=["pytest"])
+        record = self.write_record("proof.json", payload)
+        with unittest.mock.patch.object(upstream_lint, "MAX_PATHS", 1):
+            result = upstream_lint._read_revert_proof(record)
+        self.assertEqual(result, (payload, "a" * 40, None))
+
+    def test_command_arguments_are_independent_of_path_bound(self) -> None:
+        """A two-argument command remains valid with a one-path bound."""
+        payload = self.valid_record("a" * 40, "b" * 40, "c" * 40)
+        with unittest.mock.patch.object(upstream_lint, "MAX_PATHS", 1):
+            error = upstream_lint._revert_proof_schema_error(payload)
+        self.assertIsNone(error)
+
+    def add_fix_commit(
+        self, path: str = "libavfilter/vf_x.c", subject: str = "avfilter/vf_x: fix y"
+    ) -> tuple[str, str, str]:
+        """Write a source fix and test path, commit them and return commit, head and head_tree."""
+        self.write(path, SOURCE.replace("return 1", "return 2"))
+        self.write("tests/ref/fate/filter-x", "0\n")
+        self.commit(subject)
+        head = self.git("rev-parse", "HEAD").strip()
+        head_tree = self.git("rev-parse", "HEAD^{tree}").strip()
+        return head, head, head_tree
+
+    def write_record(self, filename: str, payload: dict[str, object]) -> Path:
+        """Write a JSON record dictionary to the temporary parent directory."""
+        target = self.root.parent / filename
+        target.write_text(json.dumps(payload), encoding="utf-8")
+        return target
+
+    def valid_record(
+        self, commit: str, head: str, head_tree: str, /, **overrides: object
+    ) -> dict[str, object]:
+        """Build a valid revert-proof record dictionary with optional field overrides."""
+        base_record: dict[str, object] = {
+            "commit": commit,
+            "head": head,
+            "head_tree": head_tree,
+            "command": ["pytest", "-q"],
+            "rc_head": 0,
+            "rc_reverted": 1,
+            "reverted_paths": ["libavfilter/vf_x.c"],
+        }
+        base_record.update(overrides)
+        return base_record
+
+    def test_step_accepts_matching_record_with_nonzero_rc_reverted(self) -> None:
+        """A matching record with rc_head 0 and nonzero rc_reverted passes revert-proof."""
+        commit, head, head_tree = self.add_fix_commit()
+        record_file = self.write_record("proof.json", self.valid_record(commit, head, head_tree))
+        rc, output = self.check("--revert-proof", str(record_file))
+        self.assertEqual(rc, 0, output)
+        self.assertIn("step: revert-proof rc: 0", output)
+
+    def test_unmatched_record_error_does_not_suppress_missing_proof(self) -> None:
+        """An unbound parse error stays at step scope beside the commit's missing proof."""
+        commit, _, _ = self.add_fix_commit()
+        record = self.root.parent / "invalid-record.json"
+        record.write_text("not JSON", encoding="utf-8")
+        step = self.proof_step(record)
+        self.assertEqual(step.rc, 1, step.output)
+        self.assertIn(f"{commit[:12]}: avfilter/vf_x: fix y: no revert-proof record", step.output)
+        error = f"{record}: not valid JSON"
+        self.assertEqual(step.output.splitlines().count(error), 1, step.output)
+        self.assertEqual(step.output.count(error), 1, step.output)
+
+    def test_message_only_replace_ref_cannot_hide_fix(self) -> None:
+        """A replacement with identical parents cannot hide a stored fix by renaming it."""
+        commit, _, _ = self.add_fix_commit()
+        self.git("commit", "--amend", "-qm", "avfilter/vf_x: rename helper")
+        replacement = self.git("rev-parse", "HEAD").strip()
+        self.git("reset", "--hard", commit)
+        self.git("replace", commit, replacement)
+        step = self.proof_step()
+        self.assertEqual(step.rc, 1, step.output)
+        self.assertIn(commit, step.output)
+        self.assertIn("replace refs", step.output)
+        self.assertNotIn("no revert-proof record", step.output)
+
+    def test_step_refuses_missing_record(self) -> None:
+        """A fix commit with no revert-proof record fails and names the commit and subject."""
+        commit, _, _ = self.add_fix_commit()
+        rc, output = self.check()
+        self.assertEqual(rc, 1, output)
+        self.assertIn("step: revert-proof rc: 1", output)
+        self.assertIn(f"{commit[:12]}: avfilter/vf_x: fix y", output)
+        self.assertIn("no revert-proof record", output)
+
+    def test_step_refuses_record_of_another_head_tree(self) -> None:
+        """A record whose head_tree differs from the range head tree fails as stale."""
+        commit, head, _ = self.add_fix_commit()
+        stale_tree = "0" * 40
+        record_file = self.write_record("stale.json", self.valid_record(commit, head, stale_tree))
+        rc, output = self.check("--revert-proof", str(record_file))
+        self.assertEqual(rc, 1, output)
+        self.assertIn("step: revert-proof rc: 1", output)
+        self.assertIn(f"{commit[:12]}: avfilter/vf_x: fix y", output)
+        self.assertIn("stale", output)
+
+    def test_step_refuses_rc_reverted_zero(self) -> None:
+        """A record with rc_reverted 0 fails because the test passes without the fix."""
+        commit, head, head_tree = self.add_fix_commit()
+        record_file = self.write_record(
+            "weak.json", self.valid_record(commit, head, head_tree, rc_reverted=0)
+        )
+        rc, output = self.check("--revert-proof", str(record_file))
+        self.assertEqual(rc, 1, output)
+        self.assertIn("step: revert-proof rc: 1", output)
+        self.assertIn(f"{commit[:12]}: avfilter/vf_x: fix y", output)
+        self.assertIn("test passes without the fix", output)
+
+    def test_step_refuses_rc_reverted_timeout(self) -> None:
+        """A record with rc_reverted timeout fails because a timeout gives no verdict."""
+        commit, head, head_tree = self.add_fix_commit()
+        record_file = self.write_record(
+            "timeout.json", self.valid_record(commit, head, head_tree, rc_reverted="timeout")
+        )
+        rc, output = self.check("--revert-proof", str(record_file))
+        self.assertEqual(rc, 1, output)
+        self.assertIn("step: revert-proof rc: 1", output)
+        self.assertIn(f"{commit[:12]}: avfilter/vf_x: fix y", output)
+        self.assertIn("no verdict", output)
+
+    def test_step_refuses_rc_head_nonzero(self) -> None:
+        """A record whose rc_head is nonzero fails and names the commit and subject."""
+        commit, head, head_tree = self.add_fix_commit()
+        record_file = self.write_record(
+            "bad_head.json", self.valid_record(commit, head, head_tree, rc_head=2)
+        )
+        rc, output = self.check("--revert-proof", str(record_file))
+        self.assertEqual(rc, 1, output)
+        self.assertIn("step: revert-proof rc: 1", output)
+        self.assertIn(f"{commit[:12]}: avfilter/vf_x: fix y", output)
+        self.assertIn("rc_head", output)
+
+    def test_step_refuses_duplicate_key(self) -> None:
+        """A record JSON file containing a duplicate key is refused by the JSON reader."""
+        commit, head, head_tree = self.add_fix_commit()
+        dup_path = self.root.parent / "dup.json"
+        duplicate_record = (
+            "{\n"
+            f'  "commit": "{commit}",\n'
+            f'  "head": "{head}",\n'
+            f'  "head_tree": "{head_tree}",\n'
+            '  "command": ["pytest"],\n'
+            '  "rc_head": 0,\n'
+            '  "rc_head": 0,\n'
+            '  "rc_reverted": 1,\n'
+            '  "reverted_paths": ["libavfilter/vf_x.c"]\n'
+            "}\n"
+        )
+        dup_path.write_text(
+            duplicate_record,
+            encoding="utf-8",
+        )
+        rc, output = self.check("--revert-proof", str(dup_path))
+        self.assertEqual(rc, 1, output)
+        self.assertIn("step: revert-proof rc: 1", output)
+        self.assertIn(f"{commit[:12]}: avfilter/vf_x: fix y", output)
+        self.assertIn("duplicate key", output)
+
+    def test_step_refuses_missing_key(self) -> None:
+        """A record JSON file missing a required key fails and names the missing key."""
+        commit, head, head_tree = self.add_fix_commit()
+        payload = self.valid_record(commit, head, head_tree)
+        del payload["reverted_paths"]
+        record_file = self.write_record("missing.json", payload)
+        rc, output = self.check("--revert-proof", str(record_file))
+        self.assertEqual(rc, 1, output)
+        self.assertIn("step: revert-proof rc: 1", output)
+        self.assertIn(f"{commit[:12]}: avfilter/vf_x: fix y", output)
+        self.assertIn("missing key", output)
+
+    def test_step_refuses_extra_key(self) -> None:
+        """A record JSON file with an extra key fails and names the extra key."""
+        commit, head, head_tree = self.add_fix_commit()
+        payload = self.valid_record(commit, head, head_tree, unexpected="value")
+        record_file = self.write_record("extra.json", payload)
+        rc, output = self.check("--revert-proof", str(record_file))
+        self.assertEqual(rc, 1, output)
+        self.assertIn("step: revert-proof rc: 1", output)
+        self.assertIn(f"{commit[:12]}: avfilter/vf_x: fix y", output)
+        self.assertIn("extra key", output)
+
+    def test_step_bounds_extra_key_text_in_schema_error(self) -> None:
+        """An oversized extra key name is truncated in the revert-proof schema diagnostic."""
+        commit, head, head_tree = self.add_fix_commit()
+        long_key = "z" * (upstream_lint.MAX_DIAGNOSTIC_KEY + 40)
+        payload = self.valid_record(commit, head, head_tree)
+        payload[long_key] = 1
+        record_file = self.write_record("huge_key.json", payload)
+        _, commit_id, error = upstream_lint._read_revert_proof(record_file)
+        self.assertEqual(commit_id, commit)
+        self.assertIsNotNone(error)
+        self.assertIn("extra key:", error or "")
+        self.assertNotIn(long_key, error or "")
+        self.assertIn("...", error or "")
+
+    def test_schema_samples_many_extra_keys(self) -> None:
+        """A large extra-key diagnostic reports a short sorted sample and the total."""
+        payload = dict.fromkeys(upstream_lint.REVERT_PROOF_KEYS)
+        for index in range(1999, -1, -1):
+            payload[f"extra-{index:04d}-" + "x" * 248] = None
+        error = upstream_lint._revert_proof_schema_error(payload) or ""
+        self.assertLess(len(error), 2000)
+        self.assertIn("2000 total", error)
+        self.assertIn(
+            ", ".join(f"extra-{index:04d}-" + "x" * 245 + "..." for index in range(5)), error
+        )
+        self.assertNotIn("extra-0005-", error)
+
+    def test_step_refuses_nul_in_recorded_command_argument(self) -> None:
+        """A recorded command argument containing NUL bytes is refused before measurement."""
+        commit, head, head_tree = self.add_fix_commit()
+        payload = self.valid_record(commit, head, head_tree, command=["pytest", "a\x00b"])
+        record_file = self.write_record("nul_arg.json", payload)
+        result = upstream_lint._read_revert_proof(record_file)
+        self.assertEqual(result[0], None)
+        self.assertIn("wrong value type for command", result[2] or "")
+
+    def test_step_refuses_tag_object_id_as_record_head(self) -> None:
+        """A record whose head field names an annotated tag is refused as inexact."""
+        commit, head, head_tree = self.add_fix_commit()
+        tag = f"proof-head-tag-{commit[:8]}"
+        self.git("tag", "-a", tag, "-m", "proof fixture tag", head)
+        tag_sha = self.git("rev-parse", tag).strip()
+        self.assertNotEqual(tag_sha, head)
+        record_file = self.write_record(
+            "tag_head.json", self.valid_record(commit, tag_sha, head_tree)
+        )
+        rc, output = self.check("--revert-proof", str(record_file))
+        self.assertEqual(rc, 1, output)
+        self.assertIn("head is not an exact commit id", output)
+
+    def test_record_count_overflow_waiver_passes_with_reason(self) -> None:
+        """A non-blank revert-proof waiver covers record-count overflow before loading."""
+        commit, head, head_tree = self.add_fix_commit()
+        first = self.write_record("first.json", self.valid_record(commit, head, head_tree))
+        second = self.write_record(
+            "second.json", self.valid_record(commit, head, head_tree, rc_reverted=2)
+        )
+        fixes = upstream_lint._fix_commits(self.root, self.base, head)
+        real_result = upstream_lint._revert_proof_result
+
+        def capped_result(tree, head_sha, history, records, waiver):
+            with unittest.mock.patch.object(upstream_lint, "MAX_PATHS", 1):
+                return real_result(tree, head_sha, history, records, waiver)
+
+        with unittest.mock.patch.object(
+            upstream_lint, "_revert_proof_result", side_effect=capped_result
+        ):
+            step = upstream_lint._revert_proof(
+                self.root,
+                self.base,
+                head,
+                (first, second),
+                "fixture duplicate records",
+            )
+        self.assertEqual(step.rc, 0, step.output)
+        self.assertIn("waived: fixture duplicate records", step.output)
+        self.assertIn("revert-proof records exceed MAX_PATHS=1: 2", step.output)
+        self.assertEqual(len(fixes), 1)
+
+    def test_record_count_overflow_blank_waiver_fails(self) -> None:
+        """Record-count overflow without a waiver keeps revert-proof rc 1."""
+        commit, head, head_tree = self.add_fix_commit()
+        first = self.write_record("first.json", self.valid_record(commit, head, head_tree))
+        second = self.write_record("second.json", self.valid_record(commit, head, head_tree))
+        real_result = upstream_lint._revert_proof_result
+
+        def capped_result(tree, head_sha, history, records, waiver):
+            with unittest.mock.patch.object(upstream_lint, "MAX_PATHS", 1):
+                return real_result(tree, head_sha, history, records, waiver)
+
+        with unittest.mock.patch.object(
+            upstream_lint, "_revert_proof_result", side_effect=capped_result
+        ):
+            step = upstream_lint._revert_proof(self.root, self.base, head, (first, second))
+        self.assertEqual(step.rc, 1, step.output)
+        self.assertIn("revert-proof records exceed MAX_PATHS=1: 2", step.output)
+
+    def test_step_refuses_wrong_type(self) -> None:
+        """A record JSON file with a wrong field value type fails and names the commit."""
+        commit, head, head_tree = self.add_fix_commit()
+        for idx, overrides in enumerate(
+            (
+                {"commit": "not-40-hex"},
+                {"head": 123},
+                {"head_tree": "Z" * 40},
+                {"command": "pytest"},
+                {"rc_head": True},
+                {"rc_head": False},
+                {"rc_head": 0.0},
+                {"rc_head": None},
+                {"rc_head": []},
+                {"rc_reverted": "other"},
+                {"rc_reverted": True},
+                {"rc_reverted": False},
+                {"rc_reverted": 0.0},
+                {"rc_reverted": None},
+                {"rc_reverted": []},
+                {"reverted_paths": ["b.c", "a.c"]},
+            )
+        ):
+            with self.subTest(overrides=overrides):
+                record_file = self.write_record(
+                    f"wrong_{idx}.json", self.valid_record(commit, head, head_tree, **overrides)
+                )
+                rc, output = self.check("--revert-proof", str(record_file))
+                self.assertEqual(rc, 1, output)
+                self.assertIn("step: revert-proof rc: 1", output)
+                self.assertIn(f"{commit[:12]}: avfilter/vf_x: fix y", output)
+                self.assertIn("wrong value type", output)
+
+    def test_record_accepts_return_code_values(self) -> None:
+        """Integer return codes and recognized outcome strings pass record validation."""
+        for rc_head in (0, 1):
+            for rc_reverted in (0, 1, "timeout", "launch-error"):
+                with self.subTest(rc_head=rc_head, rc_reverted=rc_reverted):
+                    payload = self.valid_record(
+                        "a" * 40, "b" * 40, "c" * 40, rc_head=rc_head, rc_reverted=rc_reverted
+                    )
+                    record = self.write_record("proof.json", payload)
+                    result = upstream_lint._read_revert_proof(record)
+                    self.assertEqual(result, (payload, "a" * 40, None))
+
+    def test_step_refuses_file_that_is_not_json(self) -> None:
+        """A record file that is not valid JSON fails and names the commit and subject."""
+        commit, _, _ = self.add_fix_commit()
+        bad_path = self.root.parent / "not_json.txt"
+        bad_path.write_text("{not valid json\n", encoding="utf-8")
+        rc, output = self.check("--revert-proof", str(bad_path))
+        self.assertEqual(rc, 1, output)
+        self.assertIn("step: revert-proof rc: 1", output)
+        self.assertIn(f"{commit[:12]}: avfilter/vf_x: fix y", output)
+        self.assertIn("not valid JSON", output)
+
+    def test_step_waiver_passes_and_names_commit(self) -> None:
+        """A non-blank --no-revert-proof-reason passes the step and lists the waived commit."""
+        commit, _, _ = self.add_fix_commit()
+        rc, output = self.check("--no-revert-proof-reason", "hardware-only path")
+        self.assertEqual(rc, 0, output)
+        self.assertIn("step: revert-proof rc: 0\nwaived: hardware-only path", output)
+        self.assertIn(f"{commit[:12]}: avfilter/vf_x: fix y", output)
+
+    def test_step_boundary_range_without_fix_commit_passes(self) -> None:
+        """A range without a source fix commit passes revert-proof with a summary line."""
+        self.write("libavfilter/vf_x.c", SOURCE.replace("return 1", "return 2"))
+        self.commit("avfilter/vf_x: update y")
+        rc, output = self.check()
+        self.assertEqual(rc, 0, output)
+        self.assertIn("step: revert-proof rc: 0\n0 fix commit(s)", output)
+
+    def test_step_boundary_two_fixes_with_one_record_names_only_unrecorded_commit(self) -> None:
+        """When one of two fix commits has a valid record, only the other commit is reported."""
+        first_commit, _, _ = self.add_fix_commit("libavfilter/vf_x.c", "avfilter/vf_x: fix first")
+        self.write("libavfilter/vf_y.c", SOURCE.replace("return 1", "return 3"))
+        self.write("tests/ref/fate/filter-y", "0\n")
+        self.commit("avfilter/vf_y: fix second")
+        second_commit = self.git("rev-parse", "HEAD").strip()
+        head_tree = self.git("rev-parse", "HEAD^{tree}").strip()
+        record_file = self.write_record(
+            "first.json", self.valid_record(first_commit, second_commit, head_tree)
+        )
+
+        rc, output = self.check("--revert-proof", str(record_file))
+        self.assertEqual(rc, 1, output)
+        self.assertIn("step: revert-proof rc: 1", output)
+        self.assertIn(f"{second_commit[:12]}: avfilter/vf_y: fix second", output)
+        self.assertNotIn(f"{first_commit[:12]}: avfilter/vf_x: fix first", output)
+
+    def test_step_refuses_merge_commit_with_fix_wording_unless_waived(self) -> None:
+        """A merge commit with fix wording is refused by name unless waived by reason."""
+        self.git("checkout", "-qb", "side", self.base)
+        self.write("libavfilter/vf_y.c", SOURCE.replace("return 1", "return 3"))
+        self.commit("avfilter/vf_y: add y")
+        self.git("checkout", "-q", "-")
+        self.write("libavfilter/vf_x.c", SOURCE.replace("return 1", "return 2"))
+        self.commit("avfilter/vf_x: update x")
+        self.git("merge", "--no-ff", "-qm", "avfilter/vf_x: merge side and fix y", "side")
+        merge_sha = self.git("rev-parse", "HEAD").strip()
+        head_tree = self.git("rev-parse", "HEAD^{tree}").strip()
+        record_file = self.write_record(
+            "merge.json", self.valid_record(merge_sha, merge_sha, head_tree)
+        )
+
+        rc, output = self.check("--revert-proof", str(record_file))
+        self.assertEqual(rc, 1, output)
+        self.assertIn("step: revert-proof rc: 1", output)
+        self.assertIn(f"{merge_sha[:12]}: avfilter/vf_x: merge side and fix y", output)
+        self.assertIn("own commit", output)
+
+        rc, output = self.check("--no-revert-proof-reason", "merge conflict resolution")
+        self.assertEqual(rc, 0, output)
+        self.assertIn("step: revert-proof rc: 0\nwaived: merge conflict resolution", output)
+        self.assertIn(f"{merge_sha[:12]}: avfilter/vf_x: merge side and fix y", output)
+
+    def test_step_accepts_good_plus_stale_duplicate_records(self) -> None:
+        """A valid record for a commit satisfies the step even when a stale duplicate exists."""
+        commit, head, head_tree = self.add_fix_commit()
+        stale_file = self.write_record("stale.json", self.valid_record(commit, head, "0" * 40))
+        good_file = self.write_record("good.json", self.valid_record(commit, head, head_tree))
+
+        rc, output = self.check("--revert-proof", str(stale_file), "--revert-proof", str(good_file))
+        self.assertEqual(rc, 0, output)
+        self.assertIn("step: revert-proof rc: 0", output)
+
+    def test_step_refuses_good_plus_malformed_duplicate_records(self) -> None:
+        """A malformed record remains a finding even when a valid record for the commit exists."""
+        commit, head, head_tree = self.add_fix_commit()
+        good_file = self.write_record("good.json", self.valid_record(commit, head, head_tree))
+        bad_payload = self.valid_record(commit, head, head_tree)
+        del bad_payload["reverted_paths"]
+        bad_file = self.write_record("bad.json", bad_payload)
+
+        rc, output = self.check("--revert-proof", str(good_file), "--revert-proof", str(bad_file))
+        self.assertEqual(rc, 1, output)
+        self.assertIn("step: revert-proof rc: 1", output)
+        self.assertIn(f"{commit[:12]}: avfilter/vf_x: fix y", output)
+        self.assertIn("missing key", output)
+
+    def test_step_refuses_fix_commits_above_commit_cap(self) -> None:
+        """More fix commits than MAX_CLAIM_COMMITS fails revert-proof without truncating."""
+        self.add_fix_commit("libavfilter/vf_x.c", "avfilter/vf_x: fix first")
+        self.write("libavfilter/vf_y.c", SOURCE.replace("return 1", "return 3"))
+        self.write("tests/ref/fate/filter-y", "0\n")
+        self.commit("avfilter/vf_y: fix second")
+        second_commit = self.git("rev-parse", "HEAD").strip()
+        head_tree = self.git("rev-parse", "HEAD^{tree}").strip()
+        record_file = self.write_record(
+            "second.json", self.valid_record(second_commit, second_commit, head_tree)
+        )
+
+        with unittest.mock.patch.object(upstream_lint, "MAX_CLAIM_COMMITS", 1):
+            _, output = self.check("--revert-proof", str(record_file))
+        self.assertIn("step: revert-proof rc: 1", output)
+        self.assertIn("fix commits exceed MAX_CLAIM_COMMITS=1: 2", output)
+
+    def proof_step(self, *records: Path) -> upstream_lint.Step:
+        """Run only the revert-proof consumer against the fixture's committed range."""
+        head = self.git("rev-parse", "HEAD").strip()
+        return upstream_lint._revert_proof(self.root, self.base, head, records)
+
+    def test_step_refuses_commit_scan_overflow_before_classification(self) -> None:
+        """A fix behind the commit scan bound cannot disappear as a zero-fix range."""
+        self.add_fix_commit()
+        self.write("doc/new.txt", "newer neutral commit\n")
+        self.commit("doc: update text")
+        with unittest.mock.patch.object(upstream_lint, "MAX_PATHS", 1):
+            step = self.proof_step()
+        self.assertEqual(step.rc, 1, step.output)
+        self.assertIn("commit scan exceeds MAX_PATHS=1: 2", step.output)
+
+    def test_step_accepts_exact_commit_scan_bound(self) -> None:
+        """Exactly seven commits still prove the fix behind six neutral commits."""
+        commit, _, _ = self.add_fix_commit()
+        for number in range(6):
+            self.write("doc/new.txt", f"neutral update {number}\n")
+            self.commit("doc: update text")
+        head = self.git("rev-parse", "HEAD").strip()
+        head_tree = self.git("rev-parse", "HEAD^{tree}").strip()
+        record = self.write_record("proof.json", self.valid_record(commit, head, head_tree))
+        with unittest.mock.patch.object(upstream_lint, "MAX_PATHS", 7):
+            step = self.proof_step(record)
+        self.assertEqual(step.rc, 0, step.output)
+        self.assertIn("1 fix commit(s), 1 revert-proof record(s)", step.output)
+
+    def test_step_refuses_path_scan_overflow_before_source_classification(self) -> None:
+        """A source behind seven doc paths cannot hide beyond the path scan bound."""
+        for number in range(7):
+            self.write(f"doc/{number}.txt", "documentation\n")
+        commit, _, _ = self.add_fix_commit()
+        with unittest.mock.patch.object(upstream_lint, "MAX_PATHS", 7):
+            step = self.proof_step()
+        self.assertEqual(step.rc, 1, step.output)
+        self.assertIn(f"{commit}: commit paths exceed MAX_PATHS=7: 9", step.output)
+
+    def test_step_accepts_exact_path_scan_bound(self) -> None:
+        """Exactly seven commit paths include the complete sorted source set."""
+        for number in range(5):
+            self.write(f"doc/{number}.txt", "documentation\n")
+        commit, head, head_tree = self.add_fix_commit()
+        record = self.write_record("proof.json", self.valid_record(commit, head, head_tree))
+        with unittest.mock.patch.object(upstream_lint, "MAX_PATHS", 7):
+            step = self.proof_step(record)
+        self.assertEqual(step.rc, 0, step.output)
+
+    def test_step_refuses_record_head_with_wrong_tree_or_missing_commit(self) -> None:
+        """A plausible head hash must resolve to a commit with the recorded tree."""
+        commit, _, head_tree = self.add_fix_commit()
+        for head, diagnostic in (
+            (self.base, "head commit tree differs"),
+            ("0" * 40, "head does not resolve to a commit"),
+            (head_tree, "head does not resolve to a commit"),
+        ):
+            with self.subTest(head=head):
+                record = self.write_record(
+                    "bad-head.json", self.valid_record(commit, head, head_tree)
+                )
+                step = self.proof_step(record)
+                self.assertEqual(step.rc, 1, step.output)
+                self.assertIn(diagnostic, step.output)
+
+    def test_step_refuses_sorted_but_inexact_reverted_paths(self) -> None:
+        """Sorted source lists still fail when paths are missing, extra or duplicated."""
+        self.write("libavfilter/vf_y.c", SOURCE)
+        commit, head, head_tree = self.add_fix_commit()
+        for paths in (
+            ["libavfilter/vf_x.c"],
+            ["libavfilter/vf_x.c", "libavfilter/vf_y.c", "libavfilter/vf_z.c"],
+            ["libavfilter/vf_x.c", "libavfilter/vf_x.c", "libavfilter/vf_y.c"],
+        ):
+            with self.subTest(paths=paths):
+                record = self.write_record(
+                    "bad-paths.json",
+                    self.valid_record(commit, head, head_tree, reverted_paths=paths),
+                )
+                step = self.proof_step(record)
+                self.assertEqual(step.rc, 1, step.output)
+                self.assertIn("reverted_paths differ from fix source paths", step.output)
+
+    def test_step_accepts_complete_sorted_reverted_source_paths(self) -> None:
+        """The full sorted source set accepts with a resolvable matching head commit."""
+        self.write("libavfilter/vf_y.c", SOURCE)
+        commit, head, head_tree = self.add_fix_commit()
+        record = self.write_record(
+            "proof.json",
+            self.valid_record(
+                commit, head, head_tree, reverted_paths=["libavfilter/vf_x.c", "libavfilter/vf_y.c"]
+            ),
+        )
+        step = self.proof_step(record)
+        self.assertEqual(step.rc, 0, step.output)
 
 
 if __name__ == "__main__":

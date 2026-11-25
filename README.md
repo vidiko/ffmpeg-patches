@@ -622,9 +622,11 @@ pull, the measured two-pull, 12-page window needs at most 519 requests and
 `RequestBudget.__call__` in `scripts/upstream_links_forge.py` admits a request
 only while more than `REQUEST_TIMEOUT` plus the 0.5-second pause (30.5 seconds)
 of the scan budget remains. Before request 519 the scan has paused 518 times
-(259 seconds), so less than 10.5 seconds remain for the network and local work
-of the 518 earlier requests. At 25 ms per request, request 514 is the last one
-admitted and the scan exits 2 when request 515 is refused; narrow a fill with
+(259 seconds), so 1510.5 seconds remain (1800 minus the 30.5-second reserve
+minus 259) for the network and local work of the 518 earlier requests, about
+2.9 seconds each. At 25 ms per request, all 519 requests are admitted, and the
+window still exits 2 when the earlier requests average more than about 2.9
+seconds; narrow a fill with
 `fill --pull N` (`_fill_targets` in `scripts/upstream_links_manifest.py`), or
 narrow a check's candidate window with `check --since YYYY-MM-DD`
 (`check_window` in `scripts/upstream_links.py`), or add check targets with
@@ -634,9 +636,23 @@ Both commands derive their request cap as
 candidate rows and 20 file pages per pull. Before reading files, a progress
 line gives the candidate count, expected requests assuming one file page per
 pull and a file-page upper bound.
-The monotonic `SCAN_BUDGET_SECONDS` budget is 300 seconds for network waits
+The monotonic `SCAN_BUDGET_SECONDS` budget is 1800 seconds for network waits
 in either command; detected exhaustion prints `incomplete scan` and exits 2
-before publishing. Admission reserves pacing and a full network-operation
+before publishing.
+
+That 1800-second budget (1769.5 usable seconds after the 30.5-second reserve)
+is sized from the 1000-candidate cap: for `N` open targets in
+`upstream-contributions.json`, a cap-sized scan makes at most `N + 20`
+pre-plan requests and `N + 1000` single-page file listings. At the pace
+measured in one scheduled `upstream.yml` run on 2026-11-24 (about 3.6 seconds
+per pre-plan request and 1.08 seconds per file listing, 0.5-second pacing
+included), the 23 open targets of that run need 1259.64 seconds, or
+1511.57 seconds with a 1.2 headroom factor.
+`test_scan_budget_covers_candidate_cap_at_measured_ci_pace` in
+`tests/test_workflow_actions.py` pins this bound and turns red at 69 open
+targets.
+
+Admission reserves pacing and a full network-operation
 timeout, and elapsed time is checked again after pacing and each fetch.
 A single read-only daemon worker performs
 each fetch; waiting ends at the remaining scan budget even if the socket keeps
@@ -648,7 +664,7 @@ Local CPU work and local file operations are not interrupted, so the budget is
 not a hard whole-run time limit. On detected expiry no further fetch is
 admitted; the process can exit while the outstanding read finishes. Overlaps run
 in a separate workflow job, independent of drift, with a timeout of twice that
-budget (10 minutes); a workflow test pins this relationship.
+budget (60 minutes); a workflow test pins this relationship.
 The maximum 4096 own pulls admit 106036 requests:
 53018 seconds of pacing, or 3234098 seconds including one 30-second blocking
 operation per request, so the request cap alone cannot bound job time.

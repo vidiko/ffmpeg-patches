@@ -3133,10 +3133,65 @@ def _write_revisit_records(root: Path, states: dict[int, str]) -> Path:
     return record_path
 
 
+REVISIT_CAP_LIVE_TRIGGER = "revisit at the 1 merge"
+REVISIT_CAP_FIRED_TRIGGER = "revisit at the 2 merge"
+
+REVISIT_CAP_CASES: tuple[tuple[int, str | None, int, int], ...] = (
+    (32, None, 0, 0),
+    (33, None, 1, 0),
+    (32, REVISIT_CAP_FIRED_TRIGGER, 1, 0),
+    (31, REVISIT_CAP_FIRED_TRIGGER, 0, 1),
+    (0, REVISIT_CAP_FIRED_TRIGGER, 0, 1),
+)
+
+
+def _build_revisit_cap_reason(live_count: int, fired_trigger: str | None) -> str:
+    """Join live_count open merge triggers and an optional trailing fired trigger."""
+    parts = [REVISIT_CAP_LIVE_TRIGGER for _ in range(live_count)]
+    if fired_trigger is not None:
+        parts.append(fired_trigger)
+    return "; ".join(parts)
+
+
+def _write_merged_exceptions_sidecar(
+    root: Path, count: int, last_reason: str = REVISIT_BASE_BUMP
+) -> Path:
+    """Write a temporary merged sidecar with count distinct valid exception entries."""
+    patches = root / "patches"
+    patches.mkdir(parents=True, exist_ok=True)
+    sidecar = patches / "0001-revisit.toml"
+    header = (
+        'status = "merged"\n'
+        'upstream = "https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/1"\n'
+        'consumers = ["vmafx"]\n'
+    )
+    chunks = [header]
+    for index in range(count):
+        reason = last_reason if index == count - 1 else REVISIT_BASE_BUMP
+        chunks.append(
+            "\n[[exceptions]]\n"
+            'rule = "HISS-04"\n'
+            'path = "lib.c"\n'
+            f'function = "f{index}"\n'
+            "lines = 61\n"
+            'category = "D"\n'
+            'entered = "2026-10-31"\n'
+            'expires = "2027-02-28"\n'
+            f"reason = {json.dumps(reason)}\n"
+        )
+    sidecar.write_text("".join(chunks), encoding="utf-8")
+    return sidecar
+
+
 class RevisitTriggerTest(unittest.TestCase):
     """Verify fired revisit-trigger detection in sidecar exception reasons."""
 
     PREFIX = "0001-revisit.toml: exception (HISS-04, f): revisit trigger fired"
+    OVERFLOW_ERROR = (
+        "0001-revisit.toml: exception (HISS-04, f): "
+        "more than 32 merge revisit triggers in one reason; shorten the reason"
+    )
+    EXCEPTIONS_CAP_ERROR = "0001-revisit.toml: 'exceptions' exceeds cap of 4096"
 
     def _check_case(
         self, status: str, reason: str, record_states: dict[int, str] | None
@@ -3150,6 +3205,16 @@ class RevisitTriggerTest(unittest.TestCase):
             findings = series.Findings()
             series.check_metadata(sidecar, findings, today=date(2026, 11, 24))
             return findings, root / series.CONTRIBUTIONS
+
+    def _check_merged_exceptions_count(
+        self, count: int, last_reason: str = REVISIT_BASE_BUMP
+    ) -> series.Findings:
+        """Run check_metadata on a temporary merged sidecar with count exception entries."""
+        with tempfile.TemporaryDirectory() as tmp:
+            sidecar = _write_merged_exceptions_sidecar(Path(tmp), count, last_reason)
+            findings = series.Findings()
+            series.check_metadata(sidecar, findings, today=date(2026, 11, 24))
+            return findings
 
     def test_revisit_trigger_cases(self) -> None:
         """Check live, fired, missing-entry and missing-record revisit trigger rows."""
@@ -3181,6 +3246,34 @@ class RevisitTriggerTest(unittest.TestCase):
         fired = [err for err in findings.errors if "revisit trigger fired" in err]
         self.assertEqual(fired, [])
         self.assertEqual(findings.errors, [])
+
+    def test_revisit_trigger_cap_cases(self) -> None:
+        """Check the per-reason merge-trigger cap boundary and overflow diagnostics."""
+        records = {1: "open", 2: "merged"}
+        for index, (live, fired_trigger, exp_overflow, exp_fired) in enumerate(REVISIT_CAP_CASES):
+            with self.subTest(row=index, live=live, fired_trigger=fired_trigger):
+                reason = _build_revisit_cap_reason(live, fired_trigger)
+                findings, _ = self._check_case("submitted", reason, records)
+                overflow = [err for err in findings.errors if err == self.OVERFLOW_ERROR]
+                fired = [err for err in findings.errors if err.startswith(self.PREFIX)]
+                other = [
+                    err
+                    for err in findings.errors
+                    if err != self.OVERFLOW_ERROR and not err.startswith(self.PREFIX)
+                ]
+                self.assertEqual(len(overflow), exp_overflow, findings.errors)
+                self.assertEqual(len(fired), exp_fired, findings.errors)
+                self.assertEqual(other, [], findings.errors)
+
+    def test_exceptions_cap_at_limit_passes(self) -> None:
+        """Accept a merged sidecar carrying the maximum 4096 valid exception entries."""
+        findings = self._check_merged_exceptions_count(4096)
+        self.assertEqual(findings.errors, [])
+
+    def test_exceptions_cap_overflow_reports_error(self) -> None:
+        """Reject a 4097-entry merged sidecar with one cap error and no other finding."""
+        findings = self._check_merged_exceptions_count(4097, "revisit when the patch goes upstream")
+        self.assertEqual(findings.errors, [self.EXCEPTIONS_CAP_ERROR])
 
 
 if __name__ == "__main__":

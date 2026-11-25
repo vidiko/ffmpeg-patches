@@ -59,6 +59,7 @@ import argparse
 import bisect
 import contextlib
 import functools
+import itertools
 import json
 import os
 import re
@@ -488,15 +489,20 @@ def check_exception_entry(
     return pair
 
 
-def check_exceptions_metadata(data: dict, name: str, findings: Findings, today: date) -> None:
+def check_exceptions_metadata(
+    data: dict[str, object], name: str, findings: Findings, today: date
+) -> None:
+    """Validate the sidecar exceptions table list, its entry cap and duplicate keys."""
     if "exceptions" not in data:
         return
     exceptions = data["exceptions"]
     if not isinstance(exceptions, list):
         findings.error(name, "'exceptions' must be an array of tables")
         return
+    if len(exceptions) > MAX_SERIES_EXCEPTIONS:
+        findings.error(name, f"'exceptions' exceeds cap of {MAX_SERIES_EXCEPTIONS}")
     seen_pairs: set[tuple[str, str]] = set()
-    for entry in exceptions:
+    for entry in exceptions[:MAX_SERIES_EXCEPTIONS]:
         pair = check_exception_entry(entry, name, findings, today)
         if pair is not None:
             if pair in seen_pairs:
@@ -550,6 +556,15 @@ def _revisit_trigger_error(entry: dict[str, object], trigger: str, cause: str) -
     )
 
 
+def _revisit_trigger_cap_error(entry: dict[str, object]) -> str:
+    """Format one merge revisit-trigger cap error with its rule, function and limit."""
+    return (
+        f"exception ({entry.get('rule')}, {entry.get('function')}): "
+        f"more than {MAX_TRIGGER_MATCHES} merge revisit triggers in one reason; "
+        "shorten the reason"
+    )
+
+
 def _merge_trigger_cause(
     number: int, states: dict[int, str] | None, record_error: str | None
 ) -> str | None:
@@ -570,7 +585,7 @@ def _reason_revisit_errors(
     record_path: Path,
     record_cache: list[tuple[dict[int, str] | None, str | None]],
 ) -> list[str]:
-    """Return fired revisit-trigger messages for one exception entry."""
+    """Return revisit-trigger and trigger-cap errors for one exception entry."""
     reason = entry.get("reason")
     if not isinstance(reason, str):
         return []
@@ -580,14 +595,18 @@ def _reason_revisit_errors(
         errors.append(
             _revisit_trigger_error(entry, GOES_UPSTREAM_TRIGGER, f"sidecar status is {status!r}")
         )
-    matches = list(MERGE_TRIGGER_PATTERN.finditer(bounded))[:MAX_TRIGGER_MATCHES]
-    for match in matches:
+    matches = tuple(
+        itertools.islice(MERGE_TRIGGER_PATTERN.finditer(bounded), MAX_TRIGGER_MATCHES + 1)
+    )
+    for match in matches[:MAX_TRIGGER_MATCHES]:
         if not record_cache:
             record_cache.append(_read_contribution_states(record_path))
         states, record_error = record_cache[0]
         cause = _merge_trigger_cause(int(match.group(1)), states, record_error)
         if cause is not None:
             errors.append(_revisit_trigger_error(entry, match.group(0), cause))
+    if len(matches) > MAX_TRIGGER_MATCHES:
+        errors.append(_revisit_trigger_cap_error(entry))
     return errors
 
 

@@ -1788,7 +1788,6 @@ FIELD_ASSIGN_TARGET = re.compile(
 )
 CONDITION_HEAD = re.compile(r"\b(?:if|while)\s*\(")
 TEXI_ITEM_HEAD = re.compile(r"^@itemx?\s+(\S+)")
-TEXI_ENTRY_BOUNDARY = re.compile(r"^@(?:itemx?|end)\b")
 TEXI_ENTRY_TABLES = frozenset(("ftable", "table", "vtable"))
 OPTION_TEST_MARKERS = ("if (", "while (", "&&", "||", "?")
 OUTSIDE_TEST_MARKERS = ("&&", "||", "?")

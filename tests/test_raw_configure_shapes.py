@@ -8,9 +8,14 @@ import ast
 import graphlib
 import io
 import json
+import math
 import os
+import re
+import time
 import unittest.mock
+from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 from scripts import raw_configure_body as body_mod
 from scripts import raw_configure_files as files_mod
@@ -351,6 +356,206 @@ _R11_TS_MISSING_SINGLE = (
     "echo $( (a)\n",
     "[ a\n",
 )
+
+_R12_REFUSE_PROBES = (
+    (
+        "m01_cmd_pipeline_exec_first_stage",
+        "cmd",
+        'exec 3<<< "./helper.sh"; exec 3<<< x | cat >/dev/null; bash <&3',
+    ),
+    (
+        "m02_body_pipeline_exec_first_stage",
+        "body",
+        'exec 3<<< "./helper.sh"\nexec 3<<< x | cat >/dev/null\nbash <&3\n',
+    ),
+    (
+        "m03_cmd_pipeline_exec_last_stage",
+        "cmd",
+        'exec 3<<< "./helper.sh"; cat </dev/null | exec 3<<< x; bash <&3',
+    ),
+    ("m04_cmd_subshell_exec", "cmd", 'exec 3<<< "./helper.sh"; ( exec 3<<< x ); bash <&3'),
+    ("m05_body_subshell_exec", "body", 'exec 3<<< "./helper.sh"\n( exec 3<<< x )\nbash <&3\n'),
+    ("m06_cmd_saved_var_reassigned", "cmd", 'd=./helper.sh; exec 3<<< "$d"; d=x; bash 0<&3'),
+    ("m07_body_saved_var_reassigned", "body", 'd=./helper.sh\nexec 3<<< "$d"\nd=x\nbash 0<&3\n'),
+    (
+        "m08_body_saved_var_read",
+        "body",
+        'd=./helper.sh\nexec 3<<< "$d"\nread -r d <<< x\nbash <&3\n',
+    ),
+    (
+        "m09_cmd_saved_var_for",
+        "cmd",
+        'd=./helper.sh; exec 3<<< "$d"; for d in x; do :; done; bash <&3',
+    ),
+    ("m10_body_saved_var_export", "body", 'd=./helper.sh\nexec 3<<< "$d"\nexport d=x\nbash <&3\n'),
+    ("m11_cmd_saved_var_benign", "cmd", 'd=./helper.sh; exec 3<<< "$d"; d=true; bash <&3'),
+    ("m12_body_saved_var_benign", "body", 'd=./helper.sh\nexec 3<<< "$d"\nd=true\nbash <&3\n'),
+    (
+        "m13_cmd_inline_saved_var_benign",
+        "cmd",
+        'd=./helper.sh; exec 3<<< "$d"; d=true; bash 0<&3 4<<< x',
+    ),
+    (
+        "m14_body_arith_paren_then_exec",
+        "body",
+        ': $(( (1 + (2)) << 1 ))\nexec 3<<< "./helper.sh"\nbash <&3\n',
+    ),
+    (
+        "m15_cmd_arith_paren_then_exec",
+        "cmd",
+        ': $(( (1 + (2)) << 1 )); exec 3<<< "./helper.sh"; bash <&3',
+    ),
+    (
+        "m16_body_arith_paren_inline_dup",
+        "body",
+        ': $(( (1 + (2)) << 1 ))\nbash 3<<< "./helper.sh" 0<&3\n',
+    ),
+    (
+        "m17_body_printf_v_saved_benign",
+        "body",
+        'printf -v d %s ./helper.sh\nexec 3<<< "$d"\nd=true\nbash <&3\n',
+    ),
+    (
+        "m19_body_read_saved_benign",
+        "body",
+        'read -r d <<< ./helper.sh\nexec 3<<< "$d"\nd=true\nbash <&3\n',
+    ),
+    (
+        "m20_body_declare_saved_benign",
+        "body",
+        'declare d=./helper.sh\nexec 3<<< "$d"\nd=true\nbash <&3\n',
+    ),
+    (
+        "m21_body_append_saved_benign",
+        "body",
+        'd=./helper\nd+=.sh\nexec 3<<< "$d"\nd=true\nbash <&3\n',
+    ),
+)
+_R12_ALLOW_PROBES = (
+    ("n01_body_arith_nested_paren_shift", "body", 'd=x\n: $(( (1 + (2)) << 1 ))\ncat 3<<< "$d"\n'),
+    ("n02_body_arith_plain_shift", "body", 'd=x\n: $(( 1 << 1 ))\ncat 3<<< "$d"\n'),
+    ("n03_body_arith_one_group_shift", "body", 'd=x\n: $(( (1) << 1 ))\ncat 3<<< "$d"\n'),
+    ("n04_cmd_pipeline_exec_cat", "cmd", "exec 3<<< x; exec 3<<< y | cat >/dev/null; cat <&3"),
+    ("n05_body_saved_literal_cat", "body", "exec 3<<< first\nd=x\ncat <&3\n"),
+    ("n06_body_control_cat_fd", "body", 'd=x\ncat 3<<< "$d"\n'),
+    (
+        "n07_body_arith_nested_paren_dup",
+        "body",
+        'd=x\n: $(( (1 + (2)) << 1 ))\ncat 3<<< "$d" 0<&3\n',
+    ),
+    ("n08_body_arith_plain_dup", "body", 'd=x\n: $(( 1 << 1 ))\ncat 3<<< "$d" 0<&3\n'),
+    (
+        "n09_body_arith_nested_paren_exec_dup",
+        "body",
+        'd=x\n: $(( (1 + (2)) << 1 ))\nexec 3<<< "$d"\ncat <&3\n',
+    ),
+    ("n10_body_plain_dup_control", "body", 'd=x\ncat 3<<< "$d" 0<&3\n'),
+)
+_STALE_REASON = "saved here-string word may change before its duplication"
+_UNKNOWN_REASON = "descriptor binding unknown at duplication"
+_R12_CONTEXT_ROWS = (
+    ("p01", "exec 3<<<parent; exec 3<<<stage | cat >/dev/null; cat <&3", "parent"),
+    ("p02", "exec 3<<<parent; cat </dev/null | exec 3<<<stage; cat <&3", "parent"),
+    ("p03", "exec 3<<<parent; { exec 3<<<grp; }; cat <&3", "grp"),
+    ("p04", "exec 3<<<parent; ( exec 3<<<sub ); cat <&3", "parent"),
+    ("p05", "exec 3<<<parent; exec 3<<<stage | cat <&3", "parent"),
+    ("p06", "exec 3<<<parent; exec 3<<<stage && cat <&3", "stage"),
+    (
+        "l01",
+        "shopt -s lastpipe; exec 3<<<parent; cat </dev/null | exec 3<<<stage; cat <&3",
+        _UNKNOWN_REASON,
+    ),
+    (
+        "l02",
+        "shopt -s lastpipe; exec 3<<<parent; exec 3<<<stage | cat >/dev/null; cat <&3",
+        "parent",
+    ),
+    ("l03", "f() { exec 3<<<fn; }; exec 3<<<parent; f; cat <&3", _UNKNOWN_REASON),
+    ("l04", "exec 3<<<parent; exec 3<<<bg & wait; cat <&3", "parent"),
+    ("l05", "exec 3<<<parent; x=$(exec 3<<<cs); cat <&3", "parent"),
+    ("l06", "exec 3<<<parent; { exec 3<<<grp; } | cat; cat <&3", "parent"),
+    ("l07", "exec 3<<<parent; if true; then exec 3<<<if; fi; cat <&3", "if"),
+    ("l08", "exec 3<<<parent; for i in 1; do exec 3<<<loop; done; cat <&3", "loop"),
+    ("l09", "exec 3<<<parent; true && exec 3<<<and; cat <&3", "and"),
+    ("l10", "exec 3<<<parent; cat <(exec 3<<<ps) >/dev/null; cat <&3", "parent"),
+    ("u01", "exec 3<<<a; }; cat <&3", _UNKNOWN_REASON),
+    ("u02", "function g { exec 3<<<z; }; exec 3<<<a; cat <&3", _UNKNOWN_REASON),
+    ("u03", "case x in a) exec 3<<<y ;; esac; cat <&3", "y"),
+    ("u04", "echo $((1+2)); exec 3<<<a; cat <&3", "a"),
+)
+_R12_SAVED_ROWS = (
+    ("v01", 'd=first; exec 3<<<"$d"; d=second; cat <&3', _STALE_REASON),
+    ("v02", 'd=first; exec 3<<<"$d"; read -r d <<<second; cat <&3', _STALE_REASON),
+    ("v03", 'd=first; exec 3<<<"$d"; cat <&3', "$d"),
+    ("v04", 'd=first; cat 3<<<"$d" 0<&3', "$d"),
+    ("v05", "exec 3<<<first; d=x; cat <&3", "first"),
+    ("v06", 'd=first; exec 3<<<"$d"; unset d; cat <&3', _STALE_REASON),
+    ("v07", 'd=first; exec 3<<<"$d" 4<<<"$d"; d=second; cat <&4', _STALE_REASON),
+)
+_R12_NON_ASSIGNING = (
+    "cat file",
+    "echo hi",
+    "true",
+    ":",
+    "test -n x",
+    "[ -n x ]",
+    "printf '%s' x",
+    "exec 4<<<y",
+    "exec 5<&-",
+)
+_R12_ASSIGNING = (
+    "printf -v d x",
+    "echo $((d=1))",
+    "echo ${d:=x}",
+    'echo "$[d=1]"',
+    "d=x cat file",
+    "d+=x",
+    "read d",
+    "declare d=x",
+    "export d=x",
+    "local d=x",
+    "typeset d=x",
+    "mapfile a",
+    "readarray a",
+    "unset d",
+    "let d=1",
+    "eval d=x",
+    "source ./x",
+    ". ./x",
+    "for d in x; do :; done",
+    "select d in x; do break; done",
+    "case x in x) :;; esac",
+    "myfn",
+)
+_R12_ARITH_ROWS = (
+    (b": $(( (1 + (2)) << 1 ))", [(2, 23)]),
+    (b"delay=$(( (1 + (2)) << 1 ))", [(6, 27)]),
+    (b": $(( 1 << 1 ))", [(2, 15)]),
+    (b": $(( (1) << 1 ))", [(2, 17)]),
+    (b'echo "$((1<<2))"', [(6, 15)]),
+    (b": $(( (1 + (2 << 1 ))", []),
+    (b": $(( x ) )", []),
+)
+_R12_SECOND_CAT_ROWS = (
+    ("c01", "exec 3<<<moved; cat <&3-; cat <&3", ["moved", "moved"]),
+    ("c02", "exec 3<<<moved; cat 0<&3-; cat <&3", ["moved", "moved"]),
+    ("c03", "exec 3<<<moved; exec 0<&3-; cat <&3", [None]),
+)
+
+
+def _first(items: list[str | None]) -> str | None:
+    """Return the first stdin word of a cat list, or None when no cat was found."""
+    return items[0] if items else None
+
+
+def _best_seconds(call: Callable[[], object], repeats: int = 3) -> float:
+    """Return the shortest wall time of repeated calls."""
+    best = float("inf")
+    for _ in range(repeats):
+        start = time.perf_counter()
+        call()
+        best = min(best, time.perf_counter() - start)
+    return best
 
 
 def _ast_module_funcs(path: Path) -> dict[str, ast.FunctionDef]:
@@ -1316,28 +1521,33 @@ class RawConfigureShapeTest(RawConfigureGuardBase):
                 )
                 self.assertEqual(got_bytes, want_dup)
 
-    def _cat_stdin_from_tokens(self, command: str) -> str | None:
-        """Return the here-string word attached to cat fd 0 on the lexer surface."""
+    def _cat_stdin_from_tokens(self, command: str) -> list[str | None]:
+        """Return the here-string word attached to each cat fd 0 on the lexer surface."""
         scanned, herestrings, _ = lex_mod._scan_herestrings(command)
-        tokens = lex_mod._tokens(scanned) or []
+        tokens, refusal = lex_mod._resolve_token_flow(lex_mod._split_tokens(scanned) or [])
+        if refusal is not None:
+            return [refusal]
         stages: list[list[str]] = [[]]
         for tok in tokens:
-            if tok == ";":
+            if tok in lex_mod.SEPARATORS:
                 stages.append([])
             else:
                 stages[-1].append(tok)
+        found: list[str | None] = []
         for stage in stages:
             words, attached = lex_mod._strip_redirections(stage)
             if words and words[0] == "cat":
-                if attached and attached[0].startswith("__RCG_HS_0_"):
-                    return herestrings.get(attached[0])
-                return None
-        return None
+                zero = bool(attached) and attached[0].startswith("__RCG_HS_0_")
+                found.append(herestrings.get(attached[0]) if zero else None)
+        return found
 
-    def _cat_stdin_from_bytes(self, command: str) -> str | None:
-        """Return the plain here-string word rewritten onto cat fd 0 on the byte surface."""
-        rewritten = lex_mod.rewrite_descriptor_dups(command.encode("utf-8"))
-        for seg in rewritten.split(b";"):
+    def _cat_stdin_from_bytes(self, command: str) -> list[str | None]:
+        """Return the plain here-string word rewritten onto each cat fd 0 on the byte surface."""
+        rewritten, refusal = lex_mod.rewrite_descriptor_dups_checked(command.encode("utf-8"))
+        if refusal is not None:
+            return [refusal]
+        found: list[str | None] = []
+        for seg in re.split(rb";|\||\(|\)|&&|(?<![<>])&(?!>)", rewritten):
             if not seg.strip().startswith(b"cat "):
                 continue
             masked = lex_mod._mask_quoted_bytes(seg)
@@ -1352,16 +1562,16 @@ class RawConfigureShapeTest(RawConfigureGuardBase):
                     span = lex_mod._herestring_word_end_bytes(seg, masked, idx + 3)
                     if span is not None:
                         words.append(seg[span[0] : span[1]].decode("utf-8"))
-            return words[-1] if words else None
-        return None
+            found.append(words[-1] if words else None)
+        return found
 
     def test_r10_descriptor_table_both_surfaces(self) -> None:
         """Match close, copy, rebind, and source-order descriptor resolution to bash."""
         for label, command, want in _R10_DESCRIPTOR_ROWS:
             with self.subTest(label=label, surface="tokens"):
-                self.assertEqual(self._cat_stdin_from_tokens(command), want)
+                self.assertEqual(_first(self._cat_stdin_from_tokens(command)), want)
             with self.subTest(label=label, surface="bytes"):
-                self.assertEqual(self._cat_stdin_from_bytes(command), want)
+                self.assertEqual(_first(self._cat_stdin_from_bytes(command)), want)
 
     def test_whole_body_descriptor_marks_past_256_lines(self) -> None:
         """Count marks and reject qualification across lines beyond the former 256-line cap."""
@@ -1418,15 +1628,15 @@ class RawConfigureShapeTest(RawConfigureGuardBase):
         """Model descriptor moves and shell-word dup boundaries on token and byte surfaces."""
         for label, command, want in _R11_MOVE_ROWS:
             with self.subTest(label=label, surface="tokens"):
-                self.assertEqual(self._cat_stdin_from_tokens(command), want)
+                self.assertEqual(_first(self._cat_stdin_from_tokens(command)), want)
             with self.subTest(label=label, surface="bytes"):
                 rewritten = lex_mod.rewrite_descriptor_dups(command.encode("utf-8"))
                 self.assertNotIn(b"moved-", rewritten)
-                self.assertEqual(self._cat_stdin_from_bytes(command), want)
-        self.assertEqual(self._cat_stdin_from_tokens("cat 3<<<moved <&3"), "moved")
-        self.assertEqual(self._cat_stdin_from_bytes("cat 3<<<moved <&3"), "moved")
-        self.assertEqual(self._cat_stdin_from_tokens("cat 3<<<moved <&3-"), "moved")
-        self.assertEqual(self._cat_stdin_from_bytes("cat 3<<<moved <&3-"), "moved")
+                self.assertEqual(_first(self._cat_stdin_from_bytes(command)), want)
+        self.assertEqual(_first(self._cat_stdin_from_tokens("cat 3<<<moved <&3")), "moved")
+        self.assertEqual(_first(self._cat_stdin_from_bytes("cat 3<<<moved <&3")), "moved")
+        self.assertEqual(_first(self._cat_stdin_from_tokens("cat 3<<<moved <&3-")), "moved")
+        self.assertEqual(_first(self._cat_stdin_from_bytes("cat 3<<<moved <&3-")), "moved")
         m08_bytes = lex_mod.rewrite_descriptor_dups(b"exec 3<<<moved; cat 4<&3- <&4; cat <&3")
         self.assertTrue(m08_bytes.endswith(b"cat <<< moved"))
         m08_scanned, _, _ = lex_mod._scan_herestrings("exec 3<<<moved; cat 4<&3- <&4; cat <&3")
@@ -1436,8 +1646,8 @@ class RawConfigureShapeTest(RawConfigureGuardBase):
                 cmd = f"cat 3<<<moved {bad_dup}"
                 self.assertIsNone(lex_mod._dup_stdin_source(bad_dup))
                 self.assertIsNone(lex_mod._DUP_STDIN_BYTES.search(bad_dup.encode("ascii")))
-                self.assertIsNone(self._cat_stdin_from_tokens(cmd))
-                self.assertIsNone(self._cat_stdin_from_bytes(cmd))
+                self.assertIsNone(_first(self._cat_stdin_from_tokens(cmd)))
+                self.assertIsNone(_first(self._cat_stdin_from_bytes(cmd)))
                 self.assertEqual(lex_mod.rewrite_descriptor_dups(cmd.encode("ascii")), cmd.encode())
 
     def test_r11_heredoc_data_marks_table(self) -> None:
@@ -1454,7 +1664,7 @@ class RawConfigureShapeTest(RawConfigureGuardBase):
         unterm = b"cat <<'EOF'\n3<<<x\n4<<<x\n"
         self.assertEqual(lex_mod.descriptor_tail_mark_count(unterm), 2)
         hd_dup = "exec 3<<<real; cat <<'EOF'\nexec 3<<<fake\nEOF\ncat 0<&3"
-        self.assertEqual(self._cat_stdin_from_bytes(hd_dup), "real")
+        self.assertEqual(_first(self._cat_stdin_from_bytes(hd_dup)), "real")
 
     def test_r11_missing_node_twin_refusal(self) -> None:
         """Refuse plain twins recovered with MISSING syntax nodes and allow complete groups."""
@@ -1514,9 +1724,9 @@ class RawConfigureShapeTest(RawConfigureGuardBase):
         """Treat numeric words as redirect prefixes only when source-adjacent to the operator."""
         for label, command, want in _R11_SPACED_ROWS:
             with self.subTest(label=label, surface="tokens"):
-                self.assertEqual(self._cat_stdin_from_tokens(command), want)
+                self.assertEqual(_first(self._cat_stdin_from_tokens(command)), want)
             with self.subTest(label=label, surface="bytes"):
-                self.assertEqual(self._cat_stdin_from_bytes(command), want)
+                self.assertEqual(_first(self._cat_stdin_from_bytes(command)), want)
         s05_tokens = lex_mod._tokens("printf '[%s]' 3 </dev/null") or []
         self.assertEqual(lex_mod._strip_redirections(s05_tokens)[0], ["printf", "[%s]", "3"])
         attached_tokens = lex_mod._tokens("printf '[%s]' 3</dev/null") or []
@@ -1526,8 +1736,197 @@ class RawConfigureShapeTest(RawConfigureGuardBase):
         """Select the last standard-input binding across explicit 0/00 here-strings and dups."""
         for label, command, want in _R11_FD0_ROWS:
             with self.subTest(label=label, surface="tokens"):
+                self.assertEqual(_first(self._cat_stdin_from_tokens(command)), want)
+            with self.subTest(label=label, surface="bytes"):
+                self.assertEqual(_first(self._cat_stdin_from_bytes(command)), want)
+        for body in ('cat 33<<< "$d"\n', 'cat {fd}<<< "$d"\n'):
+            self.assertIsNone(scan_body(body, self._shape_context(), BodyBudget())[0])
+
+    def test_r12_probe_table(self) -> None:
+        """Refuse every in-scope lim414m case and allow every lim414n case in-process."""
+        (self.tree / "sub").mkdir(exist_ok=True)
+        helper_text = f"{_PARITY_CFG} --help\n"
+        for name in ("helper.sh", "sub/helper.sh"):
+            target = self.tree / name
+            target.write_text(helper_text, encoding="utf-8")
+            target.chmod(0o755)
+        script = self.tree / "s.sh"
+        for want_refused, table in ((True, _R12_REFUSE_PROBES), (False, _R12_ALLOW_PROBES)):
+            for label, kind, text in table:
+                command = text
+                if kind == "body":
+                    script.write_text(text, encoding="utf-8")
+                    command = "bash ./s.sh"
+                with self.subTest(label=label, kind=kind):
+                    blocked = GUARD_MOD._inspect_with_deadline(command, self.tree)
+                    self.assertEqual(blocked is not None, want_refused)
+
+    def test_r12_execution_context_table_both_surfaces(self) -> None:
+        """Keep exec bindings of isolated pipeline stages, groups and jobs out of the caller."""
+        for label, command, want in _R12_CONTEXT_ROWS:
+            with self.subTest(label=label, surface="tokens"):
+                self.assertEqual(self._cat_stdin_from_tokens(command)[-1], want)
+            with self.subTest(label=label, surface="bytes"):
+                self.assertEqual(self._cat_stdin_from_bytes(command)[-1], want)
+
+    def test_r12_isolated_exec_twin_reads_the_parent_word(self) -> None:
+        """Rewrite the dup after an isolated exec to the parent word in the plain twin."""
+        for body in (
+            'exec 3<<< "./helper.sh"\nexec 3<<< x | cat >/dev/null\nbash <&3\n',
+            'exec 3<<< "./helper.sh"\n( exec 3<<< x )\nbash <&3\n',
+        ):
+            with self.subTest(body=body):
+                twin = lex_mod.rewrite_descriptor_dups(body.encode("utf-8"))
+                self.assertTrue(twin.rstrip().endswith(b'bash <<< "./helper.sh"'))
+
+    def _saved_word_want(self, got: list[str | None], want: str) -> None:
+        """Compare the last cat stdin word or refusal reason, ignoring surrounding quotes."""
+        last = got[-1]
+        self.assertEqual(last.strip('"') if isinstance(last, str) else last, want)
+
+    def test_r12_saved_word_table_both_surfaces(self) -> None:
+        """Resolve a saved non-literal here-string word only when it cannot have changed."""
+        for label, command, want in _R12_SAVED_ROWS:
+            with self.subTest(label=label, surface="tokens"):
+                self._saved_word_want(self._cat_stdin_from_tokens(command), want)
+            with self.subTest(label=label, surface="bytes"):
+                self._saved_word_want(self._cat_stdin_from_bytes(command), want)
+
+    def test_r12_saved_word_allow_list_both_surfaces(self) -> None:
+        """Keep a saved word across non-assigning commands and refuse across any other command."""
+        for between, want in (
+            *((cmd, "$d") for cmd in _R12_NON_ASSIGNING),
+            *((cmd, _STALE_REASON) for cmd in _R12_ASSIGNING),
+        ):
+            command = f'd=first; exec 3<<<"$d"; {between}; cat <&3'
+            with self.subTest(between=between, surface="tokens"):
+                self._saved_word_want(self._cat_stdin_from_tokens(command), want)
+            with self.subTest(between=between, surface="bytes"):
+                self._saved_word_want(self._cat_stdin_from_bytes(command), want)
+        literal = "exec 3<<<first; read d; cat <&3"
+        self.assertEqual(self._cat_stdin_from_tokens(literal)[-1], "first")
+        self.assertEqual(self._cat_stdin_from_bytes(literal)[-1], "first")
+
+    def test_r12_saved_word_refusal_names_reason_in_script_body(self) -> None:
+        """Name the unresolved-binding reasons when a script body is decided."""
+        stale = 'd=first\nexec 3<<<"$d"\nd=second\ncat <&3\n'
+        unknown = "shopt -s lastpipe\ncat </dev/null | exec 3<<<b\ncat <&3\n"
+        self.assertEqual(lex_mod.descriptor_dup_refusal(stale.encode("utf-8")), _STALE_REASON)
+        self.assertEqual(lex_mod.descriptor_dup_refusal(unknown.encode("utf-8")), _UNKNOWN_REASON)
+        self.assertIsNone(lex_mod.descriptor_dup_refusal(b'd=x\nexec 3<<<"$d"\ncat <&3\n'))
+        context = self._shape_context()
+        self.assertEqual(scan_body(stale, context, BodyBudget())[0], _STALE_REASON)
+        self.assertEqual(scan_body(unknown, context, BodyBudget())[0], _UNKNOWN_REASON)
+
+    def test_r12_arithmetic_span_balances_nested_parentheses(self) -> None:
+        """Close an arithmetic expansion only at the pair that matches its opener."""
+        for line, want in _R12_ARITH_ROWS:
+            with self.subTest(line=line):
+                self.assertEqual(lex_mod._line_arith_spans(line), want)
+        nested = b'd=x\n: $(( (1 + (2)) << 1 ))\ncat 3<<< "$d"\n'
+        keyed = b'd=x\ndelay=$(( (1 + (2)) << 1 ))\ncat 3<<< "$d"\n'
+        plain = b'd=x\n: $(( 1 << 1 ))\ncat 3<<< "$d"\n'
+        for raw in (nested, keyed, plain, b'd=x\ncat 3<<< "$d"\n'):
+            with self.subTest(raw=raw):
+                self.assertFalse(lex_mod.script_blocks_fd_herestring_allowlist(raw))
+        self.assertTrue(lex_mod.script_blocks_fd_herestring_allowlist(b": $(( x ) << 1 )\n"))
+
+    def test_r12_blank_skips_do_not_copy_the_rest_of_the_line(self) -> None:
+        """Keep each blank-skip helper constant-time in the length of the remaining bytes."""
+        helpers = (
+            ("spaces_tabs", lambda line: lex_mod._skip_spaces_tabs(line, 0)),
+            ("spaces", lambda line: lex_mod._skip_spaces(line, 0)),
+            ("herestring_word", lambda line: lex_mod._herestring_word_end_bytes(line, line, 0)),
+        )
+        small = b"  x " + b"y" * 100_000
+        large = b"  x " + b"y" * 400_000
+        for name, helper in helpers:
+            with self.subTest(helper=name):
+                t_small = _best_seconds(lambda h=helper: [h(small) for _ in range(3000)])
+                t_large = _best_seconds(lambda h=helper: [h(large) for _ in range(3000)])
+                self.assertLess(t_large, 2.5 * max(t_small, 0.002))
+        self.assertEqual(lex_mod._skip_spaces_tabs(b" \t x", 0), 3)
+        self.assertEqual(lex_mod._skip_spaces(b" \t x", 0), 1)
+        self.assertEqual(lex_mod._skip_spaces_tabs(b"  ", 1), 2)
+        self.assertEqual(lex_mod._skip_spaces_tabs(b"x", 5), 5)
+
+    def test_r12_descriptor_scans_scale_with_script_size(self) -> None:
+        """Scan many heredoc openers and many short redirects with a bounded doubling ratio."""
+        opener = b"cat <<X\nx\nX\n"
+        tail = b'd=x\ncat 3<<< "$d" 0<&3\n'
+        cases = (
+            ("mark_count", lex_mod.descriptor_tail_mark_count, (8_000, 256_000), opener, tail),
+            ("rewrite_scripts", lex_mod.rewrite_descriptor_dups, (2_000, 32_000), opener, tail),
+            (
+                "rewrite_redirects",
+                lex_mod.rewrite_descriptor_dups,
+                (1_000, 16_000),
+                b"2>/dev/null ",
+                b"0<&3",
+            ),
+        )
+        for name, call, (small, large), unit, end in cases:
+            head = b"" if unit == opener else b"cat 3<<<x "
+            seconds = {
+                n: _best_seconds(lambda c=call, r=head + unit * n + end: c(r), repeats=2)
+                for n in (small, large)
+            }
+            limit = 2.5 ** math.log2(large / small) * max(seconds[small], 0.01)
+            with self.subTest(scan=name):
+                self.assertLess(seconds[large], limit)
+
+    def test_r12_shared_source_statement_is_charged_once(self) -> None:
+        """Charge a source statement reached by an inline body and its twin once."""
+        (self.root / "lib.sh").write_text(":\n", encoding="utf-8")
+        body = "eval 'cat 3<<<\"$d\"; source ./lib.sh'\n"
+        limit = body_mod.MAX_SCRIPT_FILES
+        context = self._source_context([limit - 1])
+        self.assertIsNone(scan_body(body, context, BodyBudget())[0])
+        self.assertEqual(context.files_read[0], limit)
+        spent = self._source_context([limit])
+        self.assertIn("script file limit", scan_body(body, spent, BodyBudget())[0] or "")
+        budget = BodyBudget()
+        scan_body(body, self._source_context([0]), budget)
+        self.assertEqual(budget.inline_bodies, 2)
+
+    def _source_context(self, reads: list[int]) -> InspectionContext:
+        """Build a context whose source reader reads real files under the test root."""
+        return InspectionContext(
+            cwd=self.root,
+            directory_changed=False,
+            files_read=reads,
+            classifier=lambda _words: None,
+            script_dir=self.root,
+            source_reader=files_mod._read_source,
+        )
+
+    def test_r12_twin_only_source_reference_is_still_inspected(self) -> None:
+        """Read and inspect a source statement that only the plain twin contains."""
+        helper = self.root / "helper.sh"
+        helper.write_text(f"{_PARITY_CFG} --help\n", encoding="utf-8")
+        helper.chmod(0o755)
+        body = "eval 'cat 3<<<\"$d\"'\n"
+
+        def twin_with_source(raw: bytes, scan: Any) -> tuple[Any, bytes]:
+            """Build a twin that adds one source statement absent from the original."""
+            twin_raw = raw + b"; source ./helper.sh\n"
+            root = body_mod.bash_parser().parse(twin_raw).root_node
+            scan.syntax_roots[twin_raw] = root
+            return root, twin_raw
+
+        self.assertIsNone(scan_body(body, self._source_context([0]), BodyBudget())[0])
+        with unittest.mock.patch.object(body_mod, "_inline_twin_node", twin_with_source):
+            hit = scan_body(body, self._source_context([0]), BodyBudget())[0]
+        self.assertIsNotNone(hit)
+
+    def test_r12_move_rows_check_the_second_cat(self) -> None:
+        """Keep a temporary move from closing the descriptor for the next command."""
+        for label, command, want in _R12_SECOND_CAT_ROWS:
+            with self.subTest(label=label, surface="tokens"):
                 self.assertEqual(self._cat_stdin_from_tokens(command), want)
             with self.subTest(label=label, surface="bytes"):
                 self.assertEqual(self._cat_stdin_from_bytes(command), want)
-        for body in ('cat 33<<< "$d"\n', 'cat {fd}<<< "$d"\n'):
-            self.assertIsNone(scan_body(body, self._shape_context(), BodyBudget())[0])
+        for label, command, want in _R11_MOVE_ROWS[:2]:
+            with self.subTest(label=label, surface="second"):
+                self.assertEqual(self._cat_stdin_from_tokens(command)[1:], [want])
+                self.assertEqual(self._cat_stdin_from_bytes(command)[1:], [want])

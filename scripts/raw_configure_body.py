@@ -21,7 +21,7 @@ from scripts.raw_configure_lex import (
     descriptor_tail_marks_present,
     errors_within_tail_span,
     find_descriptor_herestring_tail,
-    rewrite_descriptor_dups,
+    rewrite_descriptor_dups_checked,
     strip_descriptor_tail_marks,
     tail_line_is_toplevel,
 )
@@ -599,6 +599,9 @@ class _Scan:
     fd_tail_allow: dict[bytes, bool | None] = field(default_factory=dict)
     redirect_target_ok: dict[bytes, dict[str, bool]] = field(default_factory=dict)
     syntax_roots: dict[bytes, Any] = field(default_factory=dict)
+    twin_raws: set[bytes] = field(default_factory=set)
+    in_twin: bool = False
+    source_reads: dict[tuple[bool, str, bool], list[list[str] | str]] = field(default_factory=dict)
 
 
 def bash_parser() -> Any | str:
@@ -756,7 +759,11 @@ def _inline_twin_node(raw: bytes, scan: _Scan) -> tuple[Any, bytes] | None:
     """Build a digit-stripped twin syntax root for an inline body with descriptor marks."""
     if not descriptor_tail_marks_present(raw):
         return None
-    twin_raw = strip_descriptor_tail_marks(rewrite_descriptor_dups(raw))
+    rewritten, dup_refusal = rewrite_descriptor_dups_checked(raw)
+    if dup_refusal is not None:
+        scan.refusal = dup_refusal
+        return None
+    twin_raw = strip_descriptor_tail_marks(rewritten)
     twin_root = bash_parser().parse(twin_raw).root_node
     hit = _unterminated_heredoc_refusal(twin_root, twin_raw)
     if hit is not None:
@@ -766,12 +773,12 @@ def _inline_twin_node(raw: bytes, scan: _Scan) -> tuple[Any, bytes] | None:
     return twin_root, twin_raw
 
 
-def _queue_inline(body: str, scan: _Scan, *, source: bool = False) -> None:
+def _queue_inline(body: str, scan: _Scan, *, source: bool = False, charge: bool = True) -> None:
     """Queue an inline syntax tree or record an explicit shared-budget refusal."""
-    if scan.budget.inline_bodies >= MAX_INLINE_BODIES:
+    if charge and scan.budget.inline_bodies >= MAX_INLINE_BODIES:
         scan.refusal = "more than 256 inline shell bodies"
         return
-    scan.budget.inline_bodies += 1
+    scan.budget.inline_bodies += 1 if charge else 0
     raw = body.encode("utf-8", "surrogateescape")
     if scan.span_held:
         scan.prefix_spans.append((raw, 0, len(raw) + 1, scan.span_held))
@@ -788,9 +795,10 @@ def _queue_inline(body: str, scan: _Scan, *, source: bool = False) -> None:
         scan.source_literals[id(root)] = _literal_map(names, raw, watched)
         _note_prefix_calls(names, scan)
     twin = _inline_twin_node(raw, scan)
-    scan.stack.append((root, raw, False))
     if twin is not None:
+        scan.twin_raws.add(twin[1])
         scan.stack.append((twin[0], twin[1], False))
+    scan.stack.append((root, raw, False))
 
 
 def _file_target(target: str | None, scan: _Scan) -> str | None:
@@ -1127,6 +1135,20 @@ def _source_operand(words: list[str]) -> tuple[str | None, str | None]:
     return words[idx], None
 
 
+def _read_source_once(
+    reader: Callable[[str, bool, InspectionContext, list[str]], list[str] | str],
+    key: tuple[str, bool],
+    scan: _Scan,
+) -> tuple[list[str] | str, bool]:
+    """Read one source statement, reusing the texts the other walk already read for it."""
+    theirs = scan.source_reads.setdefault((not scan.in_twin, *key), [])
+    if theirs:
+        return theirs.pop(0), True
+    texts = reader(key[0], key[1], scan.context, scan.cd_targets)
+    scan.source_reads.setdefault((scan.in_twin, *key), []).append(texts)
+    return texts, False
+
+
 def _source_target(target: str | None, scan: _Scan) -> str | None:
     """Inline readable source texts into the caller and mark unresolved directories unknown."""
     if target is None:
@@ -1142,11 +1164,11 @@ def _source_target(target: str | None, scan: _Scan) -> str | None:
         scan.dir_changed = scan.source_unknown = True
         return None
     changed = scan.dir_changed and not os.path.isabs(target) and not target.startswith("~")
-    texts = reader(target, changed, scan.context, scan.cd_targets)
+    texts, shared = _read_source_once(reader, (target, changed), scan)
     if isinstance(texts, str):
         return texts
     for text in reversed(texts):
-        _queue_inline(text, scan, source=True)
+        _queue_inline(text, scan, source=True, charge=not shared)
     return None
 
 
@@ -1424,7 +1446,10 @@ def _descriptor_plain_twin_refusal(
     raw = body.encode("utf-8", "surrogateescape")
     if not descriptor_tail_marks_present(raw):
         return None, empty, empty, empty
-    twin_raw = strip_descriptor_tail_marks(rewrite_descriptor_dups(raw))
+    rewritten, dup_refusal = rewrite_descriptor_dups_checked(raw)
+    if dup_refusal is not None:
+        return dup_refusal, empty, empty, empty
+    twin_raw = strip_descriptor_tail_marks(rewritten)
     parser = bash_parser()
     prefix = (
         "descriptor here-string form refused because the same script "
@@ -3520,6 +3545,7 @@ def _run_scan_walk(
         if budget.nodes >= MAX_BODY_NODES:
             return limit, [], [], []
         node, source, mode = scan.stack.pop()
+        scan.in_twin = source in scan.twin_raws
         _merge_source_literals(node, scan)
         budget.nodes += 1
         hit = _visit(node, source, mode, scan)

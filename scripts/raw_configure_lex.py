@@ -8,8 +8,9 @@ import itertools
 import re
 import shlex
 import sys
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 # Ensure repository root is on sys.path for test/tool imports
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -41,13 +42,12 @@ _DUP_STDIN = re.compile(rf"(?:{_DESCRIPTOR_PREFIX_STR})?<&([0-9]+)-?{_DUP_OPERAN
 _DUP_STDIN_BYTES = re.compile(
     rb"(?:" + _DESCRIPTOR_PREFIX + rb")?<&\s*([0-9]+)-?" + _DUP_OPERAND_END
 )
-_HS_FD_TAG = re.compile(r"^__RCG_HS_FD([0-9]+)_([0-9]+)__$")
+_HS_FD_TAG = re.compile(r"^__RCG_HS_FD([0-9]+)_([0-9]+)(V?)__$")
 _HS_ZERO_TAG = re.compile(r"^__RCG_HS_0_([0-9]+)__$")
 _DUP_OR_CLOSE_TOK = re.compile(
     rf"^(?:{_DESCRIPTOR_PREFIX_STR})?(<&|>&)([0-9]+-?|-){_DUP_OPERAND_END_STR}"
 )
 _FILE_REDIR_TOK = re.compile(r"^([0-9]*)(>>|<>|>\||<|>|&>|&>>)$")
-_EXEC_ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 _SEG_REDIR_BYTES = re.compile(
     rb"(?:"
     rb"(?P<hd>(?:" + _DESCRIPTOR_PREFIX + rb")?<<-?(?!<))"
@@ -61,6 +61,7 @@ _SEG_REDIR_BYTES = re.compile(
     rb"|(?P<file>(?P<file_fd>" + _DESCRIPTOR_PREFIX + rb")?(?P<file_op>>>|<>|>\||<|>)(?![<&>(]))"
     rb")"
 )
+_BYTE_SEP = re.compile(rb"\|\||\|&|\||&&|;;&|;;|;&|;|&|\n|\(|\)|`")
 
 
 def _descriptor_fd(prefix: str | bytes | None) -> int | None:
@@ -527,7 +528,7 @@ def _herestring_tag(prefix: str, val: str, idx: int, herestrings: dict[str, str]
     if _is_stdin_descriptor(prefix):
         tag = f"__RCG_HS_0_{idx}__"
     elif (fd := _descriptor_fd(prefix)) is not None:
-        tag = f"__RCG_HS_FD{fd}_{idx}__"
+        tag = f"__RCG_HS_FD{fd}_{idx}{'V' if _word_volatile(val) else ''}__"
         herestrings[f"__RCG_HS_0_{idx}__"] = val
     else:
         tag = f"__RCG_HS_BR_{idx}__"
@@ -597,76 +598,380 @@ def _dup_stdin_source(tok: str) -> int | None:
     return _dup_stdin_fd(match.group(1), match.group(2)) if match is not None else None
 
 
-def _step_stage_token(
-    stage: list[str],
-    idx: int,
-    local_fds: dict[int, str],
-    out: list[str],
-    words: list[str],
-) -> int:
+class _Marker:
+    """Table value naming why a descriptor binding cannot be resolved."""
+
+    def __init__(self, reason: str) -> None:
+        """Store the refusal reason carried by this marker."""
+        self.reason = reason
+
+
+_UNKNOWN = _Marker("descriptor binding unknown at duplication")
+_STALE = _Marker("saved here-string word may change before its duplication")
+_LEAD_WORDS = frozenset(
+    (
+        "if",
+        "then",
+        "elif",
+        "else",
+        "while",
+        "until",
+        "do",
+        "{",
+        "}",
+        "!",
+        "time",
+        "fi",
+        "done",
+        "esac",
+    )
+)
+_ASSIGN_WORD = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(?:\[[^\]]*\])?\+?=")
+_FN_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_.:-]*$")
+_NON_ASSIGNING = frozenset(("cat", "echo", "true", ":", "test", "[", "printf"))
+_ARITH_MARKS = ("$((", "$[", "((", "${")
+_SUB_TAG = "__RCG_SUB_"
+_TERM_KIND = {
+    ";": ";",
+    "\n": ";",
+    "&&": ";",
+    "||": ";",
+    "|": "|",
+    "&": "&",
+    "(": "(",
+    ")": ")",
+}
+
+
+class _Bound(NamedTuple):
+    """One here-string word held by a descriptor; volatile when it expands a variable."""
+
+    word: Any
+    volatile: bool
+
+
+class _Event(NamedTuple):
+    """One stage with its payload, ending separator, separator kind and unchanged text."""
+
+    payload: Any
+    sep: Any
+    kind: str
+    echo: list[Any]
+
+
+class _StageState:
+    """Outputs of one command stage: rewritten parts, command words, table and refusal."""
+
+    def __init__(self, table: dict[int, Any]) -> None:
+        """Start a stage from a copy of the caller's descriptor table."""
+        self.fds: dict[int, Any] = dict(table)
+        self.out: list[Any] = []
+        self.words: list[str] = []
+        self.stripped = bytearray()
+        self.refusal: str | None = None
+
+
+class _Frame:
+    """One open group: closer, table at the open, pipeline position and case depth."""
+
+    def __init__(
+        self, closer: str, snapshot: dict[int, Any], after_pipe: bool, case_level: int
+    ) -> None:
+        """Record one open group with the table to restore at its closer."""
+        self.closer = closer
+        self.snapshot = snapshot
+        self.after_pipe = after_pipe
+        self.case_level = case_level
+        self.is_fn = False
+        self.assigned = False
+
+
+def _word_volatile(word: str | bytes) -> bool:
+    """Return whether a here-string word can expand a variable or run a substitution."""
+    if isinstance(word, bytes):
+        return b"$" in word or b"`" in word
+    return "$" in word or "`" in word
+
+
+def _leading_words(words: list[str]) -> list[str]:
+    """Return the run of reserved opening or closing words at the start of one stage."""
+    lead: list[str] = []
+    for word in words:
+        if word not in _LEAD_WORDS:
+            break
+        lead.append(word)
+    return lead
+
+
+def _command_words(words: list[str]) -> tuple[list[str], bool]:
+    """Return the words from the command name on and whether an assignment precedes it."""
+    assigned = False
+    for idx, word in enumerate(words):
+        if word in _LEAD_WORDS:
+            continue
+        if _ASSIGN_WORD.match(word) is not None:
+            assigned = True
+            continue
+        return words[idx:], assigned
+    return [], assigned
+
+
+def _stage_assigns(cmd: list[str], assigned: bool) -> bool:
+    """Return whether one stage can assign a shell variable under the non-assigning allow-list."""
+    if assigned:
+        return True
+    if not cmd or cmd == ["exec"]:
+        return False
+    if cmd[0] not in _NON_ASSIGNING:
+        return True
+    if cmd[0] == "printf" and any(word.startswith("-v") for word in cmd[1:]):
+        return True
+    return any(mark in word for word in cmd for mark in _ARITH_MARKS)
+
+
+def _changed_fds(old: dict[int, Any], new: dict[int, Any]) -> set[int]:
+    """Return the descriptors whose binding differs between two tables."""
+    return {fd for fd in old.keys() | new.keys() if old.get(fd) != new.get(fd)}
+
+
+def _stale_table(table: dict[int, Any]) -> dict[int, Any]:
+    """Return a copy of table with every volatile here-string binding marked stale."""
+    return {
+        fd: (_STALE if isinstance(val, _Bound) and val.volatile else val)
+        for fd, val in table.items()
+    }
+
+
+class _FdFlow:
+    """Descriptor table, group stack and pipeline position shared by both surfaces."""
+
+    def __init__(self, lastpipe: bool) -> None:
+        """Start with an empty table and no open group."""
+        self.fds: dict[int, Any] = {}
+        self.frames: list[_Frame] = []
+        self.after_pipe = False
+        self.pending_fn = False
+        self.lastpipe = lastpipe
+        self.sticky: set[int] = set()
+        self.case_level = 0
+        self.broken = False
+        self.volatile = False
+        self.sub_tag = False
+        self.refusal: str | None = None
+
+    def isolated(self, kind: str) -> bool:
+        """Return whether a stage ending in kind runs in a child of the caller."""
+        return kind in ("|", "&") or (self.after_pipe and not self.lastpipe)
+
+    def mark_assigned(self) -> None:
+        """Mark every saved here-string word stale after a command that can assign."""
+        if self.volatile:
+            self.fds = _stale_table(self.fds)
+            self.volatile = False
+        if self.frames:
+            self.frames[-1].assigned = True
+
+    def break_model(self) -> None:
+        """Mark every descriptor unknown from here on when a construct cannot be modelled."""
+        self.broken = True
+        self.fds = dict.fromkeys(self.fds, _UNKNOWN)
+
+    def commit(self, local: dict[int, Any], kind: str) -> None:
+        """Carry the table of an exec stage into the caller unless the stage is isolated."""
+        if self.isolated(kind):
+            return
+        new = dict(local)
+        if self.after_pipe:
+            new.update(dict.fromkeys(_changed_fds(self.fds, new), _UNKNOWN))
+        new.update(dict.fromkeys(self.sticky, _UNKNOWN))
+        self.fds = dict.fromkeys(new, _UNKNOWN) if self.broken else new
+        self.volatile = self.volatile or any(
+            isinstance(val, _Bound) and val.volatile for val in new.values()
+        )
+
+    def open(self, closer: str) -> None:
+        """Open a group, saving the table so an isolated group can restore it."""
+        frame = _Frame(closer, dict(self.fds), self.after_pipe, self.case_level)
+        frame.is_fn = self.pending_fn
+        self.pending_fn = False
+        self.frames.append(frame)
+        self.after_pipe = False
+
+    def close(self, closer: str, kind: str) -> None:
+        """Close the innermost group opened for closer and restore its table when isolated."""
+        top = self.frames[-1] if self.frames else None
+        if top is None or top.closer != closer:
+            self.stray(closer)
+            return
+        if top.case_level != self.case_level:
+            self.mark_assigned()
+            return
+        self.frames.pop()
+        now = self.fds
+        isolated = closer == ")" or top.is_fn or kind in ("|", "&")
+        isolated = isolated or (top.after_pipe and not self.lastpipe)
+        if isolated:
+            self.fds = dict(top.snapshot)
+            self.volatile = True
+        if top.is_fn:
+            changed = _changed_fds(top.snapshot, now)
+            self.sticky |= changed
+            self.fds.update(dict.fromkeys(changed, _UNKNOWN))
+        elif top.after_pipe and not isolated:
+            self.fds.update(dict.fromkeys(_changed_fds(top.snapshot, now), _UNKNOWN))
+        if top.assigned:
+            self.mark_assigned()
+        self.after_pipe = False
+
+    def stray(self, closer: str) -> None:
+        """Handle a closer without an opener: a case pattern or substitution tail, else unknown."""
+        if closer == ")" and (self.case_level > 0 or self.sub_tag):
+            self.mark_assigned()
+        else:
+            self.break_model()
+
+    def end_stage(self, words: list[str], local: dict[int, Any], kind: str) -> None:
+        """Fold one finished stage into the table under the execution-context rule."""
+        lead = _leading_words(words)
+        self.sub_tag = any(_SUB_TAG in word for word in words)
+        for _ in range(lead.count("{")):
+            self.open("}")
+        cmd, assigned = _command_words(words)
+        if cmd[:1] in (["function"], ["coproc"]):
+            self.break_model()
+        if cmd == ["exec"]:
+            self.commit(local, kind)
+        if _stage_assigns(cmd, assigned):
+            self.mark_assigned()
+        opens = 1 if cmd[:1] == ["case"] else 0
+        self.case_level = max(0, self.case_level + opens - lead.count("esac"))
+        for _ in range(lead.count("}")):
+            self.close("}", kind)
+
+    def advance(self, kind: str, fn_def: bool) -> None:
+        """Apply the separator that ends a stage: group open or close, pipe position."""
+        if kind == "(":
+            if fn_def:
+                self.pending_fn = True
+            else:
+                self.open(")")
+        elif kind == ")":
+            self.close(")", kind)
+        else:
+            self.after_pipe = kind == "|"
+
+
+def _is_fn_def(words: list[str], events: list[_Event], idx: int) -> bool:
+    """Return whether the stage is a bare function name followed by an empty ( ) pair."""
+    cmd, _ = _command_words(words)
+    if len(cmd) != 1 or _FN_NAME.match(cmd[0]) is None or idx + 1 >= len(events):
+        return False
+    nxt = events[idx + 1]
+    return nxt.kind == ")" and not any(part.strip() for part in nxt.echo)
+
+
+def _drive_stages(
+    events: list[_Event], run: Callable[[Any, _FdFlow], _StageState], flow: _FdFlow
+) -> list[list[Any]]:
+    """Run every stage in source order under the execution-context rule; return stage outputs."""
+    results: list[list[Any]] = []
+    skip = False
+    for idx, event in enumerate(events):
+        if skip:
+            skip = False
+            results.append(event.echo)
+            continue
+        stage = run(event.payload, flow)
+        results.append(stage.out)
+        flow.refusal = flow.refusal or stage.refusal
+        flow.end_stage(stage.words, stage.fds, event.kind)
+        skip = event.kind == "(" and _is_fn_def(stage.words, events, idx)
+        flow.advance(event.kind, skip)
+    return results
+
+
+def _dup_token(resolved: Any, tok: str, stage: _StageState) -> str:
+    """Return the token for a dup: the bound tag, or the dup itself when unresolved or refused."""
+    if isinstance(resolved, _Marker):
+        stage.refusal = stage.refusal or resolved.reason
+        return tok
+    if isinstance(resolved, _Bound):
+        return str(resolved.word)
+    return resolved if resolved is not None else tok
+
+
+def _step_stage_token(stage: list[str], idx: int, state: _StageState) -> int:
     """Process one command-stage token or redirection in source order and return next index."""
     tok = stage[idx]
     if tok.startswith(("__RCG_HD_", "__RCG_HS_")):
         if (fd_match := _HS_FD_TAG.fullmatch(tok)) is not None:
-            local_fds[int(fd_match.group(1))] = f"__RCG_HS_0_{fd_match.group(2)}__"
+            tag = f"__RCG_HS_0_{fd_match.group(2)}__"
+            state.fds[int(fd_match.group(1))] = _Bound(tag, bool(fd_match.group(3)))
         elif _HS_ZERO_TAG.fullmatch(tok) is not None:
-            local_fds[0] = tok
+            state.fds[0] = tok
         elif tok.startswith("__RCG_HD_"):
-            local_fds.pop(0, None)
-        out.append(tok)
+            state.fds.pop(0, None)
+        state.out.append(tok)
         return idx + 1
     if (
         (fmatch := _FILE_REDIR_TOK.fullmatch(tok)) is not None
         and idx + 1 < len(stage)
         and stage[idx + 1] not in SEPARATORS
     ):
-        _apply_file_redirect(local_fds, fmatch.group(1), fmatch.group(2))
-        out.extend(stage[idx : idx + 2])
+        _apply_file_redirect(state.fds, fmatch.group(1), fmatch.group(2))
+        state.out.extend(stage[idx : idx + 2])
         return idx + 2
     if (dmatch := _DUP_OR_CLOSE_TOK.fullmatch(tok)) is not None:
-        resolved = _apply_dup_or_close(local_fds, dmatch.group(1), dmatch.group(2), dmatch.group(3))
-        out.append(resolved if resolved is not None else tok)
+        resolved = _apply_dup_or_close(state.fds, dmatch.group(1), dmatch.group(2), dmatch.group(3))
+        state.out.append(_dup_token(resolved, tok, state))
         return idx + 1
-    if words or _EXEC_ASSIGN.match(tok) is None:
-        words.append(tok)
-    out.append(tok)
+    state.words.append(tok)
+    state.out.append(tok)
     return idx + 1
 
 
-def _resolve_stage_dups(
-    stage: list[str], exec_fds: dict[int, str]
-) -> tuple[list[str], dict[int, str]]:
-    """Update descriptor bindings in source order and resolve fd 0 dups within one stage."""
-    local_fds = dict(exec_fds)
-    out: list[str] = []
-    words: list[str] = []
+def _run_token_stage(stage: list[str], flow: _FdFlow) -> _StageState:
+    """Resolve descriptor dups across one token stage against the flow table."""
+    state = _StageState(flow.fds)
     idx = 0
     for _ in range(len(stage)):
         if idx >= len(stage):
             break
-        idx = _step_stage_token(stage, idx, local_fds, out, words)
-    next_exec = local_fds if words == ["exec"] else exec_fds
-    return out, next_exec
+        idx = _step_stage_token(stage, idx, state)
+    return state
 
 
-def _resolve_herestring_dups(tokens: list[str]) -> list[str]:
-    """Resolve descriptor here-string dups onto fd 0 across simple commands."""
-    result: list[str] = []
+def _token_events(tokens: list[str]) -> list[_Event]:
+    """Split tokens into stages, each ended by a separator token."""
+    events: list[_Event] = []
     stage: list[str] = []
-    exec_fds: dict[int, str] = {}
     for tok in tokens:
         if tok in SEPARATORS:
-            if stage:
-                resolved, exec_fds = _resolve_stage_dups(stage, exec_fds)
-                result.extend(resolved)
-                stage = []
-            result.append(tok)
+            events.append(_Event(stage, tok, _TERM_KIND[tok], stage))
+            stage = []
         else:
             stage.append(tok)
-    if stage:
-        resolved, _ = _resolve_stage_dups(stage, exec_fds)
-        result.extend(resolved)
-    return result
+    events.append(_Event(stage, "", ";", stage))
+    return events
+
+
+def _resolve_token_flow(tokens: list[str]) -> tuple[list[str], str | None]:
+    """Resolve descriptor here-string dups across commands; return tokens and a refusal."""
+    events = _token_events(tokens)
+    flow = _FdFlow(any("lastpipe" in tok or tok == "shopt" for tok in tokens))
+    results = _drive_stages(events, _run_token_stage, flow)
+    out: list[str] = []
+    for event, res in zip(events, results, strict=True):
+        out.extend(res)
+        if event.sep:
+            out.append(event.sep)
+    return out, flow.refusal
+
+
+def _resolve_herestring_dups(tokens: list[str]) -> list[str] | None:
+    """Resolve descriptor here-string dups onto fd 0 across simple commands; None when refused."""
+    out, refusal = _resolve_token_flow(tokens)
+    return None if refusal is not None else out
 
 
 def _step_word_char(command: str, idx: int, quote: str | None) -> tuple[int, str | None] | None:
@@ -725,8 +1030,8 @@ def _raw_token_spans(command: str, limit: int) -> list[tuple[int, int]]:
     return spans
 
 
-def _tokens(command: str) -> list[str] | None:
-    """Split a shell command without executing substitutions or expansions."""
+def _split_tokens(command: str) -> list[str] | None:
+    """Split a shell command into raw tokens without executing substitutions or expansions."""
     if len(command.encode("utf-8", "surrogatepass")) > MAX_COMMAND:
         return None
     lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|<>()\n")
@@ -763,7 +1068,13 @@ def _tokens(command: str) -> list[str] | None:
         tokens.append(token)
     if len(tokens) > MAX_TOKENS:
         return None
-    return _resolve_herestring_dups(tokens)
+    return tokens
+
+
+def _tokens(command: str) -> list[str] | None:
+    """Split a shell command and resolve descriptor dups; None when unparsable or refused."""
+    tokens = _split_tokens(command)
+    return None if tokens is None else _resolve_herestring_dups(tokens)
 
 
 def _strip_redirections(tokens: list[str]) -> tuple[list[str], list[str]]:
@@ -793,21 +1104,22 @@ def _strip_redirections(tokens: list[str]) -> tuple[list[str], list[str]]:
 
 def _close_arith_span(line: bytes, start: int) -> int | None:
     """Return the end byte index after one arithmetic expansion or None when unclosed."""
-    depth = 1
+    depth = 2
+    pair = -1
     pos = start + 3
     for _ in range(len(line) - pos + 8):
         if pos >= len(line):
             return None
-        if line[pos : pos + 2] == b"((":
+        byte = line[pos]
+        pos += 1
+        if byte == ord("("):
             depth += 1
-            pos += 2
-        elif line[pos : pos + 2] == b"))":
+        elif byte == ord(")"):
             depth -= 1
-            pos += 2
-        else:
-            pos += 1
-        if depth == 0:
-            return pos
+            if depth == 1:
+                pair = pos
+            elif depth == 0:
+                return pos if pair == pos - 1 else None
     return None
 
 
@@ -1095,12 +1407,28 @@ def _herestring_word_end_bytes(seg: bytes, masked: bytes, pos: int) -> tuple[int
     return (start, end) if end > start else None
 
 
+def _byte_words(seg: bytes, stripped: bytearray) -> list[str]:
+    """Return the raw words of one stage with redirections blanked, decoded for the shared rules."""
+    return [
+        seg[found.start() : found.end()].decode("latin-1")
+        for found in re.finditer(rb"[^ \t\r\n]+", bytes(stripped))
+    ]
+
+
+def _dup_replacement(resolved: Any, seg: bytes, start: int, stage: _StageState) -> bytes | None:
+    """Return the <<< word replacing a resolved fd 0 dup, or None when unresolved or refused."""
+    if isinstance(resolved, _Marker):
+        stage.refusal = stage.refusal or resolved.reason
+        return None
+    if resolved is None:
+        return None
+    word = resolved.word if isinstance(resolved, _Bound) else resolved
+    lead = b"<<< " if start == 0 or seg[start - 1 : start] in b" \t" else b" <<< "
+    return lead + word
+
+
 def _step_segment_redirect(
-    seg: bytes,
-    masked_seg: bytes,
-    match: re.Match[bytes],
-    local_fds: dict[int, bytes],
-    stripped: bytearray,
+    seg: bytes, masked_seg: bytes, match: re.Match[bytes], stage: _StageState
 ) -> tuple[int, bytes | None]:
     """Apply one matched byte-surface redirect in source order; return end and replacement."""
     start, end = match.span()
@@ -1110,87 +1438,105 @@ def _step_segment_redirect(
         word_span = _herestring_word_end_bytes(seg, masked_seg, end)
         if word_span is None:
             return end, None
-        stripped[start : word_span[1]] = b" " * (word_span[1] - start)
+        stage.stripped[start : word_span[1]] = b" " * (word_span[1] - start)
         fd = _descriptor_fd(match.group("hs_fd"))
         if fd is not None:
-            local_fds[fd] = seg[word_span[0] : word_span[1]]
+            word = seg[word_span[0] : word_span[1]]
+            stage.fds[fd] = _Bound(word, _word_volatile(word))
         return word_span[1], None
     if match.group("dup") is not None:
-        stripped[start:end] = b" " * (end - start)
+        stage.stripped[start:end] = b" " * (end - start)
         resolved = _apply_dup_or_close(
-            local_fds, match.group("dup_fd"), match.group("dup_op"), match.group("dup_rhs")
+            stage.fds, match.group("dup_fd"), match.group("dup_op"), match.group("dup_rhs")
         )
-        if resolved is None:
-            return end, None
-        lead = b"<<< " if start == 0 or seg[start - 1 : start] in b" \t" else b" <<< "
-        return end, lead + resolved
+        return end, _dup_replacement(resolved, seg, start, stage)
     word_span = _herestring_word_end_bytes(seg, masked_seg, end)
     stop = word_span[1] if word_span is not None else end
-    stripped[start:stop] = b" " * (stop - start)
+    stage.stripped[start:stop] = b" " * (stop - start)
     if match.group("amp") is not None:
-        _apply_file_redirect(local_fds, None, match.group("amp"))
+        _apply_file_redirect(stage.fds, None, match.group("amp"))
     else:
-        _apply_file_redirect(local_fds, match.group("file_fd"), match.group("file_op"))
+        _apply_file_redirect(stage.fds, match.group("file_fd"), match.group("file_op"))
     return stop, None
 
 
-def _rewrite_segment_dups(
-    seg: bytes, masked_seg: bytes, exec_fds: dict[int, bytes]
-) -> tuple[bytes, dict[int, bytes]]:
+def _run_byte_stage(payload: tuple[bytes, bytes], flow: _FdFlow) -> _StageState:
     """Update segment descriptors in source order and replace resolved fd 0 dups with <<< word."""
-    local_fds = dict(exec_fds)
-    stripped = bytearray(masked_seg)
+    seg, masked_seg = payload
+    stage = _StageState(flow.fds)
+    stage.stripped = bytearray(masked_seg)
     parts: list[bytes] = []
     cursor = 0
     scan_pos = 0
     for match in _SEG_REDIR_BYTES.finditer(masked_seg):
         if match.start() < scan_pos:
             continue
-        scan_pos, replacement = _step_segment_redirect(seg, masked_seg, match, local_fds, stripped)
+        scan_pos, replacement = _step_segment_redirect(seg, masked_seg, match, stage)
         if replacement is not None:
             parts.append(seg[cursor : match.start()])
             parts.append(replacement)
             cursor = scan_pos
     parts.append(seg[cursor:])
-    next_exec = local_fds if bytes(stripped).strip() == b"exec" else exec_fds
-    return b"".join(parts), next_exec
+    stage.out = [b"".join(parts)]
+    stage.words = _byte_words(seg, stage.stripped)
+    return stage
 
 
-def _is_separator_byte(masked: bytes, idx: int) -> bool:
-    """Return whether idx in masked bytes is an unquoted command separator."""
-    b = masked[idx]
-    if b in (ord(";"), ord("\n")):
-        return True
-    if b == ord("|"):
-        return not (idx > 0 and masked[idx - 1] == ord(">"))
-    if b == ord("&"):
-        prev_redir = idx > 0 and masked[idx - 1] in b"><"
-        next_redir = idx + 1 < len(masked) and masked[idx + 1] == ord(">")
-        return not (prev_redir or next_redir)
-    return False
+def _byte_sep_kind(masked: bytes, match: re.Match[bytes]) -> str | None:
+    """Classify one separator match, or None when it spells part of a redirection operator."""
+    tok = match.group()
+    start = match.start()
+    prev = masked[start - 1 : start] if start else b""
+    if tok == b"&":
+        nxt = masked[match.end() : match.end() + 1]
+        return None if prev in (b"<", b">") or nxt == b">" else "&"
+    if tok == b"|" and prev == b">":
+        return None
+    if tok in (b"(", b")"):
+        return tok.decode("ascii")
+    return "|" if tok in (b"|", b"|&") else ";"
+
+
+def _byte_events(raw: bytes, masked: bytes) -> list[_Event]:
+    """Split raw bytes into stages ended by an unquoted separator, group edge or backtick."""
+    events: list[_Event] = []
+    start = 0
+    ticks = 0
+    for match in _BYTE_SEP.finditer(masked):
+        kind = _byte_sep_kind(masked, match)
+        if kind is None:
+            continue
+        if match.group() == b"`":
+            ticks += 1
+            kind = "(" if ticks % 2 else ")"
+        seg = raw[start : match.start()]
+        payload = (seg, masked[start : match.start()])
+        events.append(_Event(payload, raw[match.start() : match.end()], kind, [seg]))
+        start = match.end()
+    events.append(_Event((raw[start:], masked[start:]), b"", ";", [raw[start:]]))
+    return events
+
+
+def rewrite_descriptor_dups_checked(raw: bytes) -> tuple[bytes, str | None]:
+    """Rewrite fd 0 dups into here-string words and return the first named refusal, if any."""
+    masked = _mask_descriptor_scan_bytes(raw)
+    if _DUP_STDIN_BYTES.search(masked) is None:
+        return raw, None
+    events = _byte_events(raw, masked)
+    flow = _FdFlow(b"lastpipe" in raw or b"shopt" in raw)
+    results = _drive_stages(events, _run_byte_stage, flow)
+    out = [b"".join(res) + event.sep for event, res in zip(events, results, strict=True)]
+    return b"".join(out), flow.refusal
 
 
 def rewrite_descriptor_dups(raw: bytes) -> bytes:
     """Rewrite 0<&N, <&N, and moves onto fd 0 when the source fd carries a here-string."""
-    masked = _mask_descriptor_scan_bytes(raw)
-    if _DUP_STDIN_BYTES.search(masked) is None:
-        return raw
-    out: list[bytes] = []
-    exec_fds: dict[int, bytes] = {}
-    seg_start = 0
-    for idx in range(len(raw)):
-        if _is_separator_byte(masked, idx):
-            if idx > seg_start:
-                rewritten, exec_fds = _rewrite_segment_dups(
-                    raw[seg_start:idx], masked[seg_start:idx], exec_fds
-                )
-                out.append(rewritten)
-            out.append(raw[idx : idx + 1])
-            seg_start = idx + 1
-    if seg_start < len(raw):
-        rewritten, _ = _rewrite_segment_dups(raw[seg_start:], masked[seg_start:], exec_fds)
-        out.append(rewritten)
-    return b"".join(out)
+    return rewrite_descriptor_dups_checked(raw)[0]
+
+
+def descriptor_dup_refusal(raw: bytes) -> str | None:
+    """Return the named reason a descriptor dup cannot be resolved in raw bytes, if any."""
+    return rewrite_descriptor_dups_checked(raw)[1]
 
 
 def _parse_herestring_word(line: bytes, pos: int) -> int | None:
@@ -1211,16 +1557,23 @@ def _parse_herestring_word(line: bytes, pos: int) -> int | None:
     return end
 
 
+def _skip_blanks(line: bytes, pos: int, blanks: bytes) -> int:
+    """Return the index after any of the blank bytes at pos without copying the line."""
+    start = pos if pos >= 0 else max(len(line) + pos, 0)
+    for idx in range(start, len(line)):
+        if line[idx] not in blanks:
+            return pos + (idx - start)
+    return pos + (len(line) - start) if start < len(line) else pos
+
+
 def _skip_spaces_tabs(line: bytes, pos: int) -> int:
     """Return the index after horizontal whitespace at pos."""
-    tail = line[pos:]
-    return pos + (len(tail) - len(tail.lstrip(b" \t")))
+    return _skip_blanks(line, pos, b" \t")
 
 
 def _skip_spaces(line: bytes, pos: int) -> int:
     """Return the index after space characters at pos."""
-    tail = line[pos:]
-    return pos + (len(tail) - len(tail.lstrip(b" ")))
+    return _skip_blanks(line, pos, b" ")
 
 
 def _redirect_target_slice(line: bytes, pos: int) -> tuple[int, bytes] | None:

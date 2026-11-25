@@ -1751,6 +1751,14 @@
           "seen": "2026-11-19"
         },
         {
+          "number": 24303,
+          "kind": "pull",
+          "author": "popcornmix",
+          "reason": "same-files",
+          "state": "open",
+          "seen": "2026-11-25"
+        },
+        {
           "number": 24628,
           "kind": "pull",
           "author": "danielcamposramos",
@@ -1907,7 +1915,7 @@
           "kind": "pull",
           "author": "WT-MM",
           "reason": "same-files",
-          "state": "open",
+          "state": "merged",
           "seen": "2026-11-19"
         },
         {
@@ -2067,6 +2075,14 @@
           "author": "michaelni",
           "reason": "same-files",
           "state": "merged",
+          "seen": "2026-11-25"
+        },
+        {
+          "number": 26346,
+          "kind": "pull",
+          "author": "luoye-cpu",
+          "reason": "same-files",
+          "state": "open",
           "seen": "2026-11-25"
         }
       ]
@@ -2692,6 +2708,14 @@
           "seen": "2026-11-19"
         },
         {
+          "number": 23048,
+          "kind": "pull",
+          "author": "Greisby",
+          "reason": "same-files",
+          "state": "open",
+          "seen": "2026-11-25"
+        },
+        {
           "number": 24060,
           "kind": "pull",
           "author": "OrenJackMaurice",
@@ -3266,6 +3290,14 @@
           "reason": "same-files",
           "state": "open",
           "seen": "2026-11-25"
+        },
+        {
+          "number": 26346,
+          "kind": "pull",
+          "author": "luoye-cpu",
+          "reason": "same-files",
+          "state": "open",
+          "seen": "2026-11-25"
         }
       ]
     },
@@ -3356,6 +3388,14 @@
           "seen": "2026-11-19"
         },
         {
+          "number": 23048,
+          "kind": "pull",
+          "author": "Greisby",
+          "reason": "same-files",
+          "state": "open",
+          "seen": "2026-11-25"
+        },
+        {
           "number": 24060,
           "kind": "pull",
           "author": "OrenJackMaurice",
@@ -3375,6 +3415,14 @@
           "number": 24075,
           "kind": "pull",
           "author": "GyanD",
+          "reason": "same-files",
+          "state": "open",
+          "seen": "2026-11-25"
+        },
+        {
+          "number": 24303,
+          "kind": "pull",
+          "author": "popcornmix",
           "reason": "same-files",
           "state": "open",
           "seen": "2026-11-25"
@@ -4106,6 +4154,14 @@
           "reason": "same-files",
           "state": "open",
           "seen": "2026-11-25"
+        },
+        {
+          "number": 26346,
+          "kind": "pull",
+          "author": "luoye-cpu",
+          "reason": "same-files",
+          "state": "open",
+          "seen": "2026-11-25"
         }
       ]
     },
@@ -4639,6 +4695,14 @@
           "number": 26343,
           "kind": "pull",
           "author": "rnissl",
+          "reason": "same-files",
+          "state": "open",
+          "seen": "2026-11-25"
+        },
+        {
+          "number": 26346,
+          "kind": "pull",
+          "author": "luoye-cpu",
           "reason": "same-files",
           "state": "open",
           "seen": "2026-11-25"

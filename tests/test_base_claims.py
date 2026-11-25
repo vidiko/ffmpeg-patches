@@ -285,6 +285,224 @@ DEPENDENCY_ATTRIBUTION_CASES: tuple[tuple[str, list[tuple[int, str]] | None, str
     ("h-sibling-issue-ref", None, "Based on pull request 12 and issue 13, ends at 5d6e7f8."),
 )
 
+DEPENDENCY_SCOPE_CASES: tuple[
+    tuple[str, str, list[tuple[int, str]] | None, list[int] | None, str], ...
+] = (
+    ("b-refuse-cr", "refuse", None, None, "Depends on #12 [note). head bbbbbbb]"),
+    ("b-refuse-paren", "refuse", None, None, "Depends on #12 (note]. head bbbbbbb)"),
+    ("b-refuse-brace", "refuse", None, None, "Depends on #12 {note). head bbbbbbb}"),
+    ("b-refuse-semicolon", "refuse", None, None, "Depends on #12 [note); head bbbbbbb]"),
+    (
+        "b-refuse-list",
+        "refuse",
+        None,
+        None,
+        "Depends on #12 [note). head aaaaaaa], #13 (head bbbbbbb)",
+    ),
+    ("b-refuse-hidden", "refuse", None, None, "Depends on #12 (note], #13 head bbbbbbb)"),
+    ("b-keep-outside", "ok", [], [], "Depends on #12 [note]. Head bbbbbbb"),
+    ("b-keep-stray-closer", "ok", [(12, "bbbbbbb")], [12], "Depends on #12 [head bbbbbbb)]"),
+    ("b-keep-matched", "ok", [(12, "bbbbbbb")], [12], "Depends on #12 [head bbbbbbb]"),
+    ("b-keep-nested", "ok", [(12, "bbbbbbb")], [12], "Depends on #12 [head bbbbbbb (rebased)]"),
+    ("l-two", "ok", [], [1, 2], "Depends on #1 (old head aaaaaaa), #2"),
+    (
+        "l-mixed",
+        "ok",
+        [(2, "bbbbbbb")],
+        [1, 2],
+        "Depends on #1 (old head aaaaaaa), #2 (head bbbbbbb)",
+    ),
+    (
+        "l-over",
+        "limit",
+        None,
+        None,
+        "Depends on #1 (old head aaaaaaa), #2, #3, #4, #5, #6, #7, #8, #9, #10",
+    ),
+    (
+        "l-over-head",
+        "limit",
+        None,
+        None,
+        "Depends on #1 (old head aaaaaaa), #2 (head bbbbbbb), #3, #4, #5, #6, #7, #8, #9",
+    ),
+    (
+        "l-eight",
+        "ok",
+        [],
+        [1, 2, 3, 4, 5, 6, 7, 8],
+        "Depends on #1 (old head aaaaaaa), #2, #3, #4, #5, #6, #7, #8",
+    ),
+    ("l-and", "ok", [], [12, 13], "Depends on #12 (old head aaaaaaa) and #13"),
+    (
+        "l-square",
+        "ok",
+        [(13, "bbbbbbb")],
+        [12, 13],
+        "Depends on #12 [old head aaaaaaa], #13 [head bbbbbbb]",
+    ),
+    (
+        "l-member-words",
+        "ok",
+        [(12, "aaaaaaa")],
+        [12, 13],
+        "Depends on #12 (head aaaaaaa), #13 from an earlier series (head bbbbbbb)",
+    ),
+    ("l-trailing-hist", "ok", [], [12, 13], "Depends on #12 and #13 (previous head bbbbbbb)"),
+    (
+        "l-trailing-mixed",
+        "refuse",
+        None,
+        None,
+        "Depends on #12 and #13 (previous head aaaaaaa, now head bbbbbbb)",
+    ),
+    ("l-keep-lead-hist", "ok", [], [], "Previously depends on #12 and #13 (head bbbbbbb)"),
+    (
+        "l-keep-lead-hist-over",
+        "ok",
+        [],
+        [],
+        "Previously depends on #1, #2, #3, #4, #5, #6, #7, #8, #9, #10",
+    ),
+    ("l-keep-single-hist", "ok", [], [], "Depends on #12 (old head aaaaaaa)"),
+    ("l-keep-control-over", "limit", None, None, "Depends on #2, #3, #4, #5, #6, #7, #8, #9, #10"),
+    (
+        "l-keep-two-current",
+        "ok",
+        [(12, "aaaaaaa"), (13, "bbbbbbb")],
+        [12, 13],
+        "Depends on #12 (head aaaaaaa), #13 (head bbbbbbb)",
+    ),
+    (
+        "o-colon",
+        "ok",
+        [(12, "bbbbbbb")],
+        [12],
+        "Depends on #12: previous head aaaaaaa, now head bbbbbbb",
+    ),
+    (
+        "o-dash",
+        "ok",
+        [(12, "bbbbbbb")],
+        [12],
+        "Depends on #12 - previous head aaaaaaa, now head bbbbbbb",
+    ),
+    (
+        "o-stacked",
+        "ok",
+        [(12, "bbbbbbb")],
+        [12],
+        "Stacked on #12: old head aaaaaaa, now head bbbbbbb",
+    ),
+    (
+        "o-list",
+        "ok",
+        [(13, "bbbbbbb")],
+        [12, 13],
+        "Depends on #12: old head aaaaaaa, #13 (head bbbbbbb)",
+    ),
+    ("o-keep-lead-hist-colon", "ok", [], [], "Previously stacked on #12: head bbbbbbb"),
+    ("o-keep-lead-hist", "ok", [], [], "Previously stacked on #12 (head bbbbbbb)"),
+    (
+        "o-keep-words-unbracketed",
+        "ok",
+        [],
+        [],
+        "Depends on #12 from an earlier series head aaaaaaa",
+    ),
+    (
+        "o-words-bracketed",
+        "ok",
+        [(13, "bbbbbbb")],
+        [12, 13],
+        "Depends on #12 from an earlier series (head aaaaaaa), #13 (head bbbbbbb)",
+    ),
+    (
+        "o-words-unbracketed",
+        "ok",
+        [(13, "bbbbbbb")],
+        [12, 13],
+        "Depends on #12 from an earlier series head aaaaaaa, #13 (head bbbbbbb)",
+    ),
+    (
+        "o-keep-comma",
+        "ok",
+        [(12, "bbbbbbb")],
+        [12],
+        "Depends on #12, previously at head aaaaaaa, now head bbbbbbb",
+    ),
+    ("o-keep-old-only", "ok", [], [], "Depends on #12: old head aaaaaaa"),
+    ("o-keep-colon-current", "ok", [(12, "bbbbbbb")], [12], "Depends on #12: head bbbbbbb"),
+    (
+        "o-keep-bracketed",
+        "ok",
+        [(12, "bbbbbbb")],
+        [12],
+        "Depends on #12 (previous head aaaaaaa, now head bbbbbbb)",
+    ),
+    ("a-refuse-cr", "refuse", None, None, "Depends on #12 head (aaaaaaa and #13 head bbbbbbb)"),
+    ("a-refuse-comma", "refuse", None, None, "Depends on #12 head (aaaaaaa, #13 head bbbbbbb)"),
+    ("a-refuse-square", "refuse", None, None, "Depends on #12 head [aaaaaaa and #13 head bbbbbbb]"),
+    (
+        "a-keep",
+        "ok",
+        [(12, "aaaaaaa"), (13, "bbbbbbb")],
+        [12, 13],
+        "Depends on #12 head (aaaaaaa) and #13 head bbbbbbb",
+    ),
+    ("a-keep-plain", "ok", [], [12, 13], "Depends on #12 and #13"),
+    (
+        "b-sibling-nested-extent",
+        "ok",
+        [(12, "bbbbbbb")],
+        [12],
+        "Depends on #12 [(note]) old] at head bbbbbbb",
+    ),
+    ("b-sibling-brace-bang", "refuse", None, None, "Stacked on PR 12 {note]! tip bbbbbbb}"),
+    (
+        "l-sibling-both-hist",
+        "ok",
+        [],
+        [12, 13],
+        "Stacked on PR 12 (prior head aaaaaaa) & PR 13 (former tip bbbbbbb)",
+    ),
+    (
+        "l-sibling-trailing-three",
+        "ok",
+        [],
+        [12, 13, 14],
+        "Builds on PR 12, PR 13, and PR 14 [earlier tip bbbbbbb]",
+    ),
+    (
+        "o-sibling-builds-prior-tip",
+        "ok",
+        [(12, "bbbbbbb")],
+        [12],
+        "Builds on PR 12: prior tip aaaaaaa, now tip bbbbbbb",
+    ),
+    (
+        "o-sibling-and-former-list",
+        "ok",
+        [(13, "bbbbbbb")],
+        [12, 13],
+        "Based on PR 12 - former head aaaaaaa and PR 13 [tip bbbbbbb]",
+    ),
+    (
+        "a-sibling-ampersand",
+        "refuse",
+        None,
+        None,
+        "Stacked on PR 12 tip (aaaaaaa & PR 13 tip bbbbbbb)",
+    ),
+    (
+        "a-sibling-oxford-comma",
+        "refuse",
+        None,
+        None,
+        "On top of pull request 12 ending at (aaaaaaa, and PR #13 ending at bbbbbbb)",
+    ),
+)
+
 
 class BaseClaimsTest(unittest.TestCase):
     """Verify base-claim extraction, filtering, staleness checks and CLI exit codes."""
@@ -610,14 +828,23 @@ class BaseClaimsTest(unittest.TestCase):
     def test_dependency_list_lead_history_applies_to_every_member(self) -> None:
         """Lead-clause history suppresses every member's head across list commas."""
         for history in ("Previous", "prior", "earlier", "former", "old", "previously"):
-            for lead in (f"{history} dependency: depends on #12", f"Depends on #12 {history}"):
-                with self.subTest(lead=lead):
-                    self.assertEqual(
-                        base_claims.find_dependency_claims(
-                            f"{lead} (head aaaaaaa), #13 (head bbbbbbb)"
-                        ),
-                        [],
-                    )
+            text = f"{history} dependency: depends on #12 (head aaaaaaa), #13 (head bbbbbbb)"
+            with self.subTest(history=history):
+                self.assertEqual(base_claims.find_dependency_claims(text), [])
+                self.assertEqual(base_claims._dependency_numbers([("body", text)]), [])
+
+    def test_dependency_list_first_member_after_history_stays_local(self) -> None:
+        """History after the first member reference drops only its head and lists both members."""
+        for history in ("Previous", "prior", "earlier", "former", "old", "previously"):
+            text = f"Depends on #12 {history} (head aaaaaaa), #13 (head bbbbbbb)"
+            with self.subTest(history=history):
+                try:
+                    claims = base_claims.find_dependency_claims(text)
+                    numbers = base_claims._dependency_numbers([("body", text)])
+                except ValueError as error:
+                    self.fail(f"unexpected ValueError: {error}")
+                self.assertEqual(claims, [(13, "bbbbbbb")])
+                self.assertEqual(numbers, [12, 13])
 
     def test_dependency_list_history_is_local_to_each_members_clauses(self) -> None:
         """Member history stays local and ordinary clause breaks retain their meaning."""
@@ -1120,7 +1347,7 @@ class BaseClaimsTest(unittest.TestCase):
         """Bracketed old on one member drops only that head and keeps later members."""
         text = "Depends on #12 [old head aaaaaaa], #13 [head bbbbbbb]"
         self.assertEqual(base_claims.find_dependency_claims(text), [(13, "bbbbbbb")])
-        self.assertEqual(base_claims._dependency_numbers([("body", text)]), [13])
+        self.assertEqual(base_claims._dependency_numbers([("body", text)]), [12, 13])
 
     def test_dependency_bracket_history_drops_previous_keeps_now_head(self) -> None:
         """Bracket history stops at an inner comma and the later head stays current."""
@@ -1295,14 +1522,23 @@ class BaseClaimsTest(unittest.TestCase):
 
     def test_dependency_cli_historical_lists_need_no_dependency_json(self) -> None:
         """Historical lists pass check mode without any live dependency JSON mappings."""
-        for text in (
-            "Previously depends on #12 and #13 (head bbbbbbb)",
-            "Depends on #12 and #13 (previous head bbbbbbb)",
-        ):
+        for text in ("Previously depends on #12 and #13 (head bbbbbbb)",):
             with self.subTest(text=text):
                 body = self.write_fixture("body.md", text)
                 rc, err = self.run_cli("--merge-base", MERGE_BASE, str(body))
                 self.assertEqual((rc, err), (0, ""))
+
+    def test_dependency_cli_trailing_historical_head_lists_members(self) -> None:
+        """A trailing historical head still requires dependency JSON and lists both members."""
+        body = self.write_fixture("body.md", "Depends on #12 and #13 (previous head bbbbbbb)")
+        self.assertEqual(
+            self.run_cli("--merge-base", MERGE_BASE, str(body)),
+            (2, "base_claims: missing --dependency-json for #12\n"),
+        )
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            rc, err = self.run_cli("--merge-base", MERGE_BASE, "--list-dependencies", str(body))
+        self.assertEqual((rc, err, stdout.getvalue()), (0, "", "12\n13\n"))
 
     def test_dependency_list_limit_boundary_and_duplicate_members(self) -> None:
         """Exactly the distinct limit and repeated list members remain accepted."""
@@ -1740,6 +1976,53 @@ class BaseClaimsTest(unittest.TestCase):
                 message = str(caught.exception)
                 listed = re.findall(r"#([0-9]{1,7})\b", message)
                 self.assertEqual(len(listed), len(set(listed)), message)
+
+    def assert_scope_refusal_message(self, message: str, sentence: str) -> None:
+        """Verify an ambiguity error starts correctly and lists each member once."""
+        self.assertTrue(message.startswith("ambiguous dependency"), message)
+        for match in base_claims.DEPENDENCY_MEMBER.finditer(sentence):
+            self.assertIn(f"#{match.group(1)}", message)
+        listed = re.findall(r"#([0-9]{1,7})\b", message)
+        self.assertEqual(len(listed), len(set(listed)), message)
+
+    def assert_scope_non_ok_case(self, outcome: str, sentence: str) -> None:
+        """Verify find_dependency_claims and _dependency_numbers fail with outcome."""
+        limit = f"more than {base_claims.MAX_DEPENDENCIES} distinct dependency PR numbers"
+        with self.assertRaises(ValueError) as claims_err:
+            base_claims.find_dependency_claims(sentence)
+        with self.assertRaises(ValueError) as numbers_err:
+            base_claims._dependency_numbers([("body", sentence)])
+        for caught in (claims_err, numbers_err):
+            message = str(caught.exception)
+            if outcome == "limit":
+                self.assertEqual(message, limit)
+            else:
+                self.assertEqual(outcome, "refuse")
+                self.assert_scope_refusal_message(message, sentence)
+
+    def assert_scope_ok_case(
+        self,
+        claims: list[tuple[int, str]] | None,
+        numbers: list[int] | None,
+        sentence: str,
+    ) -> None:
+        """Verify find_dependency_claims and _dependency_numbers match expected lists."""
+        try:
+            actual_claims = base_claims.find_dependency_claims(sentence)
+            actual_numbers = base_claims._dependency_numbers([("body", sentence)])
+        except ValueError as error:
+            self.fail(f"unexpected ValueError: {error}")
+        self.assertEqual(actual_claims, claims)
+        self.assertEqual(actual_numbers, numbers)
+
+    def test_dependency_scope_cases(self) -> None:
+        """Typed brackets, member-local history, lead windows and separators match table."""
+        for label, outcome, claims, numbers, sentence in DEPENDENCY_SCOPE_CASES:
+            with self.subTest(case=label):
+                if outcome != "ok":
+                    self.assert_scope_non_ok_case(outcome, sentence)
+                    continue
+                self.assert_scope_ok_case(claims, numbers, sentence)
 
 
 if __name__ == "__main__":

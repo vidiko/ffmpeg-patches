@@ -466,3 +466,80 @@ rules:
         - /scripts/ffmpeg-forgejo
     pattern-regex: '(?m)^[ \t]*(?:el)?if[ \t]+![ \t][^\n;]*[;\n](?:\s|#[^\n]*\n)*then(?:\s|#[^\n]*\n)+(?:local\s+)?\w+=\$\?'
 
+  # PR 390 CodeQL alerts 58 to 60, 2026-11-22
+  - id: base-exception-handler-without-reraise
+    languages: [python]
+    severity: ERROR
+    message: >-
+      Catching BaseException or bare except without re-raising defers cleanup but
+      hides KeyboardInterrupt and SystemExit. Use
+      (Exception, KeyboardInterrupt, SystemExit) or end the handler with raise.
+    paths:
+      include:
+        - scripts/
+        - tests/
+      exclude:
+        - "**/tests/test_semgrep_rules.py"
+    patterns:
+      - pattern-either:
+          - pattern-regex: >-
+              except BaseException as \w+:\s*\n\s*\w+ = \w+
+          - pattern-regex: >-
+              except BaseException as \w+:\s*\n\s*\w+\.append\(
+          - pattern-regex: >-
+              except:\s*\n\s*\w+ =
+      - pattern-not-regex: >-
+          except BaseException[^:]*:\s*\n\s*raise\s*$
+      - pattern-not-regex: >-
+          except BaseException as \w+:\s*\n\s*\w+ = \w+\s*\n\s*raise\s*$
+      - pattern-not-regex: >-
+          except BaseException as \w+:\s*\n\s*\w+\.append\([^)]*\)\s*\n\s*raise\s*$
+
+  # PR 390 CodeQL alerts 58 to 60, 2026-11-22
+  - id: assert-raises-body-bare-raise
+    languages: [python]
+    severity: ERROR
+    message: >-
+      A with block that includes assertRaises must not be only a raise statement;
+      call a helper so statements after the block are reachable to static analysis.
+    paths:
+      include:
+        - tests/
+    pattern-either:
+      - pattern: |
+          with self.assertRaises($X):
+            raise $EXC
+      - pattern: |
+          with self.assertRaisesRegex($P, $Q):
+            raise $EXC
+      - pattern: |
+          with self.assertRaises($X) as $VAR:
+            raise $EXC
+      - pattern: |
+          with self.assertRaisesRegex($P, $Q) as $VAR:
+            raise $EXC
+      - pattern: |
+          with $A, self.assertRaises($X), $B:
+            raise $EXC
+      - pattern: |
+          with $A, self.assertRaises($X) as $VAR, $B:
+            raise $EXC
+      - pattern: |
+          with $A, self.assertRaisesRegex($P, $Q), $B:
+            raise $EXC
+      - pattern: |
+          with $A, self.assertRaisesRegex($P, $Q) as $VAR, $B:
+            raise $EXC
+      - pattern: |
+          with (..., self.assertRaises($X), ...):
+            raise $EXC
+      - pattern: |
+          with (..., self.assertRaises($X) as $VAR, ...):
+            raise $EXC
+      - pattern: |
+          with (..., self.assertRaisesRegex($P, $Q), ...):
+            raise $EXC
+      - pattern: |
+          with (..., self.assertRaisesRegex($P, $Q) as $VAR, ...):
+            raise $EXC
+

@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess  # nosec B404 - only the local grep action runs against fixtures.
 import tempfile
@@ -12,10 +13,16 @@ from pathlib import Path
 
 import yaml
 
+from scripts import upstream_links_forge as upstream_forge
+
 ROOT = Path(__file__).resolve().parents[1]
 PYTHON_ACTION = ROOT / ".github/actions/setup-python/action.yml"
 BASE_ACTION = ROOT / ".github/actions/load-base/action.yml"
 BASE_EXPORT = "grep -E '^FFMPEG_(REMOTE|TAG|COMMIT)=' base.env >> \"$GITHUB_ENV\""
+# Scheduled upstream.yml (2026-11-24): 36 pre-plan requests (~129 s), 130 file listings (~140 s).
+CI_PRE_PLAN_SECONDS = 3.6
+CI_FILE_LISTING_SECONDS = 1.08
+BUDGET_HEADROOM = 1.2
 
 
 def github_yaml_files() -> list[Path]:
@@ -70,6 +77,37 @@ class WorkflowActionsTest(unittest.TestCase):
     def assert_base_loading_is_shared(self, text: str) -> None:
         """Reject inline base exports outside the shared action."""
         self.assertNotIn('base.env >> "$GITHUB_ENV"', text)
+
+    def test_overlap_job_timeout_tracks_scan_budget(self) -> None:
+        """Give overlap scans their own job and a timeout derived from their budget."""
+        workflow = yaml.safe_load(
+            (ROOT / ".github/workflows/upstream.yml").read_text(encoding="utf-8")
+        )
+        job = workflow["jobs"]["links"]
+        self.assertNotIn("needs", job)
+        self.assertEqual(job["timeout-minutes"] * 60, 2 * upstream_forge.SCAN_BUDGET_SECONDS)
+        self.assertLess(
+            upstream_forge.SCAN_BUDGET_SECONDS + upstream_forge.REQUEST_TIMEOUT,
+            job["timeout-minutes"] * 60,
+        )
+
+    def test_scan_budget_covers_candidate_cap_at_measured_ci_pace(self) -> None:
+        """Size SCAN_BUDGET_SECONDS to cover the candidate cap at the measured CI pace."""
+        manifest = json.loads((ROOT / "upstream-contributions.json").read_text(encoding="utf-8"))
+        open_targets = sum(1 for row in manifest["contributions"] if row["state"] == "open")
+        pre_plan = open_targets + upstream_forge.MAX_PULL_PAGES
+        listings = open_targets + upstream_forge.MAX_CANDIDATES
+        need = pre_plan * CI_PRE_PLAN_SECONDS + listings * CI_FILE_LISTING_SECONDS
+        usable = (
+            upstream_forge.SCAN_BUDGET_SECONDS
+            - upstream_forge.REQUEST_TIMEOUT
+            - upstream_forge.REQUEST_PAUSE_SECONDS
+        )
+        self.assertGreaterEqual(
+            usable,
+            BUDGET_HEADROOM * need,
+            f"usable={usable:.1f}s < {BUDGET_HEADROOM} * need ({need:.2f}s) for N={open_targets}",
+        )
 
     def test_python_setup_has_single_owner(self) -> None:
         """Only the Python composite action may use actions/setup-python directly."""

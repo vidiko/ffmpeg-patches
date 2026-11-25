@@ -16,14 +16,22 @@ or removed.
 In the path-on-stdin mode the reader accepts only the file Git names as its commit
 message file or merge message file; any other path, a truncated prefix included,
 is undecidable (message-path allow-list).
+
+Under deadline_scope every Git call gets the time left on one total deadline
+(SIGNOFF_DEADLINE seconds), at most GIT_TIMEOUT, and none starts once it has
+passed; outside a scope each call has GIT_TIMEOUT alone.
 """
 
 from __future__ import annotations
 
 import argparse
+import contextlib
+import contextvars
 import os
 import subprocess  # nosec B404 - fixed local Git argv, no shell, explicit timeouts.
 import sys
+import time
+from collections.abc import Callable, Iterator
 from pathlib import Path
 
 MAX_COMMITS = 1000
@@ -32,6 +40,7 @@ MAX_MESSAGE_CHARS = 1024 * 1024
 MAX_STDIN_PATH_BYTES = 4096
 MAX_REMOTES = 1000
 GIT_TIMEOUT = 10
+SIGNOFF_DEADLINE = 120
 SEPARATOR_PIN = ("trailer.separators=:",)
 IDENTITY_PIN = ("user.useConfigOnly=true",)
 REASON_MISSING = "no Signed-off-by trailer"
@@ -43,6 +52,41 @@ REPAIR_MISSING = (
 REPAIR_EDIT = (
     "edit the message so exactly one Signed-off-by trailer with the expected identity remains"
 )
+# The active total deadline of one sign-off check: (clock, start, limit), else None.
+_DEADLINE: contextvars.ContextVar[tuple[Callable[[], float], float, float] | None] = (
+    contextvars.ContextVar("signoff_deadline", default=None)
+)
+
+
+def seconds_left(
+    clock: Callable[[], float], start: float, limit: float, label: str, *, zero_ok: bool = False
+) -> float:
+    """Return the seconds left of a deadline, raising once it has passed (or is just used up)."""
+    left = limit - (clock() - start)
+    if left < 0 or (left == 0 and not zero_ok):
+        raise ValueError(f"{label} deadline of {limit} s passed")
+    return left
+
+
+@contextlib.contextmanager
+def deadline_scope(
+    limit: float = SIGNOFF_DEADLINE, clock: Callable[[], float] = time.monotonic
+) -> Iterator[None]:
+    """Run the Git calls inside under one total deadline that starts now, on its own clock."""
+    token = _DEADLINE.set((clock, clock(), limit))
+    try:
+        yield
+    finally:
+        _DEADLINE.reset(token)
+
+
+def call_timeout() -> float:
+    """Return GIT_TIMEOUT, or the smaller time left on the active deadline, failing closed."""
+    active = _DEADLINE.get()
+    if active is None:
+        return GIT_TIMEOUT
+    clock, start, limit = active
+    return min(GIT_TIMEOUT, seconds_left(clock, start, limit, "sign-off check"))
 
 
 def git(
@@ -58,6 +102,7 @@ def git(
     for entry in config:
         argv.extend(["-c", entry])
     argv.extend(args)
+    timeout = call_timeout()
     try:
         result = subprocess.run(  # nosec B603 B607 - fixed Git executable, argv data, no shell.
             argv,
@@ -66,7 +111,7 @@ def git(
             capture_output=True,
             encoding="utf-8",
             check=False,
-            timeout=GIT_TIMEOUT,
+            timeout=timeout,
         )
     except (OSError, UnicodeError, subprocess.TimeoutExpired) as exc:
         raise ValueError(f"git {args[0]} failed: {type(exc).__name__}") from exc

@@ -615,5 +615,110 @@ class ConsideredRemotesTest(GitFixture):
         self.assertIn(unsigned, refused)
 
 
+class FakeClock:
+    """A settable clock standing in for time.monotonic."""
+
+    def __init__(self) -> None:
+        """Start at zero seconds."""
+        self.now = 0.0
+
+    def __call__(self) -> float:
+        """Return the current fake time."""
+        return self.now
+
+
+def empty_run(clock: FakeClock | None = None, step: float = 0.0) -> unittest.mock.Mock:
+    """Stub subprocess.run: empty Git output, advancing the clock by step seconds per call."""
+
+    def run(*args: object, **kwargs: object) -> subprocess.CompletedProcess:
+        """Serve one empty Git answer."""
+        if clock is not None:
+            clock.now += step
+        return subprocess.CompletedProcess([], 0, stdout="", stderr="")
+
+    return unittest.mock.Mock(side_effect=run)
+
+
+class SignoffDeadlineTest(unittest.TestCase):
+    """Run the sign-off Git calls under one total deadline."""
+
+    def test_per_call_timeout_is_the_time_left_capped(self) -> None:
+        """Give each call the time left on the deadline, never more than GIT_TIMEOUT."""
+        for used, expected in ((115, 5), (30, 10)):
+            with self.subTest(used=used):
+                clock = FakeClock()
+                run = empty_run()
+                with (
+                    unittest.mock.patch("scripts.signoff.subprocess.run", run),
+                    signoff.deadline_scope(clock=clock),
+                ):
+                    clock.now = used
+                    signoff.git(["remote"])
+                self.assertEqual(run.call_args.kwargs["timeout"], expected)
+
+    def test_boundary_just_before_the_deadline_still_runs(self) -> None:
+        """Make the call with the half second left at 119.5 s used."""
+        clock = FakeClock()
+        run = empty_run()
+        with (
+            unittest.mock.patch("scripts.signoff.subprocess.run", run),
+            signoff.deadline_scope(clock=clock),
+        ):
+            clock.now = 119.5
+            try:
+                signoff.git(["remote"])
+            except ValueError as exc:
+                self.fail(f"call refused with half a second left: {exc}")
+        run.assert_called_once()
+        self.assertEqual(run.call_args.kwargs["timeout"], 0.5)
+
+    def test_passed_deadline_makes_no_call(self) -> None:
+        """Refuse before the next Git call at 120 s and 121 s used."""
+        for used in (120, 121):
+            with self.subTest(used=used):
+                clock = FakeClock()
+                run = empty_run()
+                with (
+                    unittest.mock.patch("scripts.signoff.subprocess.run", run),
+                    signoff.deadline_scope(clock=clock),
+                ):
+                    clock.now = used
+                    with self.assertRaises(ValueError) as caught:
+                        signoff.check_commits("a" * 40, ZERO, considered_remotes=["origin"])
+                self.assertIn("sign-off check deadline of 120 s passed", str(caught.exception))
+                run.assert_not_called()
+
+    def test_one_deadline_spans_every_call_of_a_check(self) -> None:
+        """Refuse the third remote read once two reads used the whole deadline."""
+        clock = FakeClock()
+        run = empty_run(clock, 60)
+        with (
+            unittest.mock.patch("scripts.signoff.subprocess.run", run),
+            signoff.deadline_scope(clock=clock),
+            self.assertRaisesRegex(ValueError, "sign-off check deadline of 120 s passed"),
+        ):
+            signoff.check_commits("a" * 40, ZERO, considered_remotes=["one", "two", "three"])
+        self.assertEqual(run.call_count, 2)
+
+    def test_default_keeps_the_fixed_timeout_on_every_call(self) -> None:
+        """Pass GIT_TIMEOUT to every call of a check that runs without a deadline."""
+        run = empty_run()
+        with unittest.mock.patch("scripts.signoff.subprocess.run", run):
+            signoff.check_commits("a" * 40, ZERO, considered_remotes=["one", "two"])
+        timeouts = [call.kwargs["timeout"] for call in run.call_args_list]
+        self.assertEqual(timeouts, [signoff.GIT_TIMEOUT] * 2)
+
+    def test_deadline_ends_with_its_scope(self) -> None:
+        """Return to GIT_TIMEOUT for calls made after the scope ended."""
+        clock = FakeClock()
+        run = empty_run()
+        with unittest.mock.patch("scripts.signoff.subprocess.run", run):
+            with signoff.deadline_scope(clock=clock):
+                clock.now = 115
+            clock.now = 200
+            signoff.git(["remote"])
+        self.assertEqual(run.call_args.kwargs["timeout"], signoff.GIT_TIMEOUT)
+
+
 if __name__ == "__main__":
     unittest.main()

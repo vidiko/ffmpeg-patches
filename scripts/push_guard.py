@@ -4,8 +4,9 @@
 """Refuse invalid sign-offs, revived closed pull requests and unanswered bot review bodies.
 
 At most 256 pull request lookups may start within a 120-second check deadline,
-and review reads end by that deadline. Remote configuration queries share a
-30-second deadline.
+and review reads end by that deadline. The local sign-off reads of all updates
+run first under their own 120-second sign-off deadline, before the check
+deadline starts. Remote configuration queries share a 30-second deadline.
 
     push_guard.py REMOTE_NAME REMOTE_URL
         Read Git pre-push ref updates from stdin. For each branch update,
@@ -595,10 +596,7 @@ def bounded_api_reader(reader: APIReader, clock: Callable[[], float], start: flo
 
 def _check_deadline(clock: Callable[[], float], start: float) -> float:
     """Raise once the shared check deadline has passed; return the seconds left."""
-    left = CHECK_DEADLINE - (clock() - start)
-    if left < 0:
-        raise ValueError(f"check deadline of {CHECK_DEADLINE} s passed")
-    return left
+    return signoff.seconds_left(clock, start, CHECK_DEADLINE, "check", zero_ok=True)
 
 
 def bounded_activity_reader(
@@ -613,6 +611,29 @@ def bounded_activity_reader(
     return bounded_reader
 
 
+def read_update_lines(updates: TextIO) -> list[str]:
+    """Read at most MAX_UPDATES pre-push lines, refusing one more."""
+    lines: list[str] = []
+    for index in range(MAX_UPDATES + 1):
+        line = updates.readline()
+        if not line:
+            break
+        if index == MAX_UPDATES:
+            raise ValueError(f"more than {MAX_UPDATES} pre-push updates")
+        lines.append(line)
+    return lines
+
+
+def check_signoffs(lines: list[str], considered_remotes: list[str] | None) -> int:
+    """Check every update's sign-offs under one sign-off deadline; the first refusal wins."""
+    with signoff.deadline_scope():
+        for line in lines:
+            status = check_signoff_update(line, considered_remotes)
+            if status:
+                return status
+    return 0
+
+
 def check_updates(
     repositories: list[str],
     reader: APIReader,
@@ -621,22 +642,17 @@ def check_updates(
     considered_remotes: list[str] | None = None,
 ) -> int:
     """Check at most MAX_UPDATES ref updates, failing closed on input or API errors."""
-    start = clock()
-    bounded_reader = bounded_api_reader(reader, clock, start)
-    bounded_activity = bounded_activity_reader(activity, clock, start)
     try:
         if len(repositories) > MAX_REPOSITORIES:
             raise ValueError(f"more than {MAX_REPOSITORIES} GitHub repositories")
-        updates = read_stdin()
-        for index in range(MAX_UPDATES + 1):
-            line = updates.readline()
-            if not line:
-                return 0
-            if index == MAX_UPDATES:
-                raise ValueError(f"more than {MAX_UPDATES} pre-push updates")
-            status = check_signoff_update(line, considered_remotes)
-            if status:
-                return status
+        lines = read_update_lines(read_stdin())
+        status = check_signoffs(lines, considered_remotes)
+        if status:
+            return status
+        start = clock()
+        bounded_reader = bounded_api_reader(reader, clock, start)
+        bounded_activity = bounded_activity_reader(activity, clock, start)
+        for line in lines:
             for repository_index in range(MAX_REPOSITORIES):
                 if repository_index == len(repositories):
                     break
@@ -645,6 +661,7 @@ def check_updates(
                 )
                 if status:
                     return status
+        return 0
     except (OSError, ValueError) as exc:
         print(f"push_guard: invalid ref updates: {exc}; refusing (fail closed)", file=sys.stderr)
     return 2

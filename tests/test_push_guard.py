@@ -5,9 +5,11 @@
 from __future__ import annotations
 
 import datetime
+import functools
 import io
 import json
 import os
+import re
 import subprocess  # nosec B404 - mocked queries and local temporary Git repositories.
 import tempfile
 import threading
@@ -16,10 +18,10 @@ import unittest
 import unittest.mock
 from collections.abc import Callable
 
-from scripts import push_guard
+from scripts import push_guard, signoff
 from tests.helpers import GIT_ENVIRONMENT_NAMES, capture_main
 from tests.helpers import isolated_git_environment as without_repository_variables
-from tests.test_signoff import GitFixture
+from tests.test_signoff import FakeClock, GitFixture, empty_run
 
 REPOSITORY = "vidiko/ffmpeg-patches"
 REMOTE = f"https://github.com/{REPOSITORY}.git"
@@ -1808,6 +1810,80 @@ class SignoffPushTest(GitFixture):
         self.reader = unittest.mock.Mock(side_effect=AssertionError("unexpected PR read"))
         self.assertEqual(self.run_guard("invalid updates", "https://example.invalid/o/r")[0], 2)
         self.reader.assert_not_called()
+
+
+class SignoffDeadlinePhaseTest(unittest.TestCase):
+    """Local sign-off reads run under their own deadline, before the pull request clock starts."""
+
+    def run_updates(
+        self, count: int, delay: float, signoff_results: list[int] | None = None
+    ) -> tuple[int, list[float], unittest.mock.Mock]:
+        """Run count updates whose sign-off check takes delay seconds on the injected clock."""
+        now = [0.0]
+        budgets: list[float] = []
+
+        def checker(line: str, considered: list[str] | None = None) -> int:
+            """Spend delay seconds, then answer like the next scripted result."""
+            now[0] += delay
+            return signoff_results.pop(0) if signoff_results else 0
+
+        def activity(repository: str, number: int, budget: float) -> tuple[list, list]:
+            """Record the budget given to a review read."""
+            budgets.append(budget)
+            return [], []
+
+        reader = unittest.mock.Mock(return_value=pull_request("open", False))
+        lines = "".join(update(ref=f"branch{index}") for index in range(count))
+        with (
+            unittest.mock.patch.object(push_guard, "check_signoff_update", checker),
+            unittest.mock.patch("sys.stdin", io.StringIO(lines)),
+        ):
+            status = push_guard.check_updates([REPOSITORY], reader, lambda: now[0], activity)
+        return status, budgets, reader
+
+    def test_signoff_reads_do_not_use_the_pull_request_budget(self) -> None:
+        """Two updates with 100 s of sign-off reads each still reach both pull request reads."""
+        _, undelayed, _ = self.run_updates(2, 0)
+        status, budgets, reader = self.run_updates(2, 100)
+        self.assertEqual(status, 0)
+        self.assertEqual(reader.call_count, 2)
+        self.assertEqual(budgets[0], undelayed[0])
+
+    def test_first_refused_signoff_precedes_every_pull_request_read(self) -> None:
+        """A refused sign-off of the first update ends the check before any pull request read."""
+        status, budgets, reader = self.run_updates(2, 0, [1])
+        self.assertEqual(status, 1)
+        reader.assert_not_called()
+        self.assertEqual(budgets, [])
+
+    def test_later_refused_signoff_precedes_pull_request_reads_of_earlier_updates(self) -> None:
+        """Every update's sign-off check runs before the first update's pull request read."""
+        status, budgets, reader = self.run_updates(2, 0, [0, 1])
+        self.assertEqual(status, 1)
+        reader.assert_not_called()
+        self.assertEqual(budgets, [])
+
+    def test_passed_signoff_deadline_refuses_with_its_own_text(self) -> None:
+        """Refuse with status 2 naming the sign-off deadline, before any pull request read."""
+        clock = FakeClock()
+        run = empty_run(clock, 121)
+        reader = unittest.mock.Mock(side_effect=AssertionError("unexpected PR read"))
+        scope = functools.partial(signoff.deadline_scope, clock=clock)
+        with (
+            unittest.mock.patch("scripts.signoff.subprocess.run", run),
+            unittest.mock.patch.object(signoff, "deadline_scope", scope),
+            unittest.mock.patch("sys.stdin", io.StringIO(update())),
+        ):
+            status, _, err = capture_main(
+                lambda argv: push_guard.check_updates(
+                    [REPOSITORY], reader, time.monotonic, no_activity
+                )
+            )
+        self.assertEqual(status, 2, err)
+        self.assertIn("invalid ref updates: sign-off check deadline of 120 s passed", err)
+        self.assertIsNone(re.search(r"(?<!sign-off )check deadline of 120 s passed", err))
+        self.assertEqual(run.call_count, 1)
+        reader.assert_not_called()
 
 
 if __name__ == "__main__":

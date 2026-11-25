@@ -61,8 +61,9 @@ Fetch = Callable[[str], dict | list]
 Sleep = Callable[[float], None]
 REQUEST_TIMEOUT = upstream_drift.REQUEST_TIMEOUT
 REQUEST_PAUSE_SECONDS = 0.5
-# Reserve a complete network timeout before each request; CI allows twice this budget.
-SCAN_BUDGET_SECONDS = 300
+# The budget lets a complete scan at MAX_CANDIDATES finish at the measured CI pace with headroom.
+# test_scan_budget_covers_candidate_cap_at_measured_ci_pace pins it; upstream.yml links job gets 2x.
+SCAN_BUDGET_SECONDS = 1800
 PAGE_SIZE = 50
 MAX_PULL_PAGES = 20
 MAX_PULL_ROWS = PAGE_SIZE * MAX_PULL_PAGES

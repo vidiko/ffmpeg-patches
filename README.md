@@ -646,8 +646,8 @@ is sized from the 1000-candidate cap: for `N` open targets in
 pre-plan requests and `N + 1000` single-page file listings. At the pace
 measured in one scheduled `upstream.yml` run on 2026-11-24 (about 3.6 seconds
 per pre-plan request and 1.08 seconds per file listing, 0.5-second pacing
-included), the current 23 open targets need 1259.64 seconds, or 1511.57 seconds
-with a 1.2 headroom factor.
+included), the 23 open targets of that run need 1259.64 seconds, or
+1511.57 seconds with a 1.2 headroom factor.
 `test_scan_budget_covers_candidate_cap_at_measured_ci_pace` in
 `tests/test_workflow_actions.py` pins this bound and turns red at 69 open
 targets.

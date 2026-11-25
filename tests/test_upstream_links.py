@@ -720,7 +720,7 @@ class FillAndCheckCommandTest(unittest.TestCase):
         readme = (root / "README.md").read_text(encoding="utf-8")
         self.assertIn("30-second timeout of each blocking network operation", readme)
         self.assertNotIn("shared 30-second request deadline", readme)
-        self.assertIn("`SCAN_BUDGET_SECONDS` budget is 300 seconds", readme)
+        self.assertIn("`SCAN_BUDGET_SECONDS` budget is 1800 seconds", readme)
         self.assertIn("REQUEST_TIMEOUT", upstream_links.__doc__)
 
     def test_protocol_error_exits_two_for_fill_and_check(self) -> None:
@@ -1048,23 +1048,24 @@ class RequestCostTest(unittest.TestCase):
 
     def test_elapsed_budget_stops_before_and_after_slow_requests(self) -> None:
         """Elapsed time exhaustion is explicit and never admits another request."""
-        for elapsed in (270.0, 301.0):
-            clock = unittest.mock.Mock(side_effect=[0.0, elapsed, elapsed, elapsed])
-            fetch, pause = unittest.mock.Mock(return_value=[]), unittest.mock.Mock()
-            with unittest.mock.patch.object(upstream_forge.time, "monotonic", clock):
+        with unittest.mock.patch.object(upstream_forge, "SCAN_BUDGET_SECONDS", 300):
+            for elapsed in (270.0, 301.0):
+                clock = unittest.mock.Mock(side_effect=[0.0, elapsed, elapsed, elapsed])
+                fetch, pause = unittest.mock.Mock(return_value=[]), unittest.mock.Mock()
+                with unittest.mock.patch.object(upstream_forge.time, "monotonic", clock):
+                    request = upstream_forge.RequestBudget(fetch, 10, pause)
+                    with self.assertRaisesRegex(upstream_parse.DriftError, "incomplete scan.*300"):
+                        request("https://example.invalid/slow")
+                fetch.assert_not_called()
+                pause.assert_not_called()
+            with unittest.mock.patch.object(
+                upstream_forge.time, "monotonic", side_effect=[0.0, 0.0, 0.5, 301.0]
+            ):
                 request = upstream_forge.RequestBudget(fetch, 10, pause)
-                with self.assertRaisesRegex(upstream_parse.DriftError, "incomplete scan.*300"):
+                with self.assertRaisesRegex(upstream_parse.DriftError, "incomplete scan"):
                     request("https://example.invalid/slow")
-            fetch.assert_not_called()
-            pause.assert_not_called()
-        with unittest.mock.patch.object(
-            upstream_forge.time, "monotonic", side_effect=[0.0, 0.0, 0.5, 301.0]
-        ):
-            request = upstream_forge.RequestBudget(fetch, 10, pause)
-            with self.assertRaisesRegex(upstream_parse.DriftError, "incomplete scan"):
-                request("https://example.invalid/slow")
-        fetch.assert_called_once()
-        pause.assert_called_once_with(upstream_forge.REQUEST_PAUSE_SECONDS)
+            fetch.assert_called_once()
+            pause.assert_called_once_with(upstream_forge.REQUEST_PAUSE_SECONDS)
 
     def test_worker_keyboard_interrupt_reaches_budget_caller_unchanged(self) -> None:
         """An injected worker interrupt reaches the request caller as the same object."""
@@ -1144,15 +1145,18 @@ class RequestCostTest(unittest.TestCase):
 
     def test_elapsed_budget_cli_exits_two_without_publishing(self) -> None:
         """Both commands identify incomplete scans and leave manifest bytes intact."""
-        before = self.path.read_bytes()
-        for command in ("fill", "check"):
-            forge = FakeForge(self.answers)
-            with unittest.mock.patch.object(upstream_forge.time, "monotonic", side_effect=[0, 301]):
-                rc, _, err = run_cli(self.root, forge, command)
-            self.assertEqual(rc, 2)
-            self.assertIn("incomplete scan", err)
-            self.assertEqual(forge.read, [])
-            self.assertEqual(self.path.read_bytes(), before)
+        with unittest.mock.patch.object(upstream_forge, "SCAN_BUDGET_SECONDS", 300):
+            before = self.path.read_bytes()
+            for command in ("fill", "check"):
+                forge = FakeForge(self.answers)
+                with unittest.mock.patch.object(
+                    upstream_forge.time, "monotonic", side_effect=[0, 301]
+                ):
+                    rc, _, err = run_cli(self.root, forge, command)
+                self.assertEqual(rc, 2)
+                self.assertIn("incomplete scan", err)
+                self.assertEqual(forge.read, [])
+                self.assertEqual(self.path.read_bytes(), before)
 
     def test_budget_boundary_and_pause_once_per_request(self) -> None:
         """Exactly the cap succeeds and every fetch receives one injected fixed pause."""

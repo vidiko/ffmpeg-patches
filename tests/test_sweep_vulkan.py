@@ -2684,6 +2684,24 @@ class VulkanMutantTest(VulkanMutantHarness):
             mutant,
         )
 
+    def exec_source_copy(self, missing: Path, tail: str) -> None:
+        """Execute a fresh copy of the sweep module with VK_XML replaced and tail appended."""
+        root = Path(__file__).resolve().parents[1]
+        source = (root / "scripts/sweep_vulkan_features.py").read_text(encoding="utf-8")
+        old = 'VK_XML = Path("/usr/share/vulkan/registry/vk.xml")'
+        self.assertIn(old, source)
+        source = source.replace(old, f'VK_XML = Path("{missing}")')
+        if tail:
+            source = source.rstrip() + "\n" + tail
+        with tempfile.TemporaryDirectory() as scratch:
+            copy_path = Path(scratch) / "sweep_vulkan_features_copy.py"
+            copy_path.write_text(source, encoding="utf-8")
+            spec = importlib.util.spec_from_file_location("sweep_vulkan_features_copy", copy_path)
+            self.assertIsNotNone(spec)
+            self.assertIsNotNone(spec.loader)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+
     def test_mutant_m7_import_maps(self) -> None:
         """m7: import-time map load passes on real and fails on mutant."""
         missing = Path("/nonexistent/vk-registry-mutant/vk.xml")
@@ -2707,32 +2725,17 @@ class VulkanMutantTest(VulkanMutantHarness):
                         str(self.repo), self.base, head, time.monotonic() + 120
                     )
             reset_vulkan_maps()
+            self.exec_source_copy(missing, "")
 
         def mutant(_module: ModuleType) -> None:
-            root = Path(__file__).resolve().parents[1]
-            source = (root / "scripts/sweep_vulkan_features.py").read_text(encoding="utf-8")
-            source = source.replace(
-                'VK_XML = Path("/usr/share/vulkan/registry/vk.xml")',
-                f'VK_XML = Path("{missing}")',
-            )
-            source = (
-                source.rstrip()
-                + "\nALLOWLIST, CAPABILITY_MAP, FEATURE_ALLOWLIST = load_maps(VK_XML)\n"
+            tail = (
+                "ALLOWLIST, CAPABILITY_MAP, FEATURE_ALLOWLIST = load_maps(VK_XML)\n"
                 "DERIVABLE = derivable_features(CAPABILITY_MAP)\n_MAPS_LOADED = True\n"
             )
-            with tempfile.TemporaryDirectory() as scratch:
-                mutant_path = Path(scratch) / "sweep_vulkan_features_mutant.py"
-                mutant_path.write_text(source, encoding="utf-8")
-                spec = importlib.util.spec_from_file_location(
-                    "sweep_vulkan_features_mutant", mutant_path
-                )
-                self.assertIsNotNone(spec)
-                self.assertIsNotNone(spec.loader)
-                module = importlib.util.module_from_spec(spec)
-                with self.assertRaises(
-                    (FileNotFoundError, sweep_vulkan_features.VulkanFeatureSweepError)
-                ):
-                    spec.loader.exec_module(module)
+            with self.assertRaises(
+                (FileNotFoundError, sweep_vulkan_features.VulkanFeatureSweepError)
+            ):
+                self.exec_source_copy(missing, tail)
 
         self.assert_mutant_kills(
             "scripts/sweep_vulkan_features.py",
@@ -2799,6 +2802,237 @@ class PortParityWithoutToolsTest(VulkanMutantHarness):
         message = str(caught.exception)
         self.assertIn("missing tool:", message)
         self.assertIn(str(missing), message)
+
+
+class VulkanUnvalidatedShaderTest(unittest.TestCase):
+    """Cover arrow scan start, typedef aliases, and unvalidated shader reporting."""
+
+    setUp = VulkanSweepTest.setUp
+    commit_filter = VulkanSweepTest.commit_filter
+    vk_report = VulkanSweepTest.vk_report
+
+    def write_tool(self) -> Path:
+        """Create an empty file that stands in for an installed spirv-val."""
+        tool = Path(self.directory.name) / "spirv-val"
+        tool.write_bytes(b"")
+        return tool
+
+    def run_scalar(self, *results: tuple[int, bytes]) -> bool:
+        """Run spirv_needs_scalar with scripted spirv-val results and return its verdict."""
+        spv = Path(self.directory.name) / "m.spv"
+        spv.write_bytes(b"")
+        done = [subprocess.CompletedProcess(["x"], rc, b"", err) for rc, err in results]
+        with (
+            unittest.mock.patch.object(sweep_vulkan_features, "SPIRV_VAL", self.write_tool()),
+            unittest.mock.patch.object(sweep_vulkan_features.subprocess, "run", side_effect=done),
+        ):
+            return sweep_vulkan_features.spirv_needs_scalar(spv, time.monotonic() + 120)
+
+    def alias_sites(self, source: str) -> list[sweep_vulkan_features.FeatureSite]:
+        """Return feature read sites for one source under the minimal vk.xml fixture."""
+        self.addCleanup(reset_vulkan_maps)
+        ensure_maps_fixture()
+        return sweep_vulkan_features.c_feature_reads(source)
+
+    def test_arrow_match_starts_at_arrow(self) -> None:
+        """FEATURE_READ starts a spaced arrow match at the arrow, not at the blanks."""
+        text = "p   ->shaderInt64"
+        match = sweep_vulkan_features.FEATURE_READ.search(text)
+        self.assertIsNotNone(match)
+        self.assertEqual(match.start(), text.index("-"))
+
+    def test_spaced_and_split_arrow_reads(self) -> None:
+        """A spaced arrow reports its line and a split arrow reports the arrow line."""
+        spaced = "int g(VkPhysicalDeviceFeatures *p) {\n    return p -> shaderInt64;\n}\n"
+        split = (
+            "int g(VkPhysicalDeviceFeatures *feats) {\n"
+            "    return feats\n"
+            "        ->shaderInt64;\n"
+            "}\n"
+        )
+        feature = sweep_vulkan_features.FeatureSite
+        self.assertEqual(self.alias_sites(spaced), [feature(2, "shaderInt64")])
+        self.assertEqual(self.alias_sites(split), [feature(3, "shaderInt64")])
+
+    def test_long_masked_comment_without_member_access(self) -> None:
+        """A very long block comment without member access yields no read sites."""
+        source = "/*" + "a" * 20000 + "*/\nint x;\n"
+        self.assertEqual(self.alias_sites(source), [])
+
+    def test_typedef_alias_direct_read(self) -> None:
+        """A direct read through a typedef alias of the feature struct is reported."""
+        source = (
+            "typedef VkPhysicalDeviceFeatures GateFeatures;\n"
+            "\n"
+            "int gate(const GateFeatures *p) {\n"
+            "    return p->shaderInt64 ? 0 : -1;\n"
+            "}\n"
+        )
+        feature = sweep_vulkan_features.FeatureSite
+        self.assertEqual(self.alias_sites(source), [feature(4, "shaderInt64")])
+
+    def test_typedef_alias_two_steps(self) -> None:
+        """An alias of an alias of the feature struct still resolves to one site."""
+        source = (
+            "typedef VkPhysicalDeviceFeatures StepA;\n"
+            "typedef StepA StepB;\n"
+            "int gate(const StepB *p) {\n"
+            "    return p->shaderInt64 ? 0 : -1;\n"
+            "}\n"
+        )
+        self.assertEqual(len(self.alias_sites(source)), 1)
+
+    def test_typedef_alias_of_other_types_rejected(self) -> None:
+        """Aliases of other Vk structs and of unrelated types stay rejected."""
+        props = (
+            "typedef VkPhysicalDeviceProperties GateProps;\n"
+            "int gate(const GateProps *p) {\n"
+            "    return p->shaderInt64 ? 0 : -1;\n"
+            "}\n"
+        )
+        flags = (
+            "typedef int Flags;\n"
+            "int gate(const Flags *p) {\n"
+            "    return p->shaderInt64 ? 0 : -1;\n"
+            "}\n"
+        )
+        self.assertEqual(self.alias_sites(props), [])
+        self.assertEqual(self.alias_sites(flags), [])
+
+    def test_absent_spirv_val_is_prerequisite(self) -> None:
+        """An absent spirv-val raises the missing-tool prerequisite error."""
+        missing = Path(self.directory.name) / "no-spirv-val"
+        spv = Path(self.directory.name) / "m.spv"
+        spv.write_bytes(b"")
+        with (
+            unittest.mock.patch.object(sweep_vulkan_features, "SPIRV_VAL", missing),
+            self.assertRaisesRegex(
+                sweep_vulkan_features.VulkanFeatureSweepError, "missing tool:"
+            ) as caught,
+        ):
+            sweep_vulkan_features.spirv_needs_scalar(spv, time.monotonic() + 120)
+        self.assertIsInstance(caught.exception, variant_sweep.SweepPrerequisiteError)
+
+    @unittest.skipIf(SKIP_VULKAN, SKIP_REASON)
+    def test_absent_spirv_val_keeps_port_parity_section(self) -> None:
+        """A full sweep records the missing spirv-val and still runs port-parity."""
+        self.addCleanup(reset_vulkan_maps)
+        reset_vulkan_maps()
+        head = self.commit_filter(
+            c_vulkan=(
+                "extern const unsigned char ff_test_comp_spv_data[];\n"
+                "int gate(VkPhysicalDeviceFeatures *feats) {\n"
+                "    if (!feats->shaderStorageImageReadWithoutFormat) return -1;\n"
+                "    return 0;\n"
+                "}\n"
+            ),
+            shader_name="test.comp.glsl",
+            shader=SIMPLE_SHADER,
+        )
+        missing = Path(self.directory.name) / "no-spirv-val"
+        loader = variant_sweep.sibling_module
+
+        def share_module(name: str) -> ModuleType:
+            if name == "sweep_vulkan_features":
+                return sweep_vulkan_features
+            return loader(name)
+
+        with (
+            unittest.mock.patch.object(sweep_vulkan_features, "SPIRV_VAL", missing),
+            unittest.mock.patch.object(variant_sweep, "sibling_module", share_module),
+        ):
+            report = variant_sweep.sweep_all(str(self.repo), self.base, head)
+        self.assertIn("prerequisite: missing tool:", section(report, "vulkan-features"))
+        self.assertIn("class: port-parity", report)
+
+    def test_both_layouts_rejected_raises_with_diagnostic(self) -> None:
+        """Rejection in both layout modes raises with the scalar-run stderr line."""
+        with self.assertRaises(sweep_vulkan_features.ShaderValidationError) as caught:
+            self.run_scalar((1, b"default failure\n"), (1, b"\n  error: line 69: bad type\nmore\n"))
+        self.assertIn("error: line 69: bad type", str(caught.exception))
+        self.assertNotIn("default failure", str(caught.exception))
+        self.assertNotIn("more", str(caught.exception))
+
+    def test_diagnostic_is_bounded_and_table_safe(self) -> None:
+        """A long stderr line with a pipe yields at most 160 characters and no pipe."""
+        line = ("x" * 200 + "|" + "y" * 300).encode()
+        with self.assertRaises(sweep_vulkan_features.ShaderValidationError) as caught:
+            self.run_scalar((1, b"a\n"), (1, line + b"\n"))
+        self.assertLessEqual(len(str(caught.exception)), 160)
+        self.assertNotIn("|", str(caught.exception))
+
+    def test_scalar_verdicts_unchanged(self) -> None:
+        """Default-fail then scalar-pass needs scalar; both passing does not."""
+        self.assertTrue(self.run_scalar((1, b"e\n"), (0, b"")))
+        self.assertFalse(self.run_scalar((0, b""), (0, b"")))
+
+    def test_compare_gates_unanalyzed_rows(self) -> None:
+        """Each shader with a diagnostic adds one unanalyzed row after the other rows."""
+        needs = sweep_vulkan_features.ShaderNeeds
+        row = sweep_vulkan_features.compare_gates(
+            "libavfilter/vf_test_vulkan.c",
+            [],
+            [needs("libavfilter/vulkan/a.comp.glsl", set(), {}, "diag")],
+        )
+        self.assertEqual(
+            row,
+            [
+                (
+                    "libavfilter/vulkan/a.comp.glsl:1",
+                    "scalarBlockLayout",
+                    "spirv-val rejected both layouts: diag",
+                    "unanalyzed",
+                )
+            ],
+        )
+        rows = sweep_vulkan_features.compare_gates(
+            "libavfilter/vf_test_vulkan.c",
+            [],
+            [
+                needs("libavfilter/vulkan/b.comp.glsl", set(), {}, "second"),
+                needs("libavfilter/vulkan/a.comp.glsl", set(), {}, "first"),
+                needs("libavfilter/vulkan/c.comp.glsl", {"shaderInt64"}, {}, ""),
+            ],
+        )
+        self.assertEqual(
+            [(r[0], r[3]) for r in rows],
+            [
+                ("libavfilter/vulkan/c.comp.glsl:1", "used-unchecked"),
+                ("libavfilter/vulkan/a.comp.glsl:1", "unanalyzed"),
+                ("libavfilter/vulkan/b.comp.glsl:1", "unanalyzed"),
+            ],
+        )
+
+    @unittest.skipIf(SKIP_VULKAN, SKIP_REASON)
+    def test_sweep_reports_unanalyzed_when_spirv_val_rejects(self) -> None:
+        """A sweep whose spirv-val rejects both modes reports one unanalyzed row."""
+        self.addCleanup(reset_vulkan_maps)
+        reset_vulkan_maps()
+        head = self.commit_filter(
+            c_vulkan=(
+                "extern const unsigned char ff_test_comp_spv_data[];\n"
+                "int gate(VkPhysicalDeviceFeatures *feats) {\n"
+                "    if (!feats->shaderStorageImageReadWithoutFormat) return -1;\n"
+                "    return 0;\n"
+                "}\n"
+            ),
+            shader_name="test.comp.glsl",
+            shader=SIMPLE_SHADER,
+        )
+        real_run = subprocess.run
+
+        def wrapper(argv, *args, **kwargs):
+            if argv[0] == str(SPIRV_VAL):
+                return subprocess.CompletedProcess(argv, 1, b"", b"error: planted rejection\n")
+            return real_run(argv, *args, **kwargs)
+
+        with unittest.mock.patch.object(sweep_vulkan_features.subprocess, "run", wrapper):
+            report = self.vk_report(head)
+        rows = [line for line in report.splitlines() if "| unanalyzed |" in line]
+        self.assertEqual(len(rows), 1, report)
+        self.assertIn("libavfilter/vulkan/test.comp.glsl:1", rows[0])
+        self.assertIn("planted rejection", rows[0])
+        self.assertNotIn("prerequisite:", report)
 
 
 if __name__ == "__main__":

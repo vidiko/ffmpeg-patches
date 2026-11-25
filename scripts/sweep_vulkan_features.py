@@ -37,8 +37,9 @@ GLSLANG_ARGS = ("-V", "--target-env", "spirv1.6", "--glsl-version", "460", "-S",
 MAX_VULKAN_FILES = 64
 MAX_SHADERS = 64
 MAX_TOOL_BYTES = 8 * 1024 * 1024
+MAX_DIAGNOSTIC = 160
 SHADER_SYMBOL = re.compile(r"ff_(\w+)_comp_spv_data", re.ASCII)
-FEATURE_READ = re.compile(r"(?:\.\s*|\s*->\s*)([A-Za-z]\w*)", re.ASCII)
+FEATURE_READ = re.compile(r"(?:\.\s*|->\s*)([A-Za-z]\w*)", re.ASCII)
 FEATURE_STRUCT_DECL = re.compile(
     r"\b(VkPhysicalDevice\w+)\s*(\*+\s*|\s+)(\w+)\s*(?=[,;=)])",
     re.ASCII,
@@ -65,6 +66,10 @@ class VulkanFeatureSweepError(SweepPrerequisiteError):
     """Raised when Vulkan sweep prerequisites or shader compilation fail."""
 
 
+class ShaderValidationError(VulkanFeatureSweepError):
+    """Raised when spirv-val rejects a shader in both layout modes."""
+
+
 class FeatureSite(NamedTuple):
     """Hold one feature gate read site in a Vulkan filter C file."""
 
@@ -88,6 +93,7 @@ class ShaderNeeds(NamedTuple):
     path: str
     features: set[str]
     evidence: dict[str, str]
+    unvalidated: str = ""
 
 
 class CapabilityEnables(NamedTuple):
@@ -184,11 +190,16 @@ def ensure_maps() -> None:
     MAP_STATE.loaded = True
 
 
+def require_tool(tool: str) -> None:
+    """Refuse an absent allow-listed tool before launching it."""
+    if not Path(tool).is_file():
+        raise VulkanFeatureSweepError(f"missing tool: {tool}")
+
+
 def run_tool(argv: list[str], deadline: float, maximum: int, label: str) -> str:
     """Run one allow-listed external tool with a bounded deadline and output size."""
     timeout = min(120, check_deadline(deadline))
-    if not Path(argv[0]).is_file():
-        raise VulkanFeatureSweepError(f"missing tool: {argv[0]}")
+    require_tool(argv[0])
     with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
         result = subprocess.run(  # nosec B603 - argv built from fixed tool paths only.
             argv,
@@ -517,6 +528,10 @@ TYPEDEF_STRUCT_ALIAS = re.compile(
     r"\btypedef\s+(?:struct|union)\s+(\w+)\s+(\w+)\s*;",
     re.ASCII,
 )
+TYPEDEF_SIMPLE_ALIAS = re.compile(
+    r"\btypedef\s+(?!(?:struct|union|enum)\b)(?:const\s+)?(\w+)\s+(\w+)\s*;",
+    re.ASCII,
+)
 
 
 def c_top_level_region_bounds(masked: str) -> list[tuple[int, int]]:
@@ -762,6 +777,15 @@ def _typedef_alias_after_body(masked: str, body_end: int) -> str | None:
     return match.group(1)
 
 
+def c_simple_typedef_aliases(masked: str) -> dict[str, str]:
+    """Map typedef names to the single identifier they rename in masked source."""
+    return {
+        match.group(2): match.group(1)
+        for match in TYPEDEF_SIMPLE_ALIAS.finditer(masked)
+        if match.group(1) != match.group(2)
+    }
+
+
 def c_typedef_alias_map(masked: str) -> dict[str, str]:
     """Map typedef names to struct or union tags declared in masked source."""
     aliases: dict[str, str] = {}
@@ -785,7 +809,7 @@ def c_typedef_alias_map(masked: str) -> dict[str, str]:
             aliases[alias] = alias
     for match in re.finditer(r"\b(?:struct|union)\s+(\w+)\s*\{", masked):
         aliases.setdefault(match.group(1), match.group(1))
-    return aliases
+    return {**c_simple_typedef_aliases(masked), **aliases}
 
 
 def c_struct_member_types(masked: str) -> dict[str, dict[str, tuple[str, bool]]]:
@@ -1012,6 +1036,8 @@ def feature_read_from_eligible_struct(
         unknown, kind = resolve_var_kind(
             position, root, scope.bounds, scope.region_decls, scope.file_decls
         )
+        if kind is not None:
+            kind = _resolve_type_alias(kind, scope.typedef_aliases)
         return _eligible_from_kind(unknown, kind)
     if root is None:
         return True
@@ -1056,8 +1082,17 @@ def spirv_capabilities(disasm: str) -> set[str]:
     return {match[1] for match in re.finditer(r"OpCapability (\w+)", disasm)}
 
 
+def validation_diagnostic(result: subprocess.CompletedProcess[bytes]) -> str:
+    """Return the first stderr line of a failed spirv-val run, bounded and table-safe."""
+    text = result.stderr.decode("utf-8", errors="replace")
+    lines = [line.strip() for line in text[:4096].splitlines() if line.strip()]
+    line = lines[0] if lines else f"exit status {result.returncode}"
+    return line.replace("|", "/")[:MAX_DIAGNOSTIC]
+
+
 def spirv_needs_scalar(spv: Path, deadline: float) -> bool:
     """Return whether spirv-val requires scalar-block-layout for this module."""
+    require_tool(str(SPIRV_VAL))
     base = [str(SPIRV_VAL), "--target-env", "vulkan1.3", str(spv)]
     scalar = [*base, "--scalar-block-layout"]
     for argv in (base, scalar):
@@ -1072,6 +1107,8 @@ def spirv_needs_scalar(spv: Path, deadline: float) -> bool:
         if argv is base:
             default_rc = result.returncode
         else:
+            if default_rc != 0 and result.returncode != 0:
+                raise ShaderValidationError(validation_diagnostic(result))
             return default_rc != 0 and result.returncode == 0
     return False
 
@@ -1247,10 +1284,14 @@ def shader_requirements(
             "shaderStorageImageArrayNonUniformIndexing",
             f"{shader_path}:NonUniform storage-image index",
         )
-    if spirv_needs_scalar(spv, deadline):
-        features.add("scalarBlockLayout")
-        evidence.setdefault("scalarBlockLayout", f"{shader_path}:spirv-val scalar layout")
-    return ShaderNeeds(shader_path, features, evidence)
+    unvalidated = ""
+    try:
+        if spirv_needs_scalar(spv, deadline):
+            features.add("scalarBlockLayout")
+            evidence.setdefault("scalarBlockLayout", f"{shader_path}:spirv-val scalar layout")
+    except ShaderValidationError as error:
+        unvalidated = str(error)
+    return ShaderNeeds(shader_path, features, evidence, unvalidated)
 
 
 def anyof_members(group_key: str) -> frozenset[str]:
@@ -1286,6 +1327,16 @@ def gate_row_anchor(
     return c_path
 
 
+def unanalyzed_rows(needs: list[ShaderNeeds]) -> list[tuple[str, str, str, str]]:
+    """Emit one unanalyzed row per shader whose validation failed in both layouts."""
+    text = "spirv-val rejected both layouts: "
+    return [
+        (f"{entry.path}:1", "scalarBlockLayout", text + entry.unvalidated, "unanalyzed")
+        for entry in sorted(needs, key=lambda item: item.path)
+        if entry.unvalidated
+    ]
+
+
 def compare_gates(
     c_path: str,
     checked: list[FeatureSite],
@@ -1317,6 +1368,7 @@ def compare_gates(
         text = evidence_by_feature.get(feature, "shader")
         anchor = gate_row_anchor(text, anchor_by_feature, feature, c_path)
         rows.append((f"{anchor}:1", feature, text, direction))
+    rows.extend(unanalyzed_rows(needs))
     return rows
 
 

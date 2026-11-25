@@ -483,7 +483,10 @@ def check_branch(
 
 def branch_update(line: str) -> tuple[str, str, str] | None:
     """Validate one update and select branch creations or updates, excluding deletions."""
-    _, local_sha, remote_ref, remote_sha = line.split()
+    fields = line.removesuffix("\n").split(" ")
+    if len(fields) != 4:
+        raise ValueError("pre-push record must hold exactly four fields")
+    _, local_sha, remote_ref, remote_sha = fields
     if not SHA.fullmatch(local_sha) or not SHA.fullmatch(remote_sha):
         raise ValueError("invalid pre-push SHA")
     if set(local_sha) == {"0"} or not remote_ref.startswith("refs/heads/"):
@@ -507,7 +510,10 @@ def check_signoff_update(line: str, considered_remotes: list[str] | None = None)
     branch, local_sha, remote_sha = update
     reason = signoff.check_commits(local_sha, remote_sha, considered_remotes=considered_remotes)
     if reason:
-        print(f"push_guard: refusing branch {branch}: {reason}; {signoff.FIX}", file=sys.stderr)
+        print(
+            f"push_guard: refusing branch {branch}: {reason}; {signoff.repair_text(reason)}",
+            file=sys.stderr,
+        )
         return 1
     return 0
 

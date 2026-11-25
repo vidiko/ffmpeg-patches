@@ -12,11 +12,16 @@ When no remote is considered, only the known advertised head limits history.
 Passing no considered-remote list checks against every configured remote;
 a stale remote missing origin history can refuse until that remote is fetched
 or removed.
+
+In the path-on-stdin mode the reader accepts only the file Git names as its commit
+message file or merge message file; any other path, a truncated prefix included,
+is undecidable (message-path allow-list).
 """
 
 from __future__ import annotations
 
 import argparse
+import os
 import subprocess  # nosec B404 - fixed local Git argv, no shell, explicit timeouts.
 import sys
 from pathlib import Path
@@ -27,19 +32,35 @@ MAX_MESSAGE_CHARS = 1024 * 1024
 MAX_STDIN_PATH_BYTES = 4096
 MAX_REMOTES = 1000
 GIT_TIMEOUT = 10
-FIX = (
-    "amend with the sign-off option (git commit --amend --signoff), "
-    "or merge with the sign-off option (git merge --signoff)"
+SEPARATOR_PIN = ("trailer.separators=:",)
+IDENTITY_PIN = ("user.useConfigOnly=true",)
+REASON_MISSING = "no Signed-off-by trailer"
+REPAIR_MISSING = (
+    "amend with the sign-off option (git commit --amend --signoff); "
+    "an in-progress merge concludes with a commit given the sign-off option "
+    "(git commit --signoff)"
+)
+REPAIR_EDIT = (
+    "edit the message so exactly one Signed-off-by trailer with the expected identity remains"
 )
 
 
 def git(
-    args: list[str], text: str | None = None, cwd: str | None = None, *, missing_ok: bool = False
+    args: list[str],
+    text: str | None = None,
+    cwd: str | None = None,
+    *,
+    missing_ok: bool = False,
+    config: tuple[str, ...] = (),
 ) -> str:
-    """Run local Git with a fixed executable and deadline, failing closed on errors."""
+    """Run local Git without replacement objects, with a deadline, failing closed on errors."""
+    argv = ["git", "--no-replace-objects"]
+    for entry in config:
+        argv.extend(["-c", entry])
+    argv.extend(args)
     try:
         result = subprocess.run(  # nosec B603 B607 - fixed Git executable, argv data, no shell.
-            ["git", *args],
+            argv,
             input=text if text is not None else "",
             cwd=cwd,
             capture_output=True,
@@ -57,33 +78,47 @@ def git(
 
 
 def identity(cwd: str | None = None) -> str:
-    """Read the exact sign-off identity from the effective Git configuration."""
-    name = git(["config", "user.name"], cwd=cwd, missing_ok=True).removesuffix("\n")
-    email = git(["config", "user.email"], cwd=cwd, missing_ok=True).removesuffix("\n")
-    if not name.strip() or not email.strip():
-        raise ValueError("Git identity unset or empty (user.name and user.email required)")
-    return f"{name} <{email}>"
+    """Read the committer identity the sign-off option writes, never an autodetected one."""
+    unset = "Git identity unset or empty (committer name and email required)"
+    try:
+        ident = git(["var", "GIT_COMMITTER_IDENT"], cwd=cwd, config=IDENTITY_PIN)
+    except ValueError as exc:
+        raise ValueError(f"{unset}: {exc}") from exc
+    name_email = ident.removesuffix("\n").rsplit(" ", 2)[0]
+    name, separator, rest = name_email.partition(" <")
+    if not separator or not rest.endswith(">") or not name.strip() or not rest[:-1].strip():
+        raise ValueError(unset)
+    return name_email
 
 
-def message_values(message: str, cwd: str | None = None) -> list[str]:
-    """Extract Signed-off-by values through Git's trailer parser, including unfolding."""
-    parsed = git(["interpret-trailers", "--parse"], message, cwd).splitlines()
-    if len(parsed) > MAX_TRAILERS:
+def trailer_values(text: str) -> list[str]:
+    """Extract Signed-off-by values from formatted trailer lines, empty values included."""
+    lines = text.split("\n")
+    if len(lines) > MAX_TRAILERS:
         raise ValueError(f"more than {MAX_TRAILERS} trailers")
     values = []
-    for index in range(MAX_TRAILERS):
-        if index == len(parsed):
-            break
-        key, separator, value = parsed[index].partition(":")
+    for line in lines:
+        key, separator, value = line.partition(":")
         if separator and key.casefold() == "signed-off-by":
             values.append(value.strip())
     return values
 
 
+def message_values(message: str, cwd: str | None = None) -> list[str]:
+    """Extract Signed-off-by values through Git's trailer parser, including unfolding."""
+    command = ["interpret-trailers", "--parse", "--no-divider"]
+    return trailer_values(git(command, message, cwd, config=SEPARATOR_PIN))
+
+
+def repair_text(reason: str) -> str:
+    """Map a judge reason, also behind a commit prefix, to the repair that fixes it."""
+    return REPAIR_MISSING if REASON_MISSING in reason else REPAIR_EDIT
+
+
 def judge(values: list[str], expected: str) -> str | None:
     """Accept exactly one trailer whose value equals the configured identity."""
     if not values:
-        return "no Signed-off-by trailer"
+        return REASON_MISSING
     if len(values) != 1:
         return "more than one Signed-off-by trailer"
     if values[0] != expected:
@@ -112,6 +147,18 @@ def read_message_path_stdin() -> str:
     if not body:
         raise ValueError("empty message path stdin")
     return body
+
+
+def is_git_message_file(path: str) -> bool:
+    """Tell whether the path names Git's own commit message file or merge message file."""
+    for name in ("COMMIT_EDITMSG", "MERGE_MSG"):
+        known = git(["rev-parse", "--git-path", name]).removesuffix("\n")
+        try:
+            if os.path.samefile(path, known):
+                return True
+        except OSError:
+            continue
+    return False
 
 
 def _rev_list_introduced(
@@ -186,11 +233,12 @@ def check_commits(
             "--no-patch",
             "--no-notes",
             "-z",
-            "--format=%H%x00%(trailers:key=Signed-off-by,valueonly,unfold,separator=%x0a)",
+            "--format=%H%x00%(trailers:key=Signed-off-by,unfold,separator=%x0a)",
             "--stdin",
         ],
         "\n".join(commits) + "\n",
         cwd,
+        config=SEPARATOR_PIN,
     )
     fields = raw.split("\0")
     if len(fields) != 2 * len(commits) + 1 or fields[-1] != "":
@@ -201,10 +249,28 @@ def check_commits(
         sha, value = fields[2 * index : 2 * index + 2]
         if sha != commits[index]:
             raise ValueError("Git returned unexpected commit order")
-        reason = judge(value.split("\n") if value else [], expected)
+        reason = judge(trailer_values(value), expected)
         if reason:
             return f"commit {sha}: {reason}"
     return None
+
+
+def read_message(args: argparse.Namespace) -> str:
+    """Read the message file named by the option or, on stdin, by Git's own message path."""
+    if args.message_path_stdin:
+        path = read_message_path_stdin()
+        if not is_git_message_file(path):
+            raise ValueError(
+                f"message path {path!r} is not Git's commit message file or merge message "
+                "file (message-path allow-list)"
+            )
+    else:
+        path = args.message_file
+    with Path(path).open(encoding="utf-8") as handle:
+        message = handle.read(MAX_MESSAGE_CHARS + 1)
+    if len(message) > MAX_MESSAGE_CHARS:
+        raise ValueError(f"message exceeds {MAX_MESSAGE_CHARS} characters")
+    return message
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -215,17 +281,12 @@ def main(argv: list[str] | None = None) -> int:
     group.add_argument("--message-path-stdin", action="store_true")
     args = parser.parse_args(argv)
     try:
-        path = Path(read_message_path_stdin() if args.message_path_stdin else args.message_file)
-        with path.open(encoding="utf-8") as handle:
-            message = handle.read(MAX_MESSAGE_CHARS + 1)
-        if len(message) > MAX_MESSAGE_CHARS:
-            raise ValueError(f"message exceeds {MAX_MESSAGE_CHARS} characters")
-        reason = judge(message_values(message), identity())
+        reason = judge(message_values(read_message(args)), identity())
     except (OSError, UnicodeError, ValueError) as exc:
         print(f"signoff: cannot decide: {exc}; refusing (fail closed)", file=sys.stderr)
         return 2
     if reason:
-        print(f"signoff: refusing: {reason}; {FIX}", file=sys.stderr)
+        print(f"signoff: refusing: {reason}; {repair_text(reason)}", file=sys.stderr)
         return 1
     return 0
 

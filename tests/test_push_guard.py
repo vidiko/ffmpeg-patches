@@ -632,6 +632,11 @@ class PushGuardTest(unittest.TestCase):
         checker = unittest.mock.patch.object(push_guard.signoff, "check_commits", return_value=None)
         checker.start()
         self.addCleanup(checker.stop)
+        remotes = unittest.mock.patch.object(
+            push_guard.signoff, "configured_remotes", return_value=["origin"]
+        )
+        remotes.start()
+        self.addCleanup(remotes.stop)
 
     def test_merged_pr_absent_or_unchanged_remote_is_refused(self) -> None:
         for remote_sha in (ZERO, HEAD):
@@ -778,6 +783,11 @@ class BotReviewBodyTest(unittest.TestCase):
         checker = unittest.mock.patch.object(push_guard.signoff, "check_commits", return_value=None)
         checker.start()
         self.addCleanup(checker.stop)
+        remotes = unittest.mock.patch.object(
+            push_guard.signoff, "configured_remotes", return_value=["origin"]
+        )
+        remotes.start()
+        self.addCleanup(remotes.stop)
 
     def open_guard(self, reviews: list, comments: list) -> tuple[int, str, unittest.mock.Mock]:
         """Push a branch whose open pull request has the given activity."""
@@ -1104,6 +1114,11 @@ class StdinTest(unittest.TestCase):
         checker = unittest.mock.patch.object(push_guard.signoff, "check_commits", return_value=None)
         checker.start()
         self.addCleanup(checker.stop)
+        remotes = unittest.mock.patch.object(
+            push_guard.signoff, "configured_remotes", return_value=["origin"]
+        )
+        remotes.start()
+        self.addCleanup(remotes.stop)
 
     def test_stdin_deadline_fails_closed(self) -> None:
         release = threading.Event()
@@ -1188,6 +1203,11 @@ class RemoteTest(unittest.TestCase):
         checker = unittest.mock.patch.object(push_guard.signoff, "check_commits", return_value=None)
         checker.start()
         self.addCleanup(checker.stop)
+        remotes = unittest.mock.patch.object(
+            push_guard.signoff, "configured_remotes", return_value=["origin"]
+        )
+        remotes.start()
+        self.addCleanup(remotes.stop)
 
     def test_github_urls(self) -> None:
         for remote in (
@@ -1643,6 +1663,65 @@ class SignoffConsideredRemotesTest(unittest.TestCase):
             )
         self.assertEqual(status, 0)
         self.assertIsNone(checker.call_args.kwargs.get("considered_remotes"))
+
+
+class PrePushRecordTest(unittest.TestCase):
+    """Parse pre-push records on Git's ASCII space fields only."""
+
+    def setUp(self) -> None:
+        """Stub remote discovery so the record tests need no Git checkout."""
+        remotes = unittest.mock.patch.object(
+            push_guard.signoff, "configured_remotes", return_value=["origin"]
+        )
+        remotes.start()
+        self.addCleanup(remotes.stop)
+
+    def test_ref_name_with_no_break_space_reaches_signoff_reader(self) -> None:
+        """Pass a ref name holding U+00A0 whole to the sign-off reader and its refusal."""
+        name = "a\u00a0b"
+        with unittest.mock.patch.object(
+            push_guard.signoff, "check_commits", return_value="commit x: no Signed-off-by trailer"
+        ) as checker:
+            status, _, err = guard(unittest.mock.Mock(return_value="[]"), update(ref=name))
+        self.assertEqual(status, 1, err)
+        checker.assert_called_once_with(LOCAL, ZERO, considered_remotes=["origin"])
+        self.assertIn(f"refusing branch {name}:", err)
+
+    def test_wrong_field_count_fails_closed(self) -> None:
+        """Refuse records with three or five ASCII-space fields before any check."""
+        base = f"refs/heads/local {LOCAL} refs/heads/{BRANCH}"
+        for line in (f"{base}\n", f"{base} {ZERO} extra\n"):
+            with (
+                self.subTest(line=line),
+                unittest.mock.patch.object(
+                    push_guard.signoff, "check_commits", side_effect=AssertionError("unexpected")
+                ),
+            ):
+                status, _, err = guard(unittest.mock.Mock(return_value="[]"), line)
+            self.assertEqual(status, 2, err)
+            self.assertIn("refusing (fail closed)", err)
+
+    def test_repair_text_per_reason_in_push_refusal(self) -> None:
+        """Give each push refusal its own repair text through the shared mapping."""
+        missing = push_guard.signoff.judge([], "N <e@x>")
+        many = push_guard.signoff.judge(["N <e@x>", "N <e@x>"], "N <e@x>")
+        other = push_guard.signoff.judge(["M <m@x>"], "N <e@x>")
+        for reason, present in (
+            (f"commit x: {missing}", "amend with the sign-off option"),
+            (f"commit x: {many}", "exactly one"),
+            (f"commit x: {other}", "exactly one"),
+        ):
+            with (
+                self.subTest(reason=reason),
+                unittest.mock.patch.object(
+                    push_guard.signoff, "check_commits", return_value=reason
+                ),
+            ):
+                status, _, err = capture_main(lambda _: push_guard.check_signoff_update(update()))
+            self.assertEqual(status, 1)
+            self.assertIn(present, err)
+            self.assertNotIn("git merge", err)
+            self.assertEqual(err.count("exactly one"), int(present == "exactly one"))
 
 
 class SignoffPushTest(GitFixture):

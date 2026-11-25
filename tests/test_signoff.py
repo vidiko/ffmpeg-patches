@@ -127,7 +127,9 @@ class MessageTest(GitFixture):
                 if expected:
                     self.assertIn("no Signed-off-by", result.stderr)
                     self.assertIn("amend with the sign-off option", result.stderr)
-                    self.assertIn("merge with the sign-off option", result.stderr)
+                    self.assertIn("in-progress merge", result.stderr)
+                    self.assertNotIn("merge with the sign-off option", result.stderr)
+                    self.assertNotIn("git merge", result.stderr)
         message.unlink()
         self.assertEqual(self.cli(message).returncode, 2)
 
@@ -174,6 +176,86 @@ class MessageTest(GitFixture):
             run.return_value.returncode = 128
             with self.assertRaisesRegex(ValueError, "exited 128"):
                 signoff.message_values("fixture")
+
+    def test_repair_text_per_reason(self) -> None:
+        """Give each refusal its own repair text on the message-file entrypoint."""
+        message = self.root / "message"
+        other = "Signed-off-by: Other <other@example.invalid>"
+        cases = (
+            ("Subject\n", "amend with the sign-off option", "exactly one"),
+            (f"Subject\n\n{TRAILER}\n{TRAILER}\n", "exactly one", "amend with"),
+            (f"Subject\n\n{other}\n", "exactly one", "amend with"),
+        )
+        for text, present, absent in cases:
+            with self.subTest(text=text):
+                message.write_text(text, encoding="utf-8")
+                result = self.cli(message)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn(present, result.stderr)
+                self.assertNotIn(absent, result.stderr)
+                self.assertNotIn("git merge", result.stderr)
+
+    def test_repair_text_maps_reasons(self) -> None:
+        """Map each judge reason, also behind a commit prefix, to one repair text."""
+        missing = signoff.judge([], IDENTITY)
+        many = signoff.judge([IDENTITY, IDENTITY], IDENTITY)
+        other = signoff.judge(["Other <other@example.invalid>"], IDENTITY)
+        self.assertIn("amend with the sign-off option", signoff.repair_text(missing))
+        self.assertIn("amend with the sign-off option", signoff.repair_text(f"commit x: {missing}"))
+        for reason in (many, other, f"commit x: {many}"):
+            with self.subTest(reason=reason):
+                self.assertIn("exactly one Signed-off-by", signoff.repair_text(reason))
+
+    def test_committer_identity_is_the_expected_identity(self) -> None:
+        """Accept the committer-email trailer and refuse the user-email trailer."""
+        self.git("config", "committer.email", "committer@example.invalid")
+        message = self.root / "message"
+        committer = "Signoff Fixture <committer@example.invalid>"
+        for trailer, expected in ((committer, 0), (IDENTITY, 1)):
+            with self.subTest(trailer=trailer):
+                message.write_text(f"Subject\n\nSigned-off-by: {trailer}\n", encoding="utf-8")
+                self.assertEqual(self.cli(message).returncode, expected)
+        self.assertEqual(signoff.identity(str(self.root)), committer)
+
+    def test_environment_committer_wins_and_email_alone_is_unset(self) -> None:
+        """Follow GIT_COMMITTER_EMAIL and refuse the EMAIL variable without configuration."""
+        with unittest.mock.patch.dict(os.environ, {"GIT_COMMITTER_EMAIL": "env@example.invalid"}):
+            self.assertEqual(
+                signoff.identity(str(self.root)), "Signoff Fixture <env@example.invalid>"
+            )
+        self.git("config", "--unset", "user.name")
+        self.git("config", "--unset", "user.email")
+        with (
+            unittest.mock.patch.dict(os.environ, {"EMAIL": "auto@example.invalid"}),
+            self.assertRaisesRegex(ValueError, "identity unset or empty"),
+        ):
+            signoff.identity(str(self.root))
+
+    def test_literal_divider_line_in_plain_message(self) -> None:
+        """Count the sign-off that follows a literal divider line in a plain message."""
+        message = f"Subject\n\nBody\n---\nmore text\n\n{TRAILER}\n"
+        values = signoff.message_values(message, str(self.root))
+        self.assertEqual(values, [IDENTITY])
+        self.assertIsNone(signoff.judge(values, IDENTITY))
+
+    def test_verbose_commit_message_counts_only_real_trailer(self) -> None:
+        """Ignore the diff and the foreign sign-off below the scissors line."""
+        scissors = "# ------------------------ >8 ------------------------"
+        diff = "diff --git a/f b/f\n--- a/f\n+++ b/f\n---\nSigned-off-by: F <f@example.invalid>\n"
+        message = f"Subject\n\n{TRAILER}\n{scissors}\n{diff}"
+        self.assertEqual(signoff.message_values(message, str(self.root)), [IDENTITY])
+
+    def test_trailer_separator_config_does_not_change_the_policy(self) -> None:
+        """Accept a colon sign-off and refuse a percent sign-off whatever separators are set."""
+        self.git("config", "trailer.separators", "%:")
+        message = self.root / "message"
+        percent = f"Subject\n\nSigned-off-by% {IDENTITY}\n"
+        for text, expected in ((f"Subject\n\n{TRAILER}\n", 0), (percent, 1)):
+            with self.subTest(text=text):
+                message.write_text(text, encoding="utf-8")
+                result = self.cli(message)
+                self.assertEqual(result.returncode, expected, result.stderr)
+        self.assertEqual(signoff.message_values(percent, str(self.root)), [])
 
 
 class CommitRangeTest(GitFixture):
@@ -293,16 +375,82 @@ class CommitRangeTest(GitFixture):
             ):
                 signoff.check_commits(sha, ZERO, str(self.root))
 
+    def test_replacement_object_does_not_hide_unsigned_commit(self) -> None:
+        """Refuse an unsigned commit even when a local replacement names a signed copy."""
+        tree = self.git("mktree")
+        unsigned = self.git("commit-tree", tree, text="unsigned\n")
+        signed = self.git("commit-tree", tree, text=f"unsigned\n\n{TRAILER}\n")
+        self.git("replace", unsigned, signed)
+        self.assertEqual(
+            signoff.check_commits(unsigned, ZERO, str(self.root)),
+            f"commit {unsigned}: no Signed-off-by trailer",
+        )
+
+    def test_commit_committer_identity_is_the_expected_identity(self) -> None:
+        """Accept a commit signed with the committer email and refuse the user-email one."""
+        self.git("config", "committer.email", "committer@example.invalid")
+        accepted = self.commit("fixture")
+        self.assertIn("committer@example.invalid", self.git("show", "-s", "--format=%B", accepted))
+        self.assertIsNone(signoff.check_commits(accepted, ZERO, str(self.root)))
+        refused = self.commit(f"fixture\n\n{TRAILER}", signed=False)
+        self.assertIn("other identity", signoff.check_commits(refused, ZERO, str(self.root)))
+
+    def test_commit_with_literal_divider_counts_its_trailer(self) -> None:
+        """Count the commit sign-off after a literal divider line in the log read."""
+        sha = self.commit(f"fixture\n\nbody\n---\nmore\n\n{TRAILER}", signed=False)
+        self.assertIsNone(signoff.check_commits(sha, ZERO, str(self.root)))
+
+    def test_commit_trailer_separator_config_does_not_change_the_policy(self) -> None:
+        """Accept a signed commit and refuse a percent sign-off commit under trailer.separators."""
+        self.git("config", "trailer.separators", "%:")
+        self.assertIsNone(signoff.check_commits(self.commit("fixture"), ZERO, str(self.root)))
+        percent = self.commit(f"fixture\n\nSigned-off-by% {IDENTITY}", signed=False)
+        reason = signoff.check_commits(percent, ZERO, str(self.root))
+        self.assertIsNotNone(reason)
+        self.assertIn("no Signed-off-by", reason)
+
+    def test_empty_signoff_trailer_is_counted(self) -> None:
+        """Refuse an empty sign-off before or after a valid one and accept a single valid one."""
+        tree = self.git("mktree")
+        for text, valid in (
+            (f"Signed-off-by:\n{TRAILER}", False),
+            (f"{TRAILER}\nSigned-off-by:", False),
+            (TRAILER, True),
+        ):
+            with self.subTest(text=text):
+                sha = self.git("commit-tree", tree, text=f"fixture\n\n{text}\n")
+                reason = signoff.check_commits(sha, ZERO, str(self.root))
+                if valid:
+                    self.assertIsNone(reason)
+                else:
+                    self.assertIn("more than one", reason or "")
+
+    def test_malformed_log_after_identity_fails_closed(self) -> None:
+        """Refuse malformed log records once the committer identity read succeeded."""
+        sha = self.commit()
+        ident = f"{IDENTITY} 1700000000 +0000\n"
+        for raw in ("", f"{sha}\0{TRAILER}", f"{'f' * 40}\0{TRAILER}\0"):
+            with (
+                self.subTest(raw=raw),
+                unittest.mock.patch.object(
+                    signoff, "git", side_effect=["", f"{sha}\n", ident, raw]
+                ),
+                self.assertRaises(ValueError),
+            ):
+                signoff.check_commits(sha, ZERO, str(self.root))
+
 
 class MessagePathStdinTest(GitFixture):
     """Exercise the hook message-path channel that reads one path line from stdin."""
 
-    def _run_signoff_stdin(self, path_line: str) -> subprocess.CompletedProcess[str]:
+    def _run_signoff_stdin(
+        self, path_line: str, cwd: Path | None = None
+    ) -> subprocess.CompletedProcess[str]:
         """Run signoff with --message-path-stdin and the given path line on stdin."""
         return subprocess.run(  # nosec B603 - fixed Python argv, fixture paths, no shell.
             [sys.executable, "-B", str(ROOT / "scripts/signoff.py"), "--message-path-stdin"],
             input=path_line,
-            cwd=self.root,
+            cwd=cwd or self.root,
             env=self.env,
             capture_output=True,
             encoding="utf-8",
@@ -312,12 +460,13 @@ class MessagePathStdinTest(GitFixture):
 
     def test_message_path_stdin_signed_and_unsigned(self) -> None:
         """Accept a signed message file path and refuse an unsigned one through stdin."""
-        message = self.root / "hook-message.txt"
+        relative = self.git("rev-parse", "--git-path", "COMMIT_EDITMSG")
+        message = self.root / relative
         message.write_text(f"Subject\n\n{TRAILER}\n", encoding="utf-8")
-        signed = self._run_signoff_stdin(str(message) + "\n")
+        signed = self._run_signoff_stdin(relative + "\n")
         self.assertEqual(signed.returncode, 0, signed.stderr)
         message.write_text("Subject without trailer\n", encoding="utf-8")
-        refused = self._run_signoff_stdin(str(message) + "\n")
+        refused = self._run_signoff_stdin(relative + "\n")
         self.assertEqual(refused.returncode, 1, refused.stderr)
         self.assertIn("no Signed-off-by", refused.stderr)
 
@@ -334,6 +483,46 @@ class MessagePathStdinTest(GitFixture):
                 result = self._run_signoff_stdin(path_line)
                 self.assertEqual(result.returncode, 2, result.stderr)
                 self.assertIn("cannot decide", result.stderr)
+
+    def test_message_path_stdin_allow_list_accepts_git_message_files(self) -> None:
+        """Accept the commit and merge message files in relative and absolute form."""
+        for name in ("COMMIT_EDITMSG", "MERGE_MSG"):
+            relative = self.git("rev-parse", "--git-path", name)
+            (self.root / relative).write_text(f"Subject\n\n{TRAILER}\n", encoding="utf-8")
+            for form in (relative, str(self.root / relative)):
+                with self.subTest(name=name, form=form):
+                    result = self._run_signoff_stdin(form + "\n")
+                    self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_message_path_stdin_allow_list_accepts_linked_worktree_file(self) -> None:
+        """Accept the commit message file of a linked worktree read from that worktree."""
+        self.commit("base")
+        linked = self.root / "linked-worktree"
+        self.git("worktree", "add", "-q", "-b", "side", str(linked))
+        named = subprocess.run(  # nosec B603 B607 - fixture Git argv, no shell, timeout set.
+            ["git", "rev-parse", "--git-path", "COMMIT_EDITMSG"],
+            cwd=linked,
+            env=self.env,
+            capture_output=True,
+            encoding="utf-8",
+            check=True,
+            timeout=30,
+        ).stdout.strip()
+        self.assertTrue(Path(named).is_absolute(), named)
+        Path(named).write_text(f"Subject\n\n{TRAILER}\n", encoding="utf-8")
+        result = self._run_signoff_stdin(named + "\n", cwd=linked)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_message_path_stdin_allow_list_refuses_other_signed_file(self) -> None:
+        """Refuse a signed file elsewhere in the work tree as cannot decide."""
+        elsewhere = self.root / "elsewhere.txt"
+        elsewhere.write_text(f"Subject\n\n{TRAILER}\n", encoding="utf-8")
+        for form in ("elsewhere.txt", str(elsewhere)):
+            with self.subTest(form=form):
+                result = self._run_signoff_stdin(form + "\n")
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn("cannot decide", result.stderr)
+                self.assertIn("allow-list", result.stderr)
 
 
 class ConsideredRemotesTest(GitFixture):

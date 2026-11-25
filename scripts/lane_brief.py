@@ -21,12 +21,11 @@ import importlib
 import io
 import os
 import re
-import shlex
 import stat
 import subprocess  # nosec B404 - runner precheck with explicit argv, no shell, bounded timeout.
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -100,13 +99,43 @@ AWK_LENGTH_PROGRAM = re.compile(
 )
 GREP_COUNTED_DOT = re.compile(r"(?<!\\)\.\\?\{\d{2,3}(?:,\d*)?\\?\}")
 LENGTH_TOOL_NAMES = frozenset({"wc", "awk", "gawk", "mawk", "nawk", "grep", "egrep", "fgrep", "rg"})
-GIT_DIFF_COMMAND = re.compile(r"\bgit\b[^|;&]*\bdiff\b")
 STANDALONE_OBJECT = re.compile(r"(?<![0-9a-fA-F])[0-9a-fA-F]{40}(?![0-9a-fA-F])")
-NESTED_GIT_C = re.compile(r"""\bgit\s+-C\s+("[^"\n]+"|'[^'\n]+'|[^\s`'";,|&()<>]+)""")
+GIT_C_ARGUMENT = r"""(?:"[^"\n]*"|'[^'\n]*'|[^\s`'";,|&()<>]+)"""
+NESTED_GIT_C = re.compile(rf"\bgit((?:\s+-C\s+{GIT_C_ARGUMENT})+)")
+GIT_C_VALUE = re.compile(rf"\s+-C\s+({GIT_C_ARGUMENT})")
 MAX_NESTED_REPOS = 8
 REDIRECT_CHARS = frozenset("<>&|")
 COMMAND_SEPARATORS = frozenset({";", "&", "&&", "||"})
 PIPE_SEPARATORS = frozenset({"|", "|&"})
+PAREN_OPERATORS = frozenset({"(", ")", "$("})
+OPERATOR_TEXTS = COMMAND_SEPARATORS | PIPE_SEPARATORS | PAREN_OPERATORS
+SHELL_OPERATOR = re.compile(r"&&|\|\||\|&|;;&|;;|;&|&>>|&>|<<<|<<-|<<|<&|<>|>>|>&|>\||[;&|<>()]")
+SHELL_BLANKS = " \t\r\f\v"
+DQ_ESCAPED = frozenset('$`"\\')
+MAX_SHELL_DEPTH = 16
+MAKE_STARTERS = frozenset({"&&", "||", ";", "|", "|&", "&", "(", "$("})
+WRAPPER_WORDS = frozenset({"env", "nohup", "command", "exec"})
+TIMEOUT_DURATION = re.compile(r"\d+(?:\.\d+)?[smhd]?")
+NICE_ADJUST = re.compile(r"[+-]?\d+")
+NICE_JOINED = re.compile(r"-n[+-]?\d+")
+VERIFY_ALL = re.compile(r"verify-all\b", re.IGNORECASE)
+GIT_GLOBAL_OPTIONS = frozenset({"--no-pager", "-P", "--no-optional-locks"})
+GIT_DIFF_FILE_OPTIONS = frozenset({"--no-index", "--output"})
+GREP_MATCHER_OPTIONS = frozenset(
+    {
+        "-E",
+        "-F",
+        "-G",
+        "-P",
+        "--extended-regexp",
+        "--fixed-strings",
+        "--basic-regexp",
+        "--perl-regexp",
+    }
+)
+FIXED_STRING_OPTIONS = frozenset({"-F", "--fixed-strings"})
+RG_FIXED_TOGGLES = frozenset({"-F", "--fixed-strings", "--no-fixed-strings"})
+RG_ENGINE_OPTIONS = frozenset({"-P", "--pcre2", "--engine"})
 
 
 def validate_lines(lines: list[bytes], label: str) -> None:
@@ -350,11 +379,17 @@ def check_isolation(worktree: Path) -> int:
     return 0
 
 
-def line_slice(content: str, start: int, end: int) -> str:
-    """Return the full line or lines spanning start through end in content."""
+def line_bounds(content: str, start: int, end: int) -> tuple[int, int]:
+    """Return the offsets of the full line or lines spanning start through end in content."""
     line_start = content.rfind("\n", 0, start) + 1
     line_end = content.find("\n", end)
-    return content[line_start : len(content) if line_end < 0 else line_end]
+    return line_start, len(content) if line_end < 0 else line_end
+
+
+def line_slice(content: str, start: int, end: int) -> str:
+    """Return the full line or lines spanning start through end in content."""
+    line_start, line_end = line_bounds(content, start, end)
+    return content[line_start:line_end]
 
 
 def mask_backtick_inners(content: str) -> str:
@@ -399,7 +434,7 @@ def active_make_span(content: str) -> str:
             match.group(1)
             for match in non_clause_spans(content)
             if "host ran" not in line_slice(content, match.start(), match.end()).lower()
-            and MAKE_COMMAND.search(match.group(1))
+            and span_runs_make(match.group(1))
         ),
         "",
     )
@@ -423,7 +458,7 @@ def conflict_forbidden_make(content: str, clauses: list[str]) -> str:
 
 def conflict_make_without_praetorctl(content: str) -> str:
     """Report a brief with a make command span while Never run bans praetorctl or make."""
-    clauses = [match.group(0) for match in NEVER_RUN_CLAUSE.finditer(content)]
+    clauses = [content[start:end] for start, end in never_run_clause_spans(content)]
     praetor_clause = next(
         (
             clause
@@ -445,12 +480,39 @@ def conflict_make_without_praetorctl(content: str) -> str:
     )
 
 
-def join_is_excluded(content: str, match: re.Match[str]) -> bool:
+@dataclass(frozen=True)
+class JoinBoundaries:
+    """Hold the join boundary offsets and the record-line verdicts of one content text."""
+
+    starts: tuple[int, ...]
+    ends: tuple[int, ...]
+    records: dict[tuple[int, int], bool] = field(default_factory=dict, compare=False)
+
+
+def scan_join_boundaries(content: str) -> JoinBoundaries:
+    """Scan content once for join boundaries and return their offsets."""
+    spans = [(match.start(), match.end()) for match in JOIN_BOUNDARY.finditer(content)]
+    return JoinBoundaries(tuple(start for start, _ in spans), tuple(end for _, end in spans))
+
+
+def earlier_join_segment(content: str, boundaries: JoinBoundaries, position: int) -> str:
+    """Return the text between the last join boundary before position and position."""
+    index = bisect.bisect_right(boundaries.ends, position)
+    if index < len(boundaries.starts) and boundaries.starts[index] < position:
+        return JOIN_BOUNDARY.split(content[:position])[-1]
+    begin = boundaries.ends[index - 1] if index else 0
+    return content[begin:position]
+
+
+def join_is_excluded(content: str, match: re.Match[str], boundaries: JoinBoundaries) -> bool:
     """Return whether a one-line join match is negated or sits on a record line."""
-    line = line_slice(content, match.start(), match.end())
-    if FINDING_PREFIX.match(line) or "host ran" in line.lower():
+    bounds = line_bounds(content, match.start(), match.end())
+    if bounds not in boundaries.records:
+        line = content[bounds[0] : bounds[1]]
+        boundaries.records[bounds] = bool(FINDING_PREFIX.match(line) or "host ran" in line.lower())
+    if boundaries.records[bounds]:
         return True
-    earlier = JOIN_BOUNDARY.split(content[: match.start()])[-1]
+    earlier = earlier_join_segment(content, boundaries, match.start())
     return bool(JOIN_NEGATION.search(earlier))
 
 
@@ -459,11 +521,12 @@ def conflict_join_under_column_limit(content: str) -> str:
     limit_match = COLUMN_LIMIT.search(content)
     if not limit_match:
         return ""
+    boundaries = scan_join_boundaries(content)
     join_match = next(
         (
             match
             for match in ONE_LINE_JOIN.finditer(content)
-            if not join_is_excluded(content, match)
+            if not join_is_excluded(content, match, boundaries)
         ),
         None,
     )
@@ -483,22 +546,223 @@ def is_redirect_operator(token: str) -> bool:
     return "<" in token or ">" in token
 
 
-def span_shell_tokens(span: str) -> list[str] | None:
-    """Return punctuation-aware shell tokens for span or None when quoting is unclosed."""
-    try:
-        lexer = shlex.shlex(span, posix=True, punctuation_chars=True)
-        lexer.whitespace_split = True
-        return list(lexer)
-    except ValueError:
-        return None
+class ShellToken(str):
+    """A shell word or operator that remembers quoting and adjacency."""
+
+    quoted: bool
+    operator: bool
+    joined: bool
+
+    def __new__(
+        cls, text: str, *, quoted: bool = False, operator: bool = False, joined: bool = False
+    ) -> ShellToken:
+        """Build a token carrying its quoted, operator, and joined flags."""
+        token = super().__new__(cls, text)
+        token.quoted = quoted
+        token.operator = operator
+        token.joined = joined
+        return token
+
+
+def token_is_operator(token: str) -> bool:
+    """Return whether token is an unquoted operator; plain text counts when it looks like one."""
+    if isinstance(token, ShellToken):
+        return token.operator
+    return token in OPERATOR_TEXTS or is_redirect_operator(token)
+
+
+def token_is_quoted(token: str) -> bool:
+    """Return whether any part of token came from quotes or a backslash escape."""
+    return isinstance(token, ShellToken) and token.quoted
+
+
+def token_is_joined(token: str) -> bool:
+    """Return whether token follows the previous token with no whitespace; plain text does."""
+    return token.joined if isinstance(token, ShellToken) else True
+
+
+def token_is_redirect(token: str) -> bool:
+    """Return whether token is an unquoted redirect operator."""
+    return token_is_operator(token) and is_redirect_operator(str(token))
+
+
+@dataclass
+class _ShellScan:
+    """Hold the cursor, pending word, and mode stack of one shell text scan."""
+
+    text: str
+    pos: int = 0
+    tokens: list[ShellToken] = field(default_factory=list)
+    chars: list[str] = field(default_factory=list)
+    quoted: bool = False
+    start: int = -1
+    prev_end: int = -1
+    stack: list[str] = field(default_factory=lambda: ["root"])
+
+    def push(self, mode: str) -> bool:
+        """Open a nesting level and report False past the depth limit."""
+        if len(self.stack) >= MAX_SHELL_DEPTH:
+            return False
+        self.stack.append(mode)
+        return True
+
+    def mark(self, *, quoted: bool) -> None:
+        """Start the pending word at the cursor and note quoting."""
+        if self.start < 0:
+            self.start = self.pos
+        self.quoted = self.quoted or quoted
+
+    def emit(self, text: str, *, start: int, end: int, quoted: bool, operator: bool) -> None:
+        """Append one token and remember where it ended."""
+        joined = bool(self.tokens) and start == self.prev_end
+        self.tokens.append(ShellToken(text, quoted=quoted, operator=operator, joined=joined))
+        self.prev_end = end
+
+    def flush(self, *, keep_empty: bool = True) -> None:
+        """End the pending word at the cursor; drop an empty one unless keep_empty."""
+        if self.start >= 0 and (self.chars or keep_empty):
+            text = "".join(self.chars)
+            self.emit(text, start=self.start, end=self.pos, quoted=self.quoted, operator=False)
+        self.chars, self.quoted, self.start = [], False, -1
+
+    def operator(self, text: str) -> None:
+        """Emit an operator token at the cursor and move past it."""
+        self.flush()
+        end = self.pos + len(text)
+        self.emit(text, start=self.pos, end=end, quoted=False, operator=True)
+        self.pos = end
+
+    def blank(self) -> bool:
+        """End the pending word at whitespace; an unquoted newline also separates commands."""
+        if self.text[self.pos] == "\n":
+            self.operator(";")
+            return True
+        self.flush()
+        self.pos += 1
+        return True
+
+    def single_quote(self) -> bool:
+        """Read a single-quoted string; report False when it is unclosed."""
+        end = self.text.find("'", self.pos + 1)
+        if end < 0:
+            return False
+        self.mark(quoted=True)
+        self.chars.append(self.text[self.pos + 1 : end])
+        self.pos = end + 1
+        return True
+
+    def quote(self) -> bool:
+        """Read a single-quoted string or enter a double-quoted one."""
+        return self.single_quote() if self.text[self.pos] == "'" else self.double_quote_open()
+
+    def double_quote_open(self) -> bool:
+        """Enter a double-quoted string."""
+        self.mark(quoted=True)
+        self.pos += 1
+        return self.push("dq")
+
+    def escape(self, *, in_dq: bool) -> bool:
+        """Read a backslash escape; report False when nothing follows it."""
+        following = self.text[self.pos + 1 : self.pos + 2]
+        if not following:
+            return False
+        if following == "\n":
+            self.pos += 2
+            return True
+        keep_backslash = in_dq and following not in DQ_ESCAPED
+        self.mark(quoted=True)
+        self.chars.append("\\" if keep_backslash else following)
+        self.pos += 1 if keep_backslash else 2
+        return True
+
+    def substitution(self, *, in_dq: bool) -> bool:
+        """Open a command substitution as an operator token and scan its body as shell text."""
+        if in_dq and not self.chars:
+            self.chars, self.quoted, self.start = [], False, -1
+        else:
+            self.flush()
+        if not self.push("sub"):
+            return False
+        self.operator("$(")
+        return True
+
+    def punctuation(self) -> bool:
+        """Read one control or redirect operator at the cursor."""
+        match = SHELL_OPERATOR.match(self.text, self.pos)
+        if match is None:
+            return False
+        text = match.group()
+        nested = self.stack[-1] in ("sub", "paren")
+        if text == "(" and nested and not self.push("paren"):
+            return False
+        self.operator(text)
+        if text == ")" and nested:
+            self.stack.pop()
+        return True
+
+    def literal(self) -> bool:
+        """Append one ordinary unquoted character to the pending word."""
+        self.mark(quoted=False)
+        self.chars.append(self.text[self.pos])
+        self.pos += 1
+        return True
+
+    def step_shell(self) -> bool:
+        """Consume the next unit of unquoted shell text."""
+        char = self.text[self.pos]
+        if char in SHELL_BLANKS or char == "\n":
+            return self.blank()
+        if char in "'\"":
+            return self.quote()
+        if char == "\\":
+            return self.escape(in_dq=False)
+        if self.text.startswith("$(", self.pos):
+            return self.substitution(in_dq=False)
+        if char in ";&|<>()":
+            return self.punctuation()
+        return self.literal()
+
+    def step_dq(self) -> bool:
+        """Consume the next unit of double-quoted text."""
+        char = self.text[self.pos]
+        if char == '"':
+            self.stack.pop()
+            self.pos += 1
+            return True
+        if char == "\\":
+            return self.escape(in_dq=True)
+        if self.text.startswith("$(", self.pos):
+            return self.substitution(in_dq=True)
+        self.mark(quoted=True)
+        self.chars.append(char)
+        self.pos += 1
+        return True
+
+    def run(self) -> list[ShellToken] | None:
+        """Scan the whole text and return its tokens, or None when it cannot be parsed."""
+        for _ in range(len(self.text) + 1):
+            if self.pos >= len(self.text):
+                break
+            step = self.step_dq if self.stack[-1] == "dq" else self.step_shell
+            if not step():
+                return None
+        if self.stack != ["root"]:
+            return None
+        self.flush()
+        return self.tokens
+
+
+def span_shell_tokens(span: str) -> list[ShellToken] | None:
+    """Return quote-aware shell tokens for span or None when it cannot be parsed."""
+    return _ShellScan(span).run()
 
 
 def split_token_groups(tokens: list[str], separators: frozenset[str]) -> list[list[str]]:
-    """Split token list on separator tokens while preserving empty groups."""
+    """Split token list on operator tokens in separators while preserving empty groups."""
     groups: list[list[str]] = []
     current: list[str] = []
     for token in tokens:
-        if token in separators:
+        if token_is_operator(token) and token in separators:
             groups.append(current)
             current = []
             continue
@@ -511,6 +775,79 @@ def span_token_command_groups(tokens: list[str]) -> list[list[list[str]]]:
     """Split shell tokens into command groups and pipeline stages."""
     command_groups = split_token_groups(tokens, COMMAND_SEPARATORS)
     return [split_token_groups(group, PIPE_SEPARATORS) for group in command_groups]
+
+
+def nice_width(rest: list[str]) -> int:
+    """Return how many words a nice prefix spans, given the words after nice."""
+    if rest and NICE_JOINED.fullmatch(rest[0]):
+        return 2
+    if len(rest) > 1 and rest[0] == "-n" and NICE_ADJUST.fullmatch(rest[1]):
+        return 3
+    return 1
+
+
+def prefix_width(tokens: list[str], index: int, *, strict: bool) -> int:
+    """Return the width of an assignment or wrapper prefix at index, or 0 for none."""
+    token = tokens[index]
+    if token_is_operator(token) or (strict and token_is_quoted(token)):
+        return 0
+    if ENV_ASSIGNMENT.match(token) or token in WRAPPER_WORDS:
+        return 1
+    rest = tokens[index + 1 : index + 3]
+    if token == "timeout":
+        ready = rest and not token_is_operator(rest[0]) and TIMEOUT_DURATION.fullmatch(rest[0])
+        return 2 if ready else 0
+    return nice_width(rest) if token == "nice" else 0
+
+
+def command_word_index(tokens: list[str], index: int, *, strict: bool) -> int:
+    """Return the index of the command word after assignment and wrapper prefixes."""
+    limit = len(tokens)
+    for _ in range(limit):
+        if index >= limit:
+            break
+        width = prefix_width(tokens, index, strict=strict)
+        if not width:
+            break
+        index += width
+    return index
+
+
+def command_runs_make(tokens: list[str], index: int) -> bool:
+    """Return whether the command starting at index runs make other than make verify-all."""
+    word = command_word_index(tokens, index, strict=False)
+    if word >= len(tokens) or tokens[word] != "make":
+        return False
+    if token_is_operator(tokens[word]) or token_is_quoted(tokens[word]):
+        return False
+    after = tokens[word + 1 : word + 2]
+    exempt = (
+        after
+        and not token_is_operator(after[0])
+        and not token_is_joined(after[0])
+        and VERIFY_ALL.match(after[0])
+    )
+    return not exempt
+
+
+def tokens_run_make(tokens: list[str]) -> bool:
+    """Return whether make stands in a command position of the token stream."""
+    at_command = True
+    for index, token in enumerate(tokens):
+        if at_command and command_runs_make(tokens, index):
+            return True
+        starter = token_is_operator(token) and token in MAKE_STARTERS
+        marker = token == "--" and not token_is_operator(token) and not token_is_quoted(token)
+        at_command = starter or marker
+    return False
+
+
+def span_runs_make(span: str) -> bool:
+    """Return whether span runs make; an unparseable span keeps the raw pattern result."""
+    tokens = span_shell_tokens(span)
+    if tokens is None:
+        return bool(MAKE_COMMAND.search(span))
+    return tokens_run_make(tokens)
 
 
 @dataclass(frozen=True)
@@ -542,6 +879,7 @@ class StageParse:
     operands: tuple[str, ...]
     input_redirects: tuple[str, ...]
     refused: bool
+    opt_order: tuple[str, ...] = ()
 
 
 @dataclass
@@ -554,6 +892,7 @@ class _StageState:
     positionals: list[str]
     input_redirects: list[str]
     refused: bool
+    opt_order: list[str] = field(default_factory=list)
 
 
 WC_SPEC = ToolSpec(
@@ -1301,6 +1640,7 @@ def collect_prefix_redirects(words: list[str], tool_index: int) -> tuple[list[st
 def record_option(spec: ToolSpec, opt: str, value: str | None, state: _StageState) -> None:
     """Record one parsed option and any program, file-program, or unnamed-file effect."""
     state.seen_opts.add(opt)
+    state.opt_order.append(opt)
     if opt in spec.unnamed_file_opts:
         state.refused = True
     if value is not None and (opt, value) in spec.unnamed_file_opt_values:
@@ -1426,6 +1766,7 @@ def finalize_stage_parse(tool: str, spec: ToolSpec, state: _StageState) -> Stage
         operands=operands,
         input_redirects=tuple(state.input_redirects),
         refused=refused,
+        opt_order=tuple(state.opt_order),
     )
 
 
@@ -1499,6 +1840,25 @@ def awk_is_length_check(words: list[str], tool_index: int) -> bool:
     return False
 
 
+def grep_matcher_options(parsed: StageParse) -> list[str]:
+    """Return the matcher options of a grep stage in the order they were given."""
+    return [opt for opt in parsed.opt_order if opt in GREP_MATCHER_OPTIONS]
+
+
+def searches_fixed_strings(parsed: StageParse) -> bool:
+    """Return whether a grep, fgrep, or rg stage certainly searches fixed strings."""
+    if parsed.tool == "fgrep":
+        return not grep_matcher_options(parsed)
+    if parsed.tool == "grep":
+        matchers = grep_matcher_options(parsed)
+        return bool(matchers) and all(opt in FIXED_STRING_OPTIONS for opt in matchers)
+    if parsed.tool == "rg":
+        toggles = [opt for opt in parsed.opt_order if opt in RG_FIXED_TOGGLES]
+        engine = parsed.seen_opts & RG_ENGINE_OPTIONS
+        return bool(toggles) and toggles[-1] != "--no-fixed-strings" and not engine
+    return False
+
+
 def grep_is_length_check(words: list[str], tool_index: int | None = None) -> bool:
     """Return whether grep or rg uses a pattern file or counted-dot column-width pattern."""
     resolved = length_tool_index(words) if tool_index is None else tool_index
@@ -1507,6 +1867,8 @@ def grep_is_length_check(words: list[str], tool_index: int | None = None) -> boo
     parsed = parse_tool_stage(words, resolved)
     if parsed.uses_file:
         return True
+    if not parsed.refused and searches_fixed_strings(parsed):
+        return False
     candidates = (*parsed.programs, *parsed.operands) if parsed.refused else parsed.programs
     return any(GREP_COUNTED_DOT.search(token) for token in candidates)
 
@@ -1536,25 +1898,30 @@ def operand_is_lane_owned(operand: str) -> bool:
     return operand.startswith("/") and "/.lane/" in operand
 
 
+def is_descriptor_word(words: list[str], index: int, limit: int) -> bool:
+    """Return whether words[index] is an unquoted digit word joined to a redirect operator."""
+    token = words[index]
+    if index + 1 >= limit or token_is_operator(token):
+        return False
+    if not re.fullmatch(r"[0-9]+", token) or token_is_quoted(token):
+        return False
+    following = words[index + 1]
+    return token_is_redirect(following) and token_is_joined(following)
+
+
 def length_redirect_advance(words: list[str], index: int, limit: int) -> tuple[list[str], int]:
     """Collect stdin operands and skip redirects starting at index."""
     found: list[str] = []
-    token = words[index]
-    if re.fullmatch(r"\d+", token) and index + 1 < limit and is_redirect_operator(words[index + 1]):
+    if is_descriptor_word(words, index, limit):
         index += 1
-        token = words[index]
-    if not is_redirect_operator(token):
+    token = words[index]
+    if not token_is_redirect(token):
         return found, index
     if token == "<" and index + 1 < limit:
         found.append(words[index + 1])
         return found, index + 2
     next_index = index + 1
-    if (
-        next_index < limit
-        and words[next_index] not in COMMAND_SEPARATORS
-        and token != "<"
-        and not is_redirect_operator(words[next_index])
-    ):
+    if next_index < limit and token != "<" and not token_is_operator(words[next_index]):
         next_index += 1
     return found, next_index
 
@@ -1564,7 +1931,7 @@ def length_redirect_operands(
 ) -> tuple[int, list[str]] | None:
     """Return redirect advance when index starts a paren or redirection token."""
     token = words[index]
-    if token in ("(", ")"):
+    if token_is_operator(token) and token in PAREN_OPERATORS:
         return index + 1, []
     extra, advanced = length_redirect_advance(words, index, limit)
     if advanced == index:
@@ -2042,12 +2409,38 @@ def length_command_program_safe(words: list[str]) -> bool:
     return awk_stage_safe(parse_tool_stage(words, tool_index))
 
 
+def git_diff_option_reads_files(token: str) -> bool:
+    """Return whether a git diff option prints whole files or writes them elsewhere."""
+    return token in GIT_DIFF_FILE_OPTIONS or token.startswith("--output=")
+
+
+def git_diff_stage(stage: list[str]) -> bool:
+    """Return whether stage is a plain git diff with only allow-listed global options."""
+    for token in stage:
+        if token_is_operator(token) and (token == "$(" or "<" in token):
+            return False
+    limit = len(stage)
+    index = command_word_index(stage, 0, strict=True)
+    if index >= limit or stage[index] != "git" or token_is_operator(stage[index]):
+        return False
+    if token_is_quoted(stage[index]):
+        return False
+    index += 1
+    for _ in range(limit):
+        if index >= limit or stage[index] not in GIT_GLOBAL_OPTIONS:
+            break
+        index += 1
+    if index >= limit or stage[index] != "diff" or token_is_operator(stage[index]):
+        return False
+    return not any(git_diff_option_reads_files(token) for token in stage[index + 1 :])
+
+
 def length_command_allowed(words: list[str], pipeline: list[list[str]], command_index: int) -> bool:
     """Return whether a length command may read outside a git diff."""
     operands = command_file_operands(words)
     if operands and all(operand_is_lane_owned(operand) for operand in operands):
         return length_command_program_safe(words)
-    if command_index == 0 or not GIT_DIFF_COMMAND.search(" ".join(pipeline[0])):
+    if command_index == 0 or not git_diff_stage(pipeline[0]):
         return False
     return all(
         stage_reads_only_pipe(pipeline[idx], is_final=(idx == command_index))
@@ -2123,14 +2516,21 @@ def valid_nested_root(path: Path, worktree_root: Path) -> bool:
     return False
 
 
+def resolve_git_c_chain(worktree_root: Path, chain: str) -> Path:
+    """Resolve successive git -C values in order, as git(1) does, and return the directory."""
+    current = worktree_root
+    for match in list(GIT_C_VALUE.finditer(chain))[:MAX_LINES]:
+        value = match.group(1).strip("\"'")
+        if value:
+            current = Path(value) if Path(value).is_absolute() else current / value
+    return current.resolve()
+
+
 def nested_repositories(content: str, worktree_root: Path) -> list[Path]:
     """Collect up to 8 resolved nested repository roots named with git -C."""
     candidates: list[Path] = []
     for match in list(NESTED_GIT_C.finditer(content))[:MAX_LINES]:
-        raw = match.group(1).strip("\"'")
-        if Path(raw).is_absolute():
-            continue
-        resolved = (worktree_root / raw).resolve()
+        resolved = resolve_git_c_chain(worktree_root, match.group(1))
         if resolved not in candidates:
             candidates.append(resolved)
         if len(candidates) >= MAX_NESTED_REPOS:

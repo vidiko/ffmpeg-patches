@@ -17,7 +17,7 @@
 Exit status: 0 on success or non-overlapping check, 1 on an overlap by
 another author or undecided file comparison in check, 2 on a read, input or incomplete-scan error,
 3 when fill published the manifest but cleanup left a staging file or lock.
-SCAN_BUDGET_SECONDS gives network waits a 300-second monotonic budget;
+SCAN_BUDGET_SECONDS gives network waits an 1800-second monotonic budget;
 requests reserve pacing and a full per-operation timeout. Waiting for a fetch
 ends at the deadline even if its blocking operations keep renewing their timeout.
 Fill checks the same deadline during preparation and immediately before atomic

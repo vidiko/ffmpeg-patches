@@ -414,10 +414,8 @@ https://github.com/vidiko/ffmpeg-patches/actions/workflows/master.yml),
 https://github.com/vidiko/ffmpeg-patches/actions/workflows/upstream.yml),
 [Release](
 https://github.com/vidiko/ffmpeg-patches/actions/workflows/release.yml),
-[Scanners](
-https://github.com/vidiko/ffmpeg-patches/actions/workflows/scanners.yml),
-and the [Codacy dashboard](
-https://app.codacy.com/gh/vidiko/ffmpeg-patches/dashboard).
+and [Scanners](
+https://github.com/vidiko/ffmpeg-patches/actions/workflows/scanners.yml).
 
 ## Support ffmpeg-patches
 

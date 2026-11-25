@@ -1460,8 +1460,11 @@ def _descriptor_plain_twin_refusal(
             reason = hit if hit is not None else scan.refusal
             if reason is None:
                 twin_errors = collect_error_nodes(root)
-                if twin_errors is None or twin_errors:
+                if twin_errors is None or twin_errors or root.has_error:
                     reason = "plain twin still contains unparsable shell syntax"
+            if reason is None:
+                budget.rebound_scripts.update(probe.rebound_scripts)
+                budget.rebound_unknown = budget.rebound_unknown or probe.rebound_unknown
     if reason is None:
         return None, twin_nested, twin_cd, twin_filtered
     return f"{prefix}: {reason}", empty, empty, empty

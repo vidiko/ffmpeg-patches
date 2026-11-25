@@ -34,14 +34,19 @@ _DESCRIPTOR_BOUNDARY = r"(?:\A|(?<=[ \t\n;|()])|(?<=(?<![<>])&))"
 _DESCRIPTOR_BODY = r"([0-9]+|\{[A-Za-z_][A-Za-z0-9_]*\})"
 _DESCRIPTOR_PREFIX_STR = _DESCRIPTOR_BOUNDARY + _DESCRIPTOR_BODY
 _DESCRIPTOR_PREFIX = _DESCRIPTOR_PREFIX_STR.encode("ascii")
+_DUP_OPERAND_END_STR = r"(?=\Z|[ \t\n;&|<>()])"
+_DUP_OPERAND_END = _DUP_OPERAND_END_STR.encode("ascii")
 _TAIL_MARK = re.compile(_DESCRIPTOR_PREFIX + rb"<<<")
-_DUP_STDIN = re.compile(rf"(?:{_DESCRIPTOR_PREFIX_STR})?<&([0-9]+)$")
-_DUP_STDIN_BYTES = re.compile(rb"(?:" + _DESCRIPTOR_PREFIX + rb")?<&\s*([0-9]+)(?![0-9A-Za-z_])")
+_DUP_STDIN = re.compile(rf"(?:{_DESCRIPTOR_PREFIX_STR})?<&([0-9]+)-?{_DUP_OPERAND_END_STR}")
+_DUP_STDIN_BYTES = re.compile(
+    rb"(?:" + _DESCRIPTOR_PREFIX + rb")?<&\s*([0-9]+)-?" + _DUP_OPERAND_END
+)
 _HS_FD_TAG = re.compile(r"^__RCG_HS_FD([0-9]+)_([0-9]+)__$")
 _HS_ZERO_TAG = re.compile(r"^__RCG_HS_0_([0-9]+)__$")
-_DUP_OR_CLOSE_TOK = re.compile(rf"^(?:{_DESCRIPTOR_PREFIX_STR})?(<&|>&)([0-9]+|-)$")
+_DUP_OR_CLOSE_TOK = re.compile(
+    rf"^(?:{_DESCRIPTOR_PREFIX_STR})?(<&|>&)([0-9]+-?|-){_DUP_OPERAND_END_STR}"
+)
 _FILE_REDIR_TOK = re.compile(r"^([0-9]*)(>>|<>|>\||<|>|&>|&>>)$")
-_SPLIT_FILE_OPS = frozenset(("<", ">", ">>", "<>", ">|"))
 _EXEC_ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 _SEG_REDIR_BYTES = re.compile(
     rb"(?:"
@@ -49,7 +54,9 @@ _SEG_REDIR_BYTES = re.compile(
     rb"|(?P<hs>(?P<hs_fd>" + _DESCRIPTOR_PREFIX + rb")?<<<)"
     rb"|(?P<dup>(?P<dup_fd>"
     + _DESCRIPTOR_PREFIX
-    + rb")?(?P<dup_op><&|>&)\s*(?P<dup_rhs>[0-9]+|-)(?![0-9A-Za-z_]))"
+    + rb")?(?P<dup_op><&|>&)\s*(?P<dup_rhs>[0-9]+-?|-)"
+    + _DUP_OPERAND_END
+    + rb")"
     rb"|(?P<amp>&>>|&>|>&)"
     rb"|(?P<file>(?P<file_fd>" + _DESCRIPTOR_PREFIX + rb")?(?P<file_op>>>|<>|>\||<|>)(?![<&>(]))"
     rb")"
@@ -73,27 +80,35 @@ def _dup_stdin_fd(left: str | bytes | None, right: str | bytes) -> int | None:
     """Return the duplicated descriptor number when left<&right targets fd 0."""
     if not _is_stdin_descriptor(left):
         return None
-    return int(right)
+    text = right.decode("ascii") if isinstance(right, bytes) else right
+    return int(text.removesuffix("-"))
 
 
 def _apply_dup_or_close(
     fds: dict[int, Any], left: str | bytes | None, op: str | bytes, rhs: str | bytes
 ) -> Any | None:
-    """Apply one N<&M, N>&M, N<&-, or N>&- operation to fds; return resolved stdin value."""
+    """Apply one N<&M, N>&M, N<&M-, N>&M-, N<&-, or N>&- operation; return resolved stdin."""
     is_in = op in ("<&", b"<&")
     target = (0 if is_in else 1) if not left else _descriptor_fd(left)
-    if target is None:
-        return None
     rhs_text = rhs.decode("ascii") if isinstance(rhs, bytes) else rhs
+    if target is None:
+        if rhs_text != "-" and rhs_text.endswith("-"):
+            fds.pop(int(rhs_text[:-1]), None)
+        return None
     if rhs_text == "-":
         fds.pop(target, None)
         return None
-    val = fds.get(int(rhs_text))
+    is_move = rhs_text.endswith("-")
+    src_digits = rhs_text[:-1] if is_move else rhs_text
+    src = int(src_digits)
+    val = fds.get(src)
     if val is None:
         fds.pop(target, None)
-        return None
-    fds[target] = val
-    return val if is_in and _dup_stdin_fd(left, rhs_text) is not None else None
+    else:
+        fds[target] = val
+    if is_move:
+        fds.pop(src, None)
+    return fds.get(0) if is_in and _dup_stdin_fd(left, src_digits) is not None else None
 
 
 def _apply_file_redirect(fds: dict[int, Any], left: str | bytes | None, op: str | bytes) -> None:
@@ -163,42 +178,77 @@ def _mask_quoted_bytes(raw: bytes) -> bytes:
     return bytes(buf)
 
 
-def _append_redirect_fd(punc: str, tokens: list[str], raw_tokens: list[str], idx: int) -> int:
-    """Attach a redirection operator and any immediate target descriptor."""
-    if tokens and tokens[-1].isdigit():
-        tokens[-1] += punc
+def _append_attached_op(op: str, tokens: list[str], left_ok: bool) -> None:
+    """Append a redirection operator, merging it onto an adjacent leading fd token."""
+    if left_ok:
+        tokens[-1] += op
     else:
-        tokens.append(punc)
-    if idx < len(raw_tokens) and (raw_tokens[idx].isdigit() or raw_tokens[idx] == "-"):
-        tokens[-1] += raw_tokens[idx]
-        return idx + 1
+        tokens.append(op)
+
+
+def _append_redirect_fd(
+    punc: str,
+    tokens: list[str],
+    raw_tokens: list[str],
+    idx: int,
+    attach: tuple[bool, bool] = (True, True),
+) -> int:
+    """Attach a redirection operator to an adjacent left fd and any valid right fd target."""
+    left_ok, right_ok = attach
+    _append_attached_op(punc, tokens, left_ok and bool(tokens) and tokens[-1].isdigit())
+    if right_ok and idx < len(raw_tokens):
+        rhs = raw_tokens[idx]
+        if rhs == "-" or rhs.removesuffix("-").isdigit():
+            tokens[-1] += rhs
+            return idx + 1
     return idx
 
 
-def _append_punctuation(token: str, tokens: list[str], raw_tokens: list[str], idx: int) -> int:
+def _step_punctuation(
+    token: str,
+    pos: int,
+    tokens: list[str],
+    ctx: tuple[list[str], int, bool],
+) -> tuple[int, int]:
+    """Consume one punctuation operator at pos and return updated (pos, raw_idx)."""
+    raw_tokens, idx, attach_left = ctx
+    left_ok = attach_left and pos == 0
+    two = token[pos : pos + 2]
+    if token[pos : pos + 3] == "&>>":
+        tokens.append("&>>")
+        return pos + 3, idx
+    if two in (">&", "<&"):
+        next_idx = _append_redirect_fd(
+            two, tokens, raw_tokens, idx, (left_ok, pos + 2 == len(token))
+        )
+        return pos + 2, next_idx
+    if two in (">>", "<>", ">|"):
+        _append_attached_op(two, tokens, left_ok)
+        return pos + 2, idx
+    if two in ("&>", "&&", "||", "<<"):
+        tokens.append(two)
+        return pos + 2, idx
+    if two == "|&":
+        tokens.append("|")
+        return pos + 2, idx
+    _append_attached_op(token[pos], tokens, left_ok and token[pos] in ("<", ">"))
+    return pos + 1, idx
+
+
+def _append_punctuation(
+    token: str,
+    tokens: list[str],
+    raw_tokens: list[str],
+    idx: int,
+    *,
+    attach_left: bool = True,
+) -> int:
     """Expand one punctuation run and merge shell redirect operators."""
     pos = 0
     for _ in range(len(token)):
         if pos >= len(token):
             break
-        if token[pos : pos + 3] == "&>>":
-            tokens.append("&>>")
-            pos += 3
-        elif token[pos : pos + 2] in (">&", "<&"):
-            idx = _append_redirect_fd(token[pos : pos + 2], tokens, raw_tokens, idx)
-            pos += 2
-        elif token[pos : pos + 2] == "&>":
-            tokens.append("&>")
-            pos += 2
-        elif token[pos : pos + 2] in ("&&", "||", ">>", "<<", "<>", ">|"):
-            tokens.append(token[pos : pos + 2])
-            pos += 2
-        elif token[pos : pos + 2] == "|&":
-            tokens.append("|")
-            pos += 2
-        else:
-            tokens.append(token[pos])
-            pos += 1
+        pos, idx = _step_punctuation(token, pos, tokens, (raw_tokens, idx, attach_left))
     return idx
 
 
@@ -533,8 +583,12 @@ def _is_redirect_word_op(tok: str) -> bool:
 
 
 def _is_self_redirect_tok(tok: str) -> bool:
-    """Return whether tok is a descriptor-duplication or close redirection token."""
-    return tok in (">&", "<&") or SELF_REDIRECT.fullmatch(tok) is not None
+    """Return whether tok is a descriptor-duplication, move, or close redirection token."""
+    return (
+        tok in (">&", "<&")
+        or SELF_REDIRECT.fullmatch(tok) is not None
+        or _DUP_OR_CLOSE_TOK.fullmatch(tok) is not None
+    )
 
 
 def _dup_stdin_source(tok: str) -> int | None:
@@ -561,15 +615,6 @@ def _step_stage_token(
             local_fds.pop(0, None)
         out.append(tok)
         return idx + 1
-    if (
-        tok.isdigit()
-        and idx + 2 < len(stage)
-        and stage[idx + 1] in _SPLIT_FILE_OPS
-        and stage[idx + 2] not in SEPARATORS
-    ):
-        _apply_file_redirect(local_fds, tok, stage[idx + 1])
-        out.extend(stage[idx : idx + 3])
-        return idx + 3
     if (
         (fmatch := _FILE_REDIR_TOK.fullmatch(tok)) is not None
         and idx + 1 < len(stage)
@@ -624,6 +669,62 @@ def _resolve_herestring_dups(tokens: list[str]) -> list[str]:
     return result
 
 
+def _step_word_char(command: str, idx: int, quote: str | None) -> tuple[int, str | None] | None:
+    """Advance one char or escape in a shlex word, or return None at word boundary."""
+    ch = command[idx]
+    if quote is None:
+        if ch in " \t\r;&|<>()\n":
+            return None
+        if ch == "\\":
+            return idx + 2, None
+        return idx + 1, (ch if ch in ("'", '"') else None)
+    if quote == "'":
+        return idx + 1, (None if ch == "'" else "'")
+    if ch == '"':
+        return idx + 1, None
+    step = 2 if ch == "\\" and idx + 1 < len(command) and command[idx + 1] in ("\\", '"') else 1
+    return idx + step, '"'
+
+
+def _advance_word_span(command: str, start: int) -> int:
+    """Return end index in command of one shlex word token starting at start."""
+    n = len(command)
+    idx = start
+    quote: str | None = None
+    for _ in range(n - start + 1):
+        if idx >= n:
+            break
+        step = _step_word_char(command, idx, quote)
+        if step is None:
+            break
+        idx, quote = step
+    return min(idx, n)
+
+
+def _raw_token_spans(command: str, limit: int) -> list[tuple[int, int]]:
+    """Return (start, end) character spans in command for up to limit shlex tokens."""
+    spans: list[tuple[int, int]] = []
+    n = len(command)
+    idx = 0
+    for _ in range(limit):
+        for _ in range(n - idx):
+            if command[idx] not in " \t\r":
+                break
+            idx += 1
+        if idx >= n:
+            break
+        start = idx
+        if command[idx] in ";&|<>()\n":
+            for _ in range(n - idx):
+                if command[idx] not in ";&|<>()\n":
+                    break
+                idx += 1
+        else:
+            idx = _advance_word_span(command, idx)
+        spans.append((start, idx))
+    return spans
+
+
 def _tokens(command: str) -> list[str] | None:
     """Split a shell command without executing substitutions or expansions."""
     if len(command.encode("utf-8", "surrogatepass")) > MAX_COMMAND:
@@ -639,13 +740,25 @@ def _tokens(command: str) -> list[str] | None:
     tokens: list[str] = []
     idx = 0
     raw_slice = raw_tokens[: MAX_TOKENS + 2]
+    spans = _raw_token_spans(command, len(raw_slice))
     for _ in range(len(raw_slice)):
         if idx >= len(raw_slice):
             break
-        token = raw_slice[idx]
+        p_idx = idx
+        token = raw_slice[p_idx]
         idx += 1
         if all(c in ";&|<>()\n" for c in token):
-            idx = _append_punctuation(token, tokens, raw_slice, idx)
+            prev = spans[p_idx - 1] if p_idx > 0 else (0, 0)
+            cur = spans[p_idx] if p_idx < len(spans) else (0, 0)
+            attach_left = (
+                p_idx > 0
+                and prev[1] == cur[0]
+                and prev[1] > prev[0]
+                and command[prev[0] : prev[1]].isdigit()
+                and bool(tokens)
+                and tokens[-1] == raw_slice[p_idx - 1]
+            )
+            idx = _append_punctuation(token, tokens, raw_slice, idx, attach_left=attach_left)
             continue
         tokens.append(token)
     if len(tokens) > MAX_TOKENS:
@@ -719,6 +832,9 @@ def _line_arith_spans(line: bytes) -> list[tuple[int, int]]:
         if in_single:
             pos += 1
             continue
+        if byte == b"\\":
+            pos += 2
+            continue
         if pos + 3 <= len(line) and line[pos : pos + 3] == b"$((":
             end = _close_arith_span(line, pos)
             if end is not None:
@@ -761,9 +877,191 @@ def script_blocks_fd_herestring_allowlist(raw: bytes) -> bool:
     return raw.find(b"<<", offset) >= 0
 
 
+def _step_dq_heredoc_delim(
+    raw: bytes, idx: int, line_end: int, buf: bytearray
+) -> tuple[int, int] | None:
+    """Advance one byte inside a double-quoted heredoc delimiter or return None."""
+    b = raw[idx]
+    if b == ord('"'):
+        return idx + 1, 0
+    if b in b"$`\r":
+        return None
+    if b == ord("\\"):
+        if idx + 1 >= line_end:
+            return None
+        if raw[idx + 1] in b'\\"':
+            buf.append(raw[idx + 1])
+        else:
+            buf.extend(raw[idx : idx + 2])
+        return idx + 2, ord('"')
+    buf.append(b)
+    return idx + 1, ord('"')
+
+
+def _step_unquoted_heredoc_delim(
+    raw: bytes, idx: int, line_end: int, buf: bytearray
+) -> tuple[int, int] | None:
+    """Advance one byte outside quotes in a heredoc delimiter, or return None on rejection."""
+    b = raw[idx]
+    if b in b"$`\r":
+        return None
+    if b == ord("\\"):
+        if idx + 1 >= line_end:
+            return None
+        buf.append(raw[idx + 1])
+        return idx + 2, 0
+    if b in (ord("'"), ord('"')):
+        return idx + 1, b
+    buf.append(b)
+    return idx + 1, 0
+
+
+def _parse_heredoc_delim_bytes(raw: bytes, pos: int, line_end: int) -> tuple[bytes, int] | None:
+    """Parse one static heredoc delimiter on [pos, line_end) or return None if unmodelled."""
+    pos = _skip_spaces_tabs(raw, pos)
+    if pos >= line_end or raw[pos] == ord("#"):
+        return None
+    buf = bytearray()
+    idx = pos
+    quote = 0
+    for _ in range(line_end - pos + 1):
+        if idx >= line_end or (quote == 0 and raw[idx] in b" \t;&|<>()"):
+            break
+        if quote == 0:
+            step = _step_unquoted_heredoc_delim(raw, idx, line_end, buf)
+        elif quote == ord("'"):
+            if raw[idx] != ord("'"):
+                buf.append(raw[idx])
+            step = (idx + 1, 0 if raw[idx] == ord("'") else ord("'"))
+        else:
+            step = _step_dq_heredoc_delim(raw, idx, line_end, buf)
+        if step is None:
+            return None
+        idx, quote = step
+    return (bytes(buf), idx) if (quote == 0 and buf) else None
+
+
+def _line_heredoc_openers(
+    raw: bytes, masked: bytes, line_start: int, line_end: int
+) -> list[tuple[bytes, bool]] | None:
+    """Collect (delimiter, tab_strip) pairs on one line, or None when unmodelled."""
+    if b"<<" not in masked[line_start:line_end]:
+        return []
+    if line_end > line_start and masked[line_end - 1] in (ord("\r"), ord("\\")):
+        return None
+    arith = _line_arith_spans(raw[line_start:line_end])
+    openers: list[tuple[bytes, bool]] = []
+    pos = line_start
+    for _ in range(line_end - line_start + 1):
+        if pos >= line_end:
+            break
+        if masked[pos : pos + 2] != b"<<":
+            pos += 1
+            continue
+        if masked[pos : pos + 3] == b"<<<":
+            if pos + 3 < line_end and masked[pos + 3] == ord("<"):
+                return None
+            pos += 3
+            continue
+        local = pos - line_start
+        if any(begin <= local < end for begin, end in arith):
+            pos += 2
+            continue
+        tab_strip = pos + 2 < line_end and raw[pos + 2] == ord("-")
+        parsed = _parse_heredoc_delim_bytes(raw, pos + (3 if tab_strip else 2), line_end)
+        if parsed is None:
+            return None
+        openers.append((parsed[0], tab_strip))
+        pos = parsed[1]
+    return openers
+
+
+def _consume_heredoc_body(
+    raw: bytes, cursor: int, delim: bytes, tab_strip: bool
+) -> tuple[int, int, int] | None:
+    """Return (span_start, span_end, next_line_start) for one heredoc body, or None."""
+    n = len(raw)
+    pos = cursor
+    for _ in range(n - cursor + 2):
+        if pos >= n:
+            return None
+        nl = raw.find(b"\n", pos)
+        b_end = n if nl < 0 else nl
+        if b_end > pos and raw[b_end - 1] == ord("\r"):
+            return None
+        line = raw[pos:b_end].lstrip(b"\t") if tab_strip else raw[pos:b_end]
+        if line == delim:
+            return cursor, b_end, (n + 1 if nl < 0 else nl + 1)
+        if nl < 0:
+            return None
+        pos = nl + 1
+    return None
+
+
+def _mask_line_range(
+    raw: bytes,
+    buf: bytearray,
+    span: tuple[int, int],
+    state: tuple[int | None, bool],
+) -> tuple[int | None, bool]:
+    """Mask quoted and comment bytes within span and return updated quote state."""
+    idx, end = span
+    quote, ansi = state
+    for _ in range(end - idx + 1):
+        if idx >= end:
+            break
+        if quote is None:
+            idx, quote, ansi = _advance_unquoted_mask(raw, buf, idx)
+        else:
+            idx, quote, ansi = _advance_quoted_mask(raw, buf, idx, quote, ansi)
+    return quote, ansi
+
+
+def _consume_line_heredocs(
+    raw: bytes, buf: bytearray, cursor: int, openers: list[tuple[bytes, bool]]
+) -> int | None:
+    """Mask each heredoc payload opened on one line and return next line offset or None."""
+    for delim, tab_strip in openers:
+        taken = _consume_heredoc_body(raw, cursor, delim, tab_strip)
+        if taken is None:
+            return None
+        buf[taken[0] : taken[1]] = b"\x01" * (taken[1] - taken[0])
+        cursor = taken[2]
+    return cursor
+
+
+def _mask_descriptor_scan_bytes(raw: bytes) -> bytes:
+    """Mask quoted, comment, and closed here-document payload spans to SOH."""
+    if b"<<" not in raw:
+        return _mask_quoted_bytes(raw)
+    n = len(raw)
+    buf = bytearray(raw)
+    state: tuple[int | None, bool] = (None, False)
+    line_start = 0
+    for _ in range(n + 2):
+        if line_start >= n:
+            return bytes(buf)
+        nl = raw.find(b"\n", line_start)
+        line_end = n if nl < 0 else nl
+        state = _mask_line_range(raw, buf, (line_start, line_end), state)
+        openers = (
+            [] if state[0] is not None else _line_heredoc_openers(raw, buf, line_start, line_end)
+        )
+        if openers is None or (openers and nl < 0):
+            return _mask_quoted_bytes(raw)
+        if not openers:
+            line_start = n if nl < 0 else nl + 1
+            continue
+        next_start = _consume_line_heredocs(raw, buf, nl + 1, openers)
+        if next_start is None:
+            return _mask_quoted_bytes(raw)
+        line_start = next_start
+    return _mask_quoted_bytes(raw)
+
+
 def strip_descriptor_tail_marks(raw: bytes) -> bytes:
     """Build twin bytes with each unquoted descriptor prefix before <<< removed."""
-    masked = _mask_quoted_bytes(raw)
+    masked = _mask_descriptor_scan_bytes(raw)
     parts: list[bytes] = []
     cursor = 0
     for match in _TAIL_MARK.finditer(masked):
@@ -776,13 +1074,17 @@ def strip_descriptor_tail_marks(raw: bytes) -> bytes:
 
 def descriptor_tail_marks_present(raw: bytes) -> bool:
     """Return whether raw bytes contain an unquoted descriptor prefix before <<<."""
-    return _TAIL_MARK.search(_mask_quoted_bytes(raw)) is not None
+    return _TAIL_MARK.search(_mask_descriptor_scan_bytes(raw)) is not None
 
 
 def _herestring_word_end_bytes(seg: bytes, masked: bytes, pos: int) -> tuple[int, int] | None:
     """Return start and end byte offsets of the here-string word starting at or after pos."""
     n = len(seg)
-    start = pos + (len(seg[pos:]) - len(seg[pos:].lstrip(b" \t")))
+    start = pos
+    for _ in range(n - pos):
+        if seg[start] not in (32, 9):
+            break
+        start += 1
     if start >= n:
         return None
     end = start
@@ -869,8 +1171,8 @@ def _is_separator_byte(masked: bytes, idx: int) -> bool:
 
 
 def rewrite_descriptor_dups(raw: bytes) -> bytes:
-    """Rewrite 0<&N and <&N to plain here-strings when fd N carries a here-string word."""
-    masked = _mask_quoted_bytes(raw)
+    """Rewrite 0<&N, <&N, and moves onto fd 0 when the source fd carries a here-string."""
+    masked = _mask_descriptor_scan_bytes(raw)
     if _DUP_STDIN_BYTES.search(masked) is None:
         return raw
     out: list[bytes] = []
@@ -997,7 +1299,7 @@ def _tail_line_suffix_valid(line: bytes, digit: int) -> tuple[bool, list[bytes]]
 
 def descriptor_tail_mark_count(raw: bytes) -> int:
     """Count unquoted descriptor prefixes immediately followed by <<< in raw script bytes."""
-    masked = _mask_quoted_bytes(raw)
+    masked = _mask_descriptor_scan_bytes(raw)
     return sum(1 for _ in _TAIL_MARK.finditer(masked))
 
 
@@ -1005,7 +1307,7 @@ def find_descriptor_herestring_tail(raw: bytes) -> tuple[int, int, int, list[byt
     """Locate exactly one allowed descriptor here-string tail line in raw script bytes."""
     if script_blocks_fd_herestring_allowlist(raw):
         return None
-    masked = _mask_quoted_bytes(raw)
+    masked = _mask_descriptor_scan_bytes(raw)
     marks: list[tuple[bytes, int, int, int]] = []
     for match in _TAIL_MARK.finditer(masked):
         pos = match.start(1)

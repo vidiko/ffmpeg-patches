@@ -259,6 +259,98 @@ _R10_DESCRIPTOR_ROWS = (
     ("o03", "cat 3<<<one 3<<<two 0<&3", "two"),
     ("o04", "cat 3<<<one 0<&3 3<<<two", "one"),
 )
+_R11_REFUSE_PROBES = (
+    ("j01_body_exec_then_move", "body", 'exec 3<<< "./helper.sh"\nbash <&3-\n'),
+    ("j02_body_inline_move", "body", 'bash 3<<< "./helper.sh" 0<&3-\n'),
+    ("j03_cmd_inline_move", "cmd", 'bash 3<<< "./helper.sh" 0<&3-'),
+    ("j04_cmd_exec_then_move", "cmd", 'exec 3<<< "./helper.sh"; bash <&3-'),
+    ("j05_body_exec_spaced_word", "body", 'exec 3<<< "./helper.sh"\nbash -s 3 </dev/null 0<&3\n'),
+    ("j06_cmd_inline_spaced_word", "cmd", 'bash -s 3<<< "./helper.sh" 3 </dev/null 0<&3'),
+    ("j07_body_escaped_arith_heredoc", "body", ': "\\$((" <<X\nX\nbash 0<&3 3<<< "./helper.sh"\n'),
+    (
+        "j08_body_escaped_arith_line",
+        "body",
+        ': "\\$(("; cat <<X\nX\nbash 0<&3 3<<< "./helper.sh"\n',
+    ),
+    ("j09_body_twin_missing_paren", "body", 'bash 0<&3 3<<< "./helper.sh"\n( echo a\n'),
+    ("j10_body_move_then_word", "body", 'exec 3<<< "./helper.sh"\nbash -s <&3- x\n'),
+    (
+        "l01_body_escaped_arith_bash_heredoc",
+        "body",
+        'd=x\n: "\\$((x"; bash <<X; : "))"\n./helper.sh\nX\ncat 3<<< "$d"\n',
+    ),
+    (
+        "l02_body_escaped_arith_bash_heredoc_tail_first",
+        "body",
+        'd=x\ncat 3<<< "$d"\n: "\\$((x"; bash <<X; : "))"\n./helper.sh\nX\n',
+    ),
+    (
+        "l03_body_escaped_arith_bash_heredoc_dup",
+        "body",
+        ': "\\$((x"; bash <<X; : "))"\n./helper.sh\nX\nbash 0<&3 3<<< "./helper.sh"\n',
+    ),
+    (
+        "l04_body_escaped_arith_sh_heredoc",
+        "body",
+        'd=x\n: "\\$((x"; sh <<X; : "))"\n./helper.sh\nX\ncat 3<<< "$d"\n',
+    ),
+)
+_R11_ALLOW_PROBES = (
+    ("k01_body_heredoc_data_two_marks", "body", "cat <<'EOF'\n3<<<x\n4<<<x\nEOF\n"),
+    ("k03_body_control_cat_fd", "body", 'd=x\ncat 3<<< "$d"\n'),
+    ("k04_body_escaped_arith_literal", "body", ': "\\$(("\necho ok\n'),
+    ("k06_body_heredoc_data_one_mark", "body", "cat <<'EOF'\n3<<<x\nEOF\n"),
+)
+_R11_MOVE_ROWS = (
+    ("m01", "exec 3<<<moved; cat <&3-; echo rc=$?; cat <&3 2>&1; echo rc2=$?", "moved"),
+    ("m02", "exec 3<<<moved; cat 0<&3-; cat <&3 2>&1; echo rc2=$?", "moved"),
+    ("m03", "cat 3<<<moved 0<&3-", "moved"),
+    ("m04", "cat 0<&3- 3<<<moved 2>&1; echo rc=$?", None),
+    ("m05", "exec 3<<<moved; cat <&3 -; echo rc=$?", "moved"),
+    ("m06", "exec 3<<<moved; exec 4<&3-; cat <&3", None),
+    ("m07", "exec 3<<<moved; exec 4<&3-; cat <&4", "moved"),
+    ("m08", "exec 3<<<moved; cat 4<&3- <&4; cat <&3", "moved"),
+    ("m09", "exec 3<<<moved; cat 4<&3- <&3", None),
+)
+_R11_SPACED_ROWS = (
+    ("s01", "exec 3<<<kept; cat - 3 </dev/null 0<&3 2>&1", "kept"),
+    ("s02", "exec 3<<<kept; cat - 3</dev/null 0<&3 2>&1; echo rc=$?", None),
+    ("s03", "cat - 3<<<kept 3 </dev/null 0<&3 2>&1", "kept"),
+    ("s04", "cat - 3<<<kept 3</dev/null 0<&3 2>&1; echo rc=$?", None),
+    ("s05", "printf '[%s]' 3 </dev/null; echo", None),
+)
+_R11_FD0_ROWS = (
+    ("z01", "cat 0<<<first", "first"),
+    ("z02", "cat 00<<<first", "first"),
+    ("z03", "exec 3<<<dup; cat 0<&3 0<<<last", "last"),
+    ("z04", "cat 3<<<dup 0<&3 00<<<last", "last"),
+    ("z05", "cat 0<<<first 3<<<dup 0<&3", "dup"),
+)
+_R11_TS_MISSING_SINGLE = (
+    "( echo a\n",
+    "{ echo a\n",
+    "echo $(a\n",
+    "if true; then echo a\n",
+    'echo "a\n',
+    "case x in a) echo;;\n",
+    "[[ a\n",
+    "echo ${a\n",
+    "for i in a; do echo a\n",
+    "f() { echo a\n",
+    "while true; do echo a\n",
+    "cat <(echo a\n",
+    "echo $((1+2\n",
+    "echo `a\n",
+    "( cat\n",
+    "{ cat; \n",
+    "echo a | ( cat\n",
+    "x=$(echo a\n",
+    "if true; then cat; fi; ( echo\n",
+    "(\n",
+    "( (echo a)\n",
+    "echo $( (a)\n",
+    "[ a\n",
+)
 
 
 def _ast_module_funcs(path: Path) -> dict[str, ast.FunctionDef]:
@@ -1249,7 +1341,11 @@ class RawConfigureShapeTest(RawConfigureGuardBase):
             if not seg.strip().startswith(b"cat "):
                 continue
             masked = lex_mod._mask_quoted_bytes(seg)
-            mark_ends = {m.end() for m in lex_mod._TAIL_MARK.finditer(masked)}
+            mark_ends = {
+                m.end()
+                for m in lex_mod._TAIL_MARK.finditer(masked)
+                if not lex_mod._is_stdin_descriptor(m.group(1))
+            }
             words: list[str] = []
             for idx in range(len(masked) - 2):
                 if masked[idx : idx + 3] == b"<<<" and idx + 3 not in mark_ends:
@@ -1293,3 +1389,145 @@ class RawConfigureShapeTest(RawConfigureGuardBase):
         self.assertEqual(hs_to_scan, ["x", "y"])
         self.assertEqual(herestrings["__RCG_HS_FD3_0__"], "x")
         self.assertEqual(herestrings["__RCG_HS_FD3_1__"], "y")
+
+    def test_r11_probe_table(self) -> None:
+        """Refuse lim414j and lim414l cases and allow non-record lim414k cases in-process."""
+        (self.tree / "sub").mkdir(exist_ok=True)
+        helper_text = f"{_PARITY_CFG} --help\n"
+        for name in ("helper.sh", "sub/helper.sh"):
+            target = self.tree / name
+            target.write_text(helper_text, encoding="utf-8")
+            target.chmod(0o755)
+        script = self.tree / "s.sh"
+        for label, kind, text in _R11_REFUSE_PROBES:
+            command = text
+            if kind == "body":
+                script.write_text(text, encoding="utf-8")
+                command = "bash ./s.sh"
+            with self.subTest(label=label, kind=kind):
+                self.assertIsNotNone(GUARD_MOD._inspect_with_deadline(command, self.tree))
+        for label, kind, text in _R11_ALLOW_PROBES:
+            command = text
+            if kind == "body":
+                script.write_text(text, encoding="utf-8")
+                command = "bash ./s.sh"
+            with self.subTest(label=label, kind=kind):
+                self.assertIsNone(GUARD_MOD._inspect_with_deadline(command, self.tree))
+
+    def test_r11_move_and_operand_boundary_table(self) -> None:
+        """Model descriptor moves and shell-word dup boundaries on token and byte surfaces."""
+        for label, command, want in _R11_MOVE_ROWS:
+            with self.subTest(label=label, surface="tokens"):
+                self.assertEqual(self._cat_stdin_from_tokens(command), want)
+            with self.subTest(label=label, surface="bytes"):
+                rewritten = lex_mod.rewrite_descriptor_dups(command.encode("utf-8"))
+                self.assertNotIn(b"moved-", rewritten)
+                self.assertEqual(self._cat_stdin_from_bytes(command), want)
+        self.assertEqual(self._cat_stdin_from_tokens("cat 3<<<moved <&3"), "moved")
+        self.assertEqual(self._cat_stdin_from_bytes("cat 3<<<moved <&3"), "moved")
+        self.assertEqual(self._cat_stdin_from_tokens("cat 3<<<moved <&3-"), "moved")
+        self.assertEqual(self._cat_stdin_from_bytes("cat 3<<<moved <&3-"), "moved")
+        m08_bytes = lex_mod.rewrite_descriptor_dups(b"exec 3<<<moved; cat 4<&3- <&4; cat <&3")
+        self.assertTrue(m08_bytes.endswith(b"cat <<< moved"))
+        m08_scanned, _, _ = lex_mod._scan_herestrings("exec 3<<<moved; cat 4<&3- <&4; cat <&3")
+        self.assertTrue((lex_mod._tokens(m08_scanned) or [""])[-1].startswith("__RCG_HS_0_"))
+        for bad_dup in ("<&3x", "<&3."):
+            with self.subTest(bad_dup=bad_dup):
+                cmd = f"cat 3<<<moved {bad_dup}"
+                self.assertIsNone(lex_mod._dup_stdin_source(bad_dup))
+                self.assertIsNone(lex_mod._DUP_STDIN_BYTES.search(bad_dup.encode("ascii")))
+                self.assertIsNone(self._cat_stdin_from_tokens(cmd))
+                self.assertIsNone(self._cat_stdin_from_bytes(cmd))
+                self.assertEqual(lex_mod.rewrite_descriptor_dups(cmd.encode("ascii")), cmd.encode())
+
+    def test_r11_heredoc_data_marks_table(self) -> None:
+        """Exclude closed here-document payload lines from mark counting and dup rewriting."""
+        k01 = b"cat <<'EOF'\n3<<<x\n4<<<x\nEOF\n"
+        k06 = b"cat <<'EOF'\n3<<<x\nEOF\n"
+        one_real = b"d=x\ncat <<'EOF'\n3<<<x\n4<<<x\nEOF\ncat 3<<< \"$d\"\n"
+        two_real = 'cat 3<<< "$d"\ncat 4<<< "$d"\n'
+        self.assertEqual(lex_mod.descriptor_tail_mark_count(k01), 0)
+        self.assertEqual(lex_mod.descriptor_tail_mark_count(k06), 0)
+        self.assertFalse(lex_mod.descriptor_tail_marks_present(k01))
+        self.assertEqual(lex_mod.descriptor_tail_mark_count(one_real), 1)
+        self.assertIsNotNone(scan_body(two_real, self._shape_context(), BodyBudget())[0])
+        unterm = b"cat <<'EOF'\n3<<<x\n4<<<x\n"
+        self.assertEqual(lex_mod.descriptor_tail_mark_count(unterm), 2)
+        hd_dup = "exec 3<<<real; cat <<'EOF'\nexec 3<<<fake\nEOF\ncat 0<&3"
+        self.assertEqual(self._cat_stdin_from_bytes(hd_dup), "real")
+
+    def test_r11_missing_node_twin_refusal(self) -> None:
+        """Refuse plain twins recovered with MISSING syntax nodes and allow complete groups."""
+        ctx = self._shape_context()
+        for tail_text in _R11_TS_MISSING_SINGLE:
+            body = 'd=x\ncat 3<<< "$d"\n' + tail_text
+            with self.subTest(tail_text=tail_text):
+                hit = scan_body(body, ctx, BodyBudget())[0]
+                self.assertIsNotNone(hit)
+                self.assertIn("unparsable shell syntax", hit or "")
+        dup_mark_body = 'd=x\ncat 3<<< "$d"\n( cat 3<<< x\n'
+        self.assertIsNotNone(scan_body(dup_mark_body, ctx, BodyBudget())[0])
+        complete = 'd=x\ncat 3<<< "$d"\n( echo a )\n'
+        self.assertIsNone(scan_body(complete, ctx, BodyBudget())[0])
+
+    def test_r11_twin_rebinding_flow(self) -> None:
+        """Carry rebound script and unknown flags from an accepted twin into the caller budget."""
+        (self.tree / "safe.sh").write_text("echo ok\n", encoding="utf-8")
+        child = self.tree / "child.sh"
+        child.write_text(
+            'HERE="$(dirname "$(readlink -f "$0")")"\n. "$HERE/safe.sh"\n', encoding="utf-8"
+        )
+        child.chmod(0o755)
+        script = self.tree / "s.sh"
+        script.write_text('exec 3<<< "./child.sh"\nbash 0<&3\n', encoding="utf-8")
+        self.assertIsNone(GUARD_MOD._inspect_with_deadline("bash ./s.sh", self.tree))
+        rebound_body = 'exec 3<<< "PATH=/tmp ./child.sh"\nbash 0<&3\n'
+        script.write_text(rebound_body, encoding="utf-8")
+        self.assertIsNotNone(GUARD_MOD._inspect_with_deadline("bash ./s.sh", self.tree))
+        budget = BodyBudget()
+        ctx = InspectionContext(
+            cwd=self.tree,
+            directory_changed=False,
+            files_read=[0],
+            classifier=lambda _w: None,
+            script_dir=self.tree,
+        )
+        self.assertIsNone(scan_body(rebound_body, ctx, budget)[0])
+        self.assertIn(child.resolve(), budget.rebound_scripts)
+        unk_budget = BodyBudget()
+        self.assertIsNone(
+            scan_body(rebound_body, ctx._replace(directory_changed=True), unk_budget)[0]
+        )
+        self.assertTrue(unk_budget.rebound_unknown)
+
+    def test_r11_escaped_arithmetic_spans(self) -> None:
+        """Skip backslash-escaped arithmetic openers outside single quotes."""
+        self.assertEqual(lex_mod._line_arith_spans(b': "\\$((x"; : "))"'), [])
+        self.assertEqual(lex_mod._line_arith_spans(b"\\$(("), [])
+        self.assertEqual(lex_mod._line_arith_spans(b'echo "$((1<<2))"'), [(6, 15)])
+        blocked = b': "\\$((x" <<X; : "))"\nX\ncat 3<<< "$d"\n'
+        self.assertTrue(lex_mod.script_blocks_fd_herestring_allowlist(blocked))
+        allowed_shift = b'echo "$((1<<2))"\ncat 3<<< "$d"\n'
+        self.assertFalse(lex_mod.script_blocks_fd_herestring_allowlist(allowed_shift))
+
+    def test_r11_spaced_numeric_word_table(self) -> None:
+        """Treat numeric words as redirect prefixes only when source-adjacent to the operator."""
+        for label, command, want in _R11_SPACED_ROWS:
+            with self.subTest(label=label, surface="tokens"):
+                self.assertEqual(self._cat_stdin_from_tokens(command), want)
+            with self.subTest(label=label, surface="bytes"):
+                self.assertEqual(self._cat_stdin_from_bytes(command), want)
+        s05_tokens = lex_mod._tokens("printf '[%s]' 3 </dev/null") or []
+        self.assertEqual(lex_mod._strip_redirections(s05_tokens)[0], ["printf", "[%s]", "3"])
+        attached_tokens = lex_mod._tokens("printf '[%s]' 3</dev/null") or []
+        self.assertEqual(lex_mod._strip_redirections(attached_tokens)[0], ["printf", "[%s]"])
+
+    def test_r11_explicit_fd0_table(self) -> None:
+        """Select the last standard-input binding across explicit 0/00 here-strings and dups."""
+        for label, command, want in _R11_FD0_ROWS:
+            with self.subTest(label=label, surface="tokens"):
+                self.assertEqual(self._cat_stdin_from_tokens(command), want)
+            with self.subTest(label=label, surface="bytes"):
+                self.assertEqual(self._cat_stdin_from_bytes(command), want)
+        for body in ('cat 33<<< "$d"\n', 'cat {fd}<<< "$d"\n'):
+            self.assertIsNone(scan_body(body, self._shape_context(), BodyBudget())[0])

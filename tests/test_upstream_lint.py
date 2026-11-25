@@ -193,6 +193,60 @@ DOC_MUXERS_T2 = (
     "Write one output file.\n"
     "@end table\n"
 )
+DASHENC_SPLIT_ASSIGN_ADDED = (
+    "    if ((c->ignore_io_errors\n         = 0) && c->global_sidx)\n        ret = 0;\n"
+)
+DASHENC_SPLIT_ASSIGN_SOURCE = (
+    DASHENC_OPTIONS
+    + DASHENC_WRITE_HEAD
+    + DASHENC_SPLIT_ASSIGN_ADDED
+    + DASHENC_GAP2
+    + DASHENC_WRITE_TAIL
+)
+DASHENC_SPLIT_COMPARE_SOURCE = (
+    DASHENC_OPTIONS
+    + DASHENC_WRITE_HEAD
+    + DASHENC_SPLIT_ASSIGN_ADDED.replace("= 0)", "== 0)")
+    + DASHENC_GAP2
+    + DASHENC_WRITE_TAIL
+)
+DOC_MUXERS_VERBATIM_COMMENT_NAMES_GLOBAL_SIDX = (
+    "@table @option\n"
+    "@item ignore_io_errors\n"
+    "Ignore I/O errors.\n"
+    "@verbatim\n"
+    "@c global_sidx\n"
+    "@end verbatim\n"
+    "@item global_sidx\n"
+    "Write a global sidx.\n"
+    "@item single_file\n"
+    "Write one output file.\n"
+    "@end table\n"
+)
+DOC_MUXERS_IGNORE_BLOCK_NAMES_GLOBAL_SIDX = (
+    "@table @option\n"
+    "@item ignore_io_errors\n"
+    "Ignore I/O errors.\n"
+    "@ignore\n"
+    "Respect global_sidx when inserting index ranges.\n"
+    "@end ignore\n"
+    "@item global_sidx\n"
+    "Write a global sidx.\n"
+    "@item single_file\n"
+    "Write one output file.\n"
+    "@end table\n"
+)
+DOC_MUXERS_GLOBAL_SIDX_ONLY = (
+    "@table @option\n"
+    "@item ignore_io_errors\n"
+    "Ignore I/O errors.\n"
+    "@item global_sidx\n"
+    "Write a global sidx.\n"
+    "Write one index box for the whole output.\n"
+    "@item single_file\n"
+    "Write one output file.\n"
+    "@end table\n"
+)
 DOC_MUXERS_ITEMX_BASE = (
     "@table @option\n"
     "@item ignore_io_errors\n"
@@ -227,6 +281,60 @@ DOC_MUXERS_AFTER_EXAMPLE_NAMES_GLOBAL_SIDX = (
     "Respect @option{global_sidx} when inserting index ranges.\n"
     "@item global_sidx\n"
     "Write a global sidx.\n"
+    "@item single_file\n"
+    "Write one output file.\n"
+    "@end table\n"
+)
+DASHENC_SPLIT_ASSIGN_ADDED = (
+    "    if ((c->ignore_io_errors\n         = 0) && c->global_sidx)\n        ret = 0;\n"
+)
+DASHENC_SPLIT_ASSIGN_SOURCE = (
+    DASHENC_OPTIONS
+    + DASHENC_WRITE_HEAD
+    + DASHENC_SPLIT_ASSIGN_ADDED
+    + DASHENC_GAP2
+    + DASHENC_WRITE_TAIL
+)
+DASHENC_SPLIT_COMPARE_SOURCE = (
+    DASHENC_OPTIONS
+    + DASHENC_WRITE_HEAD
+    + DASHENC_SPLIT_ASSIGN_ADDED.replace("= 0)", "== 0)")
+    + DASHENC_GAP2
+    + DASHENC_WRITE_TAIL
+)
+DOC_MUXERS_VERBATIM_COMMENT_NAMES_GLOBAL_SIDX = (
+    "@table @option\n"
+    "@item ignore_io_errors\n"
+    "Ignore I/O errors.\n"
+    "@verbatim\n"
+    "@c global_sidx\n"
+    "@end verbatim\n"
+    "@item global_sidx\n"
+    "Write a global sidx.\n"
+    "@item single_file\n"
+    "Write one output file.\n"
+    "@end table\n"
+)
+DOC_MUXERS_IGNORE_BLOCK_NAMES_GLOBAL_SIDX = (
+    "@table @option\n"
+    "@item ignore_io_errors\n"
+    "Ignore I/O errors.\n"
+    "@ignore\n"
+    "Respect global_sidx when inserting index ranges.\n"
+    "@end ignore\n"
+    "@item global_sidx\n"
+    "Write a global sidx.\n"
+    "@item single_file\n"
+    "Write one output file.\n"
+    "@end table\n"
+)
+DOC_MUXERS_GLOBAL_SIDX_ONLY = (
+    "@table @option\n"
+    "@item ignore_io_errors\n"
+    "Ignore I/O errors.\n"
+    "@item global_sidx\n"
+    "Write a global sidx.\n"
+    "Write one index box for the whole output.\n"
     "@item single_file\n"
     "Write one output file.\n"
     "@end table\n"
@@ -2677,6 +2785,138 @@ class DocTermTest(unittest.TestCase):
             with self.subTest(text=text.strip()):
                 self.assertIn("mode", upstream_lint.texi_strip_comments(text))
 
+    def _assert_stripped(self, text: str, expected: str, named: bool) -> None:
+        """Assert the exact texi_strip_comments output and whether mode is named in it."""
+        stripped = upstream_lint.texi_strip_comments(text)
+        self.assertEqual(stripped, expected)
+        self.assertIs(upstream_lint.option_named_in_text("mode", stripped), named)
+
+    def test_texi_strip_comments_verbatim_keeps_comment_line(self) -> None:
+        """H1 v1: a @c line inside @verbatim is printed literally and stays."""
+        text = "Text.\n@verbatim\n@c mode\n@end verbatim\n"
+        self._assert_stripped(text, text, True)
+
+    def test_texi_strip_comments_plain_comment_line_removed(self) -> None:
+        """H1 v2: a @c line outside any block is still removed."""
+        self._assert_stripped("Text.\n@c mode\n", "Text.\n\n", False)
+
+    def test_texi_strip_comments_comment_after_verbatim_removed(self) -> None:
+        """H1 v3: a @c line after the @end verbatim line is still removed."""
+        text = "@verbatim\nx\n@end verbatim\n@c mode\n"
+        self._assert_stripped(text, "@verbatim\nx\n@end verbatim\n\n", False)
+
+    def test_texi_strip_comments_example_comment_removed(self) -> None:
+        """H1 v4: @example is not a raw block, so its @c line is removed."""
+        text = "@example\n@c mode\n@end example\n"
+        self._assert_stripped(text, "@example\n\n@end example\n", False)
+
+    def test_texi_strip_comments_verb_text_literal(self) -> None:
+        """H1 v5: @c inside @verb{|...|} is literal text and stays."""
+        text = "Use @verb{|@c mode|} here.\n"
+        self._assert_stripped(text, text, True)
+
+    def test_texi_strip_comments_verbatim_trailing_comment_kept(self) -> None:
+        """H1 v6: a trailing @c text inside @verbatim stays on the line."""
+        text = "@verbatim\nrun --x @c mode\n@end verbatim\n"
+        self._assert_stripped(text, text, True)
+
+    def test_texi_strip_comments_ignore_block_dropped(self) -> None:
+        """H2 i1: the @ignore opener, body and @end ignore line are dropped."""
+        text = "Text.\n@ignore\nmode\n@end ignore\n"
+        self._assert_stripped(text, "Text.\n", False)
+
+    def test_texi_strip_comments_example_body_kept(self) -> None:
+        """H2 i2: an @example body is shown and stays searchable."""
+        text = "@example\nmode\n@end example\n"
+        self._assert_stripped(text, text, True)
+
+    def test_texi_strip_comments_ignore_in_verbatim_literal(self) -> None:
+        """H2 i3: @ignore lines inside @verbatim are literal text and stay."""
+        text = "@verbatim\n@ignore\nmode\n@end ignore\n@end verbatim\n"
+        self._assert_stripped(text, text, True)
+
+    def test_texi_strip_comments_text_after_ignore_kept(self) -> None:
+        """H2 i4: text after the @end ignore line stays."""
+        text = "@ignore\nx\n@end ignore\nmode later\n"
+        self._assert_stripped(text, "mode later\n", True)
+
+    def test_texi_strip_comments_nested_ignore_needs_own_end(self) -> None:
+        """H2 i5: a nested @ignore needs its own @end, so mode stays dropped."""
+        text = "@ignore\n@ignore\nx\n@end ignore\nmode\n@end ignore\nafter\n"
+        self._assert_stripped(text, "after\n", False)
+
+    def test_texi_strip_comments_macro_body_kept(self) -> None:
+        """H2 i6: a @macro body keeps the line by line handling and stays."""
+        text = "@macro m\nmode\n@end macro\n"
+        self._assert_stripped(text, text, True)
+
+    def test_texi_strip_comments_conditional_body_kept(self) -> None:
+        """H2 i7: an @iftex body is shown in some output and stays."""
+        text = "@iftex\nmode\n@end iftex\n"
+        self._assert_stripped(text, text, True)
+
+    def test_texi_strip_comments_ignore_opener_text_dropped(self) -> None:
+        """H2 i8: text after @ignore on the opener line belongs to the dropped block."""
+        self._assert_stripped("@ignore mode\n@end ignore\n", "", False)
+
+    def _tested_per_line(self, lines: list[str]) -> list[list[str]]:
+        """Return the fields foo and mode tested per line after the whole-text filter."""
+        fields = frozenset(("foo", "mode"))
+        code = upstream_lint._code_lines("\n".join(lines))
+        spans = upstream_lint._condition_spans(code)
+        filtered = upstream_lint._lines_without_assignment_targets(code)
+        return [
+            sorted(upstream_lint._option_fields_tested(line, fields, spans=spans.get(number, ())))
+            for number, line in enumerate(filtered, 1)
+        ]
+
+    def test_assignment_filter_split_assignment_not_a_test(self) -> None:
+        """H3 a1: a target whose = sits on the next line is not an option test."""
+        lines = ["if ((c->foo", "     = enabled) && c->mode)"]
+        self.assertEqual(self._tested_per_line(lines), [[], ["mode"]])
+
+    def test_assignment_filter_split_comparison_stays_a_test(self) -> None:
+        """H3 a2: a == on the next line keeps the field a test."""
+        lines = ["if ((c->foo", "     == enabled) && c->mode)"]
+        self.assertEqual(self._tested_per_line(lines), [["foo"], ["mode"]])
+
+    def test_assignment_filter_split_compound_on_index_not_a_test(self) -> None:
+        """H3 a3: += on the next line after an indexed target is not a test."""
+        lines = ["if ((c->foo[0]", "     += 1) && c->mode)"]
+        self.assertEqual(self._tested_per_line(lines), [[], ["mode"]])
+
+    def test_assignment_filter_operator_on_first_line_not_a_test(self) -> None:
+        """H3 a4: an operator on the same line keeps working."""
+        lines = ["if ((c->foo =", "     enabled) && c->mode)"]
+        self.assertEqual(self._tested_per_line(lines), [[], ["mode"]])
+
+    def test_assignment_filter_split_inequality_stays_a_test(self) -> None:
+        """H3 a5: != on the next line keeps the field a test."""
+        lines = ["while (c->foo", "       != c->mode)"]
+        self.assertEqual(self._tested_per_line(lines), [["foo"], ["mode"]])
+
+    def test_assignment_filter_comment_before_operator_not_a_test(self) -> None:
+        """H3 a6: a blanked comment between the target and = does not hide the assignment."""
+        lines = ["if ((c->foo /* x */", "     = enabled) && c->mode)"]
+        self.assertEqual(self._tested_per_line(lines), [[], ["mode"]])
+
+    def test_assignment_filter_blank_line_before_operator_not_a_test(self) -> None:
+        """H3 a7: a blank line between the target and = does not hide the assignment."""
+        lines = ["if ((c->foo", "", "     = enabled) && c->mode)"]
+        self.assertEqual(self._tested_per_line(lines), [[], [], ["mode"]])
+
+    def test_assignment_filter_keeps_line_count_and_lengths(self) -> None:
+        """The whole-text filter keeps the line count and every line length on a1, a3, a7."""
+        for lines in (
+            ["if ((c->foo", "     = enabled) && c->mode)"],
+            ["if ((c->foo[0]", "     += 1) && c->mode)"],
+            ["if ((c->foo", "", "     = enabled) && c->mode)"],
+        ):
+            with self.subTest(lines=lines):
+                filtered = upstream_lint._lines_without_assignment_targets(lines)
+                self.assertEqual(len(filtered), len(lines))
+                self.assertEqual([len(line) for line in filtered], [len(line) for line in lines])
+
     def test_avoption_tables_bounded_header_separates_tables(self) -> None:
         """An explicit array bound on the second table keeps foo and bar apart."""
         tables = upstream_lint.avoption_tables(BOUNDED_TWO_TABLES_OPTIONS)
@@ -4846,6 +5086,50 @@ class PipelineTest(FixtureTest):
         self.assertEqual(rc, 1, output)
         self.assertIn("step: doc-terms rc: 1", output)
         self.assertIn("added code tests ignore_io_errors near global_sidx", output)
+
+    def _interplay_check(self, source: str, doc: str) -> tuple[int, str]:
+        """Commit the dashenc base, then a source and doc change, and return the check result."""
+        self._write_dashenc_fixture()
+        self.commit("libavformat/dashenc: option table fixture")
+        self.base = self.git("rev-parse", "HEAD").strip()
+        self.write("libavformat/dashenc.c", source)
+        self.write("doc/muxers.texi", doc)
+        self.commit("libavformat/dashenc: ignore I/O errors")
+        return self.check()
+
+    def test_doc_terms_option_interplay_split_assignment_passes(self) -> None:
+        """An assignment whose operator sits on the next line is not an option test."""
+        rc, output = self._interplay_check(DASHENC_SPLIT_ASSIGN_SOURCE, DOC_MUXERS_T1)
+        self.assertEqual(rc, 0, output)
+        self.assertIn("step: doc-terms rc: 0", output)
+
+    def test_doc_terms_option_interplay_split_comparison_fails(self) -> None:
+        """A comparison whose operator sits on the next line is still an option test."""
+        rc, output = self._interplay_check(DASHENC_SPLIT_COMPARE_SOURCE, DOC_MUXERS_T1)
+        self.assertEqual(rc, 1, output)
+        self.assertIn("step: doc-terms rc: 1", output)
+        self.assertIn("added code tests ignore_io_errors near global_sidx", output)
+
+    def test_doc_terms_option_interplay_verbatim_comment_names_neighbour_passes(self) -> None:
+        """A @c global_sidx line inside @verbatim is printed text and names the neighbour."""
+        doc = DOC_MUXERS_VERBATIM_COMMENT_NAMES_GLOBAL_SIDX
+        rc, output = self._interplay_check(DASHENC_T1_SOURCE, doc)
+        self.assertEqual(rc, 0, output)
+        self.assertIn("step: doc-terms rc: 0", output)
+
+    def test_doc_terms_option_interplay_ignore_block_names_neighbour_fails(self) -> None:
+        """Text inside @ignore never prints, so it does not name the neighbour."""
+        doc = DOC_MUXERS_IGNORE_BLOCK_NAMES_GLOBAL_SIDX
+        rc, output = self._interplay_check(DASHENC_T1_SOURCE, doc)
+        self.assertEqual(rc, 1, output)
+        self.assertIn("step: doc-terms rc: 1", output)
+        self.assertIn("added code tests ignore_io_errors near global_sidx", output)
+
+    def test_doc_terms_option_interplay_window_lines_read_filtered_text(self) -> None:
+        """Window lines read the filtered text, so a split assignment pairs nothing."""
+        rc, output = self._interplay_check(DASHENC_SPLIT_ASSIGN_SOURCE, DOC_MUXERS_GLOBAL_SIDX_ONLY)
+        self.assertEqual(rc, 0, output)
+        self.assertIn("step: doc-terms rc: 0", output)
 
     def _write_dashenc_fixture(self) -> None:
         """Write the dashenc and muxers fixture files shared by option-interplay tests."""

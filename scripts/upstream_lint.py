@@ -203,9 +203,11 @@ the neighbour field (underscore in the name may match a hyphen or space).
 Commented-out AVOption table headers and entry rows are ignored, whitespace
 after -> is allowed in option tests, and naming any alias of the neighbour
 field in a table that holds both options on different fields satisfies the entry.
-Texinfo @c and @comment text in an entry does not name a neighbour option.
+Texinfo @c and @comment text and @ignore text in an entry do not name a neighbour option;
+@verbatim and @verb text is literal, so a @c line inside it does name one.
 An explicit array bound in an AVOption table header still starts a new table.
-A structure field on the left of an assignment, in or outside a condition, is not a test.
+A structure field on the left of an assignment, in or outside a condition, is not a test,
+even when the assignment operator sits on a later line.
 Consecutive @item and @itemx headings share one entry, running to the line before the next
 heading of the same table or that table's @end with inner blocks and raw blocks included;
 the full entry text at head is used, not added lines alone. Only structure member access
@@ -2894,6 +2896,16 @@ def _texi_comment_command_at(line: str, at: int) -> int | None:
     return None
 
 
+def _texi_verb_end(line: str, at: int) -> int | None:
+    """Return the index after @verb text at an index, the line end if unclosed, else None."""
+    if not line.startswith("@verb{", at):
+        return None
+    if at + 6 >= len(line):
+        return len(line)
+    close = line.find(line[at + 6] + "}", at + 7)
+    return len(line) if close < 0 else close + 2
+
+
 def _texi_strip_comments_line(line: str) -> str:
     """Return one Texinfo line with @c and @comment suffix text removed."""
     index = 0
@@ -2907,6 +2919,10 @@ def _texi_strip_comments_line(line: str) -> str:
         if index + 1 < limit and line[index + 1] == "@":
             index += 2
             continue
+        verb_end = _texi_verb_end(line, index)
+        if verb_end is not None:
+            index = verb_end
+            continue
         command = _texi_comment_command_at(line, index)
         if command is not None:
             return line[:command].rstrip()
@@ -2914,14 +2930,46 @@ def _texi_strip_comments_line(line: str) -> str:
     return line
 
 
+def _texi_strip_step(line: str, stack: list[str]) -> str | None:
+    """Return one line as texi_strip_comments keeps it, or None when the line is dropped."""
+    if stack:
+        top = stack[-1]
+        _texi_raw_line(line, stack)
+    elif (command := TEXI_COMMAND.match(line)) and command[1] in TEXI_RAW:
+        top = command[1]
+        stack.append(top)
+    else:
+        return _texi_strip_comments_line(line)
+    if top == "ignore":
+        return None
+    if top == "verbatim":
+        return line
+    return _texi_strip_comments_line(line)
+
+
 def texi_strip_comments(text: str) -> str:
-    """Return Texinfo text with @c and @comment command text removed from each line."""
-    return "\n".join(_texi_strip_comments_line(line) for line in text.split("\n"))
+    """Strip @c and @comment text, drop @ignore blocks, keep @verbatim and @verb literal."""
+    stack: list[str] = []
+    kept: list[str] = []
+    for line in text.split("\n"):
+        stripped = _texi_strip_step(line, stack)
+        if stripped is not None:
+            kept.append(stripped)
+    return "\n".join(kept)
 
 
 def _text_without_assignment_targets(text: str) -> str:
     """Return text with structure-member assignment targets replaced by blanks."""
     return FIELD_ASSIGN_TARGET.sub(lambda match: " " * len(match.group(0)), text)
+
+
+def _lines_without_assignment_targets(code_lines: list[str]) -> list[str]:
+    """Return the code lines with assignment targets blanked even when the operator is later."""
+    if not code_lines:
+        return []
+
+    blanked = FIELD_ASSIGN_TARGET.sub(lambda m: re.sub(r"[^\n]", " ", m[0]), "\n".join(code_lines))
+    return blanked.split("\n")
 
 
 def _option_fields_tested(
@@ -3118,18 +3166,19 @@ def _interplay_pairs(
     """List unique option name pairs from added lines tested within OPTION_WINDOW."""
     fields = frozenset(option_field for table in tables for option_field in table)
     cond_spans = _condition_spans(code_lines)
+    test_lines = _lines_without_assignment_targets(code_lines)
     raw: list[tuple[int, str, str]] = []
     for number in sorted(added):
         if number > len(code_lines):
             continue
         tested = _option_fields_tested(
-            code_lines[number - 1],
+            test_lines[number - 1],
             fields,
             spans=cond_spans.get(number, ()),
         )
         if not tested:
             continue
-        raw.extend(_interplay_pairs_for_line(number, tested, code_lines, tables, cond_spans))
+        raw.extend(_interplay_pairs_for_line(number, tested, test_lines, tables, cond_spans))
     return _dedupe_interplay_pairs(raw)
 
 

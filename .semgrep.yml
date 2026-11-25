@@ -543,3 +543,34 @@ rules:
           with (..., self.assertRaisesRegex($P, $Q) as $VAR, ...):
             raise $EXC
 
+  # PR 399 CodeQL alerts 62 and 63, 2026-11-25. Text rule: it reads indentation, so the
+  # fixture module test_semgrep_rules.py (which embeds the shape in strings) is excluded.
+  # Reports a try (no else clause) whose last except handler ends with self.fail(...), when
+  # a name assigned in the try body is read after the try in the same block.
+  - id: try-fail-handler-then-read
+    languages: [python]
+    severity: ERROR
+    message: >-
+      Code scanning does not treat self.fail as ending an except handler, so a name bound
+      in the try body looks possibly unbound when read after the try. Move the reads into
+      an else clause of the try, or end the handler with a raise statement.
+    paths:
+      include:
+        - tests/
+      exclude:
+        - "**/tests/test_semgrep_rules.py"
+    pattern-regex: >-
+          (?mx)
+          ^(?P<i>[ \t]*)try:[ \t]*\n
+          (?:(?P=i)[ \t]+\S[^\n]*\n|[ \t]*\n)*?
+          (?P=i)[ \t]+(?P<n>[A-Za-z_]\w*)[ \t]*(?::[^=\n]+)?=(?!=)[^\n]*\n
+          (?:(?P=i)[ \t]+\S[^\n]*\n|[ \t]*\n)*?
+          (?:(?P=i)except\b[^\n]*:[ \t]*\n(?:(?P=i)[ \t]+\S[^\n]*\n|[ \t]*\n)*)*?
+          (?P=i)except\b[^\n]*:[ \t]*\n
+          (?:(?P=i)[ \t]+\S[^\n]*\n|[ \t]*\n)*?
+          (?P=i)(?P<h>[ \t]+)self\.fail\([^\n]*\n
+          (?:(?P=i)(?P=h)[ \t]+\S[^\n]*\n|(?P=i)(?P=h)\)[^\n]*\n|[ \t]*\n)*
+          (?!(?:[ \t]*\n)*(?:(?P=i)[ \t]+\S|(?P=i)(?:else|except|finally)\b))
+          (?:(?:(?P=i)[^\n]*)?\n)*?
+          (?P=i)[^\n]*\b(?P=n)\b
+

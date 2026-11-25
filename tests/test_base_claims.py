@@ -843,8 +843,9 @@ class BaseClaimsTest(unittest.TestCase):
                     numbers = base_claims._dependency_numbers([("body", text)])
                 except ValueError as error:
                     self.fail(f"unexpected ValueError: {error}")
-                self.assertEqual(claims, [(13, "bbbbbbb")])
-                self.assertEqual(numbers, [12, 13])
+                else:
+                    self.assertEqual(claims, [(13, "bbbbbbb")])
+                    self.assertEqual(numbers, [12, 13])
 
     def test_dependency_list_history_is_local_to_each_members_clauses(self) -> None:
         """Member history stays local and ordinary clause breaks retain their meaning."""
@@ -1899,7 +1900,8 @@ class BaseClaimsTest(unittest.TestCase):
                     actual = base_claims.find_dependency_claims(sentence)
                 except ValueError as error:
                     self.fail(f"unexpected ValueError: {error}")
-                self.assertEqual(actual, want)
+                else:
+                    self.assertEqual(actual, want)
 
     def test_dependency_allowlist_cli_and_chains(self) -> None:
         """Comma chains in see/unrelated prose pass while CLI modes reject unlisted shapes."""
@@ -1963,7 +1965,8 @@ class BaseClaimsTest(unittest.TestCase):
                     actual = base_claims.find_dependency_claims(sentence)
                 except ValueError as error:
                     self.fail(f"unexpected ValueError: {error}")
-                self.assertEqual(actual, want)
+                else:
+                    self.assertEqual(actual, want)
 
     def test_dependency_allowlist_refusal_numbers_are_unique(self) -> None:
         """Every allow-list refusal names each member reference number at most once."""
@@ -2012,8 +2015,17 @@ class BaseClaimsTest(unittest.TestCase):
             actual_numbers = base_claims._dependency_numbers([("body", sentence)])
         except ValueError as error:
             self.fail(f"unexpected ValueError: {error}")
-        self.assertEqual(actual_claims, claims)
-        self.assertEqual(actual_numbers, numbers)
+        else:
+            self.assertEqual(actual_claims, claims)
+            self.assertEqual(actual_numbers, numbers)
+
+    def test_scope_ok_case_reports_unexpected_value_error(self) -> None:
+        """The ok-case helper turns a ValueError into a test failure with its prefix."""
+        row = next(item for item in DEPENDENCY_SCOPE_CASES if item[0] == "b-refuse-hidden")
+        with self.assertRaises(AssertionError) as caught:
+            self.assert_scope_ok_case(None, None, row[4])
+        message = str(caught.exception)
+        self.assertTrue(message.startswith("unexpected ValueError: ambiguous dependency"), message)
 
     def test_dependency_scope_cases(self) -> None:
         """Typed brackets, member-local history, lead windows and separators match table."""

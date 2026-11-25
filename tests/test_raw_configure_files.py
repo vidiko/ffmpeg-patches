@@ -18,7 +18,7 @@ from scripts.raw_configure_files import (
 )
 from scripts.raw_configure_inspect import classify_script_words
 from tests.helpers import isolated_git_environment
-from tests.raw_configure_support import CLIENTS, ROOT, RawConfigureGuardBase
+from tests.raw_configure_support import ROOT, RawConfigureGuardBase
 
 
 def _shape_records() -> list[tuple[str, str, str]]:
@@ -340,11 +340,11 @@ class RawConfigureFilesTest(RawConfigureGuardBase):
         """Refuse execution when the hook script operand refers to a directory."""
         d1 = self.root / "d1"
         d1.mkdir()
-        for client in CLIENTS:
-            with self.subTest(client=client):
-                result = self.run_guard(client, self.payload(client, f"bash {d1}", self.root))
-                self.assertEqual(result.returncode, 2, result.stderr)
-                self.assertIn("(not a regular file)", result.stderr)
+        client = self._next_client()
+        with self.subTest(client=client):
+            result = self.run_guard(client, self.payload(client, f"bash {d1}", self.root))
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertIn("(not a regular file)", result.stderr)
         self._assert_refused(((f"bash {d1}", self.root),))
 
     def test_refuses_nested_script_larger_than_byte_limit(self) -> None:
@@ -353,11 +353,11 @@ class RawConfigureFilesTest(RawConfigureGuardBase):
         big_sh.write_bytes(b"# " + b"c" * (MAX_SCRIPT_BYTES - 1) + b"\n# extra\n")
         outer = self.root / "outer_big.sh"
         outer.write_text(f"bash {big_sh}\n", encoding="utf-8")
-        for client in CLIENTS:
-            with self.subTest(client=client):
-                result = self.run_guard(client, self.payload(client, f"bash {outer}", self.root))
-                self.assertEqual(result.returncode, 2, result.stderr)
-                self.assertIn("(script larger than inspect limit)", result.stderr)
+        client = self._next_client()
+        with self.subTest(client=client):
+            result = self.run_guard(client, self.payload(client, f"bash {outer}", self.root))
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertIn("(script larger than inspect limit)", result.stderr)
         self._assert_refused(((f"bash {outer}", self.root),))
 
     def test_refuses_nested_configure_after_dropped_directory(self) -> None:

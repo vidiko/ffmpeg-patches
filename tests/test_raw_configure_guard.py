@@ -22,6 +22,8 @@ from tests.raw_configure_support import CLIENTS, CONFIGS, ROOT, RawConfigureGuar
 class RawConfigureGuardTest(RawConfigureGuardBase):
     """Check command classification through each documented client payload."""
 
+    all_clients = True
+
     def test_refuses_configure_in_non_tree_directory(self) -> None:
         """Refuse direct configure invocations in directories without libavcodec."""
         cases = (
@@ -320,6 +322,8 @@ class RawConfigureGuardTest(RawConfigureGuardBase):
 
 class ReviewRoundGuardTest(RawConfigureGuardBase):
     """Exercise r9 sed data and the bounded inspection deadline."""
+
+    all_clients = True
 
     def test_sed_data_and_exec(self) -> None:
         """Allow literal sed edits and refuse explicit configure execution."""

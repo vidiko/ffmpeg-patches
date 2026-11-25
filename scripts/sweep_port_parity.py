@@ -45,6 +45,40 @@ SHADER_LOAD = re.compile(r"\b(?:imageLoad|texelFetch)\s*\(", re.ASCII)
 _LOOP_HEADER = re.compile(r"^\s*(?:for|while)\s*\(", re.ASCII)
 _FOR_LOOP = re.compile(r"^\s*for\b", re.ASCII)
 _OPERAND_OPS = 64
+_WHITESPACE = " \t\n\r"
+_MAX_LOADS = 64
+_MAX_STATEMENTS = 4096
+_USE_WINDOW = 32
+_SUFFIX_STEPS = 8
+_HELPER_DEFINITIONS = 8
+_CONTROL_WORDS = frozenset({"if", "for", "while", "switch", "return", "else"})
+_LOAD_SUFFIX = re.compile(r"\s*(?:\.[A-Za-z_]\w*|\[[^\]\[]*\])", re.ASCII)
+_LOAD_ASSIGN = re.compile(r"\A\s*(?:[A-Za-z_]\w*\s+)*([A-Za-z_]\w*)\s*=\s*\Z", re.ASCII)
+_UNWRAP_STEPS = 8
+_GLSL_CONSTRUCTORS = frozenset(
+    {
+        "bool",
+        "int",
+        "uint",
+        "float",
+        "double",
+        "bvec2",
+        "bvec3",
+        "bvec4",
+        "ivec2",
+        "ivec3",
+        "ivec4",
+        "uvec2",
+        "uvec3",
+        "uvec4",
+        "vec2",
+        "vec3",
+        "vec4",
+        "dvec2",
+        "dvec3",
+        "dvec4",
+    }
+)
 
 
 def pair_name(path: str) -> str | None:
@@ -188,7 +222,7 @@ def loop_header_bounds(statement: str) -> tuple[int, int] | None:
 def _skip_space(text: str, position: int, limit: int) -> int:
     """Advance past ASCII whitespace."""
     for index in range(position, limit):
-        if text[index] not in " \t\n\r":
+        if text[index] not in _WHITESPACE:
             return index
     return limit
 
@@ -287,7 +321,7 @@ def for_init_clause_end(statement: str, bounds: tuple[int, int]) -> int:
 def _non_space_index(statement: str, index: int, floor: int) -> int | None:
     """Return the highest index at or above floor that is not whitespace."""
     for idx in range(index, floor - 1, -1):
-        if statement[idx] not in " \t":
+        if statement[idx] not in _WHITESPACE:
             return idx
     return None
 
@@ -432,29 +466,218 @@ def normalization_kind(text: str) -> str | None:
     return None
 
 
-def cpu_sites(source: str) -> list[tuple[int, str]]:
-    """List sample-load normalization sites in one CPU filter source."""
+def statement_sites(masked: str, start: int, end: int) -> list[tuple[int, str]]:
+    """Classify every sample read of one statement span with its own operators and line."""
+    statement = masked[start:end]
     sites: list[tuple[int, str]] = []
-    masked = mask_literals(source)
-    for start, end in statement_spans(masked):
-        statement = masked[start:end]
-        read_match = SAMPLE_READ.search(statement)
-        if read_match is None:
-            continue
+    covered = 0
+    for count, read_match in enumerate(SAMPLE_READ.finditer(statement)):
         read_start = read_match.start()
-        read_end = sample_read_end(statement, read_start, read_match.end())
-        focus = normalization_focus(statement, read_start, read_end)
-        kind = normalization_kind(focus)
-        if kind is None:
+        if count >= _OPERAND_OPS:
+            break
+        if read_start < covered:
             continue
-        offset = start + read_match.start()
-        line_number = masked.count("\n", 0, offset) + 1
-        sites.append((line_number, kind))
+        read_end = sample_read_end(statement, read_start, read_match.end())
+        covered = read_end
+        kind = normalization_kind(normalization_focus(statement, read_start, read_end))
+        if kind is not None:
+            sites.append((masked.count("\n", 0, start + read_start) + 1, kind))
     return sites
 
 
+def cpu_sites(source: str) -> list[tuple[int, str]]:
+    """List sample-load normalization sites in one CPU filter source."""
+    sites: list[tuple[int, str]] = []
+    seen: set[tuple[int, str]] = set()
+    masked = mask_literals(source)
+    for start, end in statement_spans(masked):
+        for site in statement_sites(masked, start, end):
+            if site not in seen:
+                seen.add(site)
+                sites.append(site)
+    return sites
+
+
+def _load_end(statement: str, call_end: int) -> int:
+    """Extend a shader load call through swizzle, member and index suffixes."""
+    position = call_end
+    for _ in range(_SUFFIX_STEPS):
+        match = _LOAD_SUFFIX.match(statement, position)
+        if match is None:
+            break
+        position = match.end()
+    return position
+
+
+def shader_loads(statement: str) -> list[tuple[int, int]]:
+    """Return up to _MAX_LOADS shader load expression spans in one statement."""
+    loads: list[tuple[int, int]] = []
+    for match in SHADER_LOAD.finditer(statement):
+        if len(loads) >= _MAX_LOADS:
+            break
+        close_index = matching_close_paren(statement, match.end() - 1)
+        if close_index is not None:
+            loads.append((match.start(), _load_end(statement, close_index + 1)))
+    return loads
+
+
+def _wrapper_start(statement: str, open_index: int) -> int | None:
+    """Return where the grouping or type constructor of '(' starts, or None for a call."""
+    before = _non_space_index(statement, open_index - 1, 0)
+    if before is None or not (statement[before].isalnum() or statement[before] == "_"):
+        return open_index
+    span = _identifier_span_backward(statement, before, 0)
+    if span is None or statement[span[0] : span[1] + 1] not in _GLSL_CONSTRUCTORS:
+        return None
+    return span[0]
+
+
+def _unwrap_step(statement: str, start: int, end: int) -> tuple[int, int] | None:
+    """Grow an expression span by one wrapping pair of parentheses holding it alone."""
+    before = _non_space_index(statement, start - 1, 0)
+    after = _skip_space(statement, end, len(statement))
+    if before is None or after >= len(statement):
+        return None
+    if statement[before] != "(" or statement[after] != ")":
+        return None
+    if matching_close_paren(statement, before) != after:
+        return None
+    wrapper = _wrapper_start(statement, before)
+    return None if wrapper is None else (wrapper, _load_end(statement, after + 1))
+
+
+def unwrap_expression(statement: str, start: int, end: int) -> tuple[int, int]:
+    """Extend a load or use span outward through grouping parentheses and type constructors."""
+    for _ in range(_UNWRAP_STEPS):
+        grown = _unwrap_step(statement, start, end)
+        if grown is None:
+            break
+        start, end = grown
+    return (start, end)
+
+
+def _call_name_before(statement: str, open_index: int) -> str | None:
+    """Return the identifier directly before '(' at open_index."""
+    end = _non_space_index(statement, open_index - 1, 0)
+    span = None if end is None else _identifier_span_backward(statement, end, 0)
+    if span is None:
+        return None
+    return statement[span[0] : span[1] + 1]
+
+
+def _enclosing_call_name(statement: str, load_start: int) -> str | None:
+    """Return the function name whose argument list holds load_start, or None."""
+    depth = 0
+    for index in range(load_start - 1, -1, -1):
+        ch = statement[index]
+        if ch == ")":
+            depth += 1
+        elif ch == "(" and depth > 0:
+            depth -= 1
+        elif ch == "(":
+            name = _call_name_before(statement, index)
+            if name is not None:
+                return None if name in _CONTROL_WORDS else name
+    return None
+
+
+def _brace_body(masked: str, open_index: int) -> str | None:
+    """Return the text from the '{' at open_index through its balancing '}'."""
+    depth = 0
+    for index in range(open_index, len(masked)):
+        if masked[index] == "{":
+            depth += 1
+        elif masked[index] == "}":
+            depth -= 1
+            if depth == 0:
+                return masked[open_index : index + 1]
+    return None
+
+
+def _helper_applies(masked: str, name: str, pattern: re.Pattern[str]) -> bool:
+    """Return whether a function with a body named name matches the pattern."""
+    definition = re.compile(rf"\b[A-Za-z_]\w*\s+{re.escape(name)}\s*\([^;{{}}]*\)\s*\{{", re.ASCII)
+    for count, match in enumerate(definition.finditer(masked)):
+        if count >= _HELPER_DEFINITIONS:
+            break
+        body = _brace_body(masked, match.end() - 1)
+        if body is not None and pattern.search(body):
+            return True
+    return False
+
+
+def _assigned_name(statement: str, load_start: int, load_end: int) -> str | None:
+    """Return the simple name that receives the whole load expression."""
+    if statement[load_end:].strip(_WHITESPACE + ";"):
+        return None
+    match = _LOAD_ASSIGN.match(statement[:load_start])
+    return None if match is None else match[1]
+
+
+def _statement_use_matches(statement: str, name: str, pattern: re.Pattern[str]) -> bool:
+    """Return whether a non-member use of name in the statement carries the pattern."""
+    index = 0
+    for _ in range(_OPERAND_OPS):
+        hit = statement.find(name, index)
+        if hit < 0:
+            return False
+        index = hit + 1
+        if not _whole_word_at(statement, hit, name) or _follows_member_operator(statement, hit, 0):
+            continue
+        use_end = _load_end(statement, hit + len(name))
+        use_start, use_end = unwrap_expression(statement, hit, use_end)
+        if pattern.search(normalization_focus(statement, use_start, use_end)):
+            return True
+    return False
+
+
+def _use_normalized(
+    masked: str,
+    spans: list[tuple[int, int]],
+    index: int,
+    name: str,
+    pattern: re.Pattern[str],
+) -> bool:
+    """Return whether a later use of name in the same block carries the pattern."""
+    depth = 0
+    for follow in range(index + 1, min(len(spans), index + 1 + _USE_WINDOW)):
+        statement = masked[spans[follow][0] : spans[follow][1]]
+        if _statement_use_matches(statement, name, pattern):
+            return True
+        if statement.endswith("{"):
+            depth += 1
+        elif statement.endswith("}"):
+            if depth == 0:
+                return False
+            depth -= 1
+    return False
+
+
+def _load_normalized(
+    masked: str,
+    spans: list[tuple[int, int]],
+    load: tuple[int, int, int],
+    pattern: re.Pattern[str],
+    helpers: dict[str, bool],
+) -> bool:
+    """Return whether the pattern acts on a (statement index, start, end) load result."""
+    index, load_start, load_end = load
+    statement = masked[spans[index][0] : spans[index][1]]
+    load_start, load_end = unwrap_expression(statement, load_start, load_end)
+    if pattern.search(normalization_focus(statement, load_start, load_end)):
+        return True
+    caller = _enclosing_call_name(statement, load_start)
+    if caller is not None:
+        if caller not in helpers:
+            helpers[caller] = _helper_applies(masked, caller, pattern)
+        if helpers[caller]:
+            return True
+    name = _assigned_name(statement, load_start, load_end)
+    return name is not None and _use_normalized(masked, spans, index, name, pattern)
+
+
 def shader_site(shader_path: str, source: str, kind: str) -> str | None:
-    """Return the first shader file:line that applies the same normalization kind."""
+    """Return the first shader file:line whose load result gets the same normalization kind."""
     checks = {
         "mask": MASK,
         "shift": SHIFT,
@@ -464,13 +687,14 @@ def shader_site(shader_path: str, source: str, kind: str) -> str | None:
     pattern = checks.get(kind)
     if pattern is None:
         return None
-    body = mask_literals(source).splitlines()
-    for line_number in range(1, len(body) + 1):
-        if not SHADER_LOAD.search(body[line_number - 1]):
-            continue
-        window = "\n".join(body[max(0, line_number - 4) : min(len(body), line_number + 6)])
-        if pattern.search(window):
-            return f"{shader_path}:{line_number}"
+    masked = mask_literals(source)
+    spans = statement_spans(masked)
+    helpers: dict[str, bool] = {}
+    for index, (start, end) in enumerate(spans[:_MAX_STATEMENTS]):
+        for load_start, load_end in shader_loads(masked[start:end]):
+            if _load_normalized(masked, spans, (index, load_start, load_end), pattern, helpers):
+                line_number = masked.count("\n", 0, start + load_start) + 1
+                return f"{shader_path}:{line_number}"
     return None
 
 

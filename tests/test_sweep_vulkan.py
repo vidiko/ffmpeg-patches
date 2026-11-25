@@ -178,6 +178,16 @@ void main() { norm(imageLoad(img, ivec2(0)).x); }
 """
 
 
+def cpu_line_source(line: str) -> str:
+    """Return a CPU source whose only statement text sits on line 3."""
+    return f"void f(void)\n{{\n    {line}\n}}\n"
+
+
+def shader_line_source(*lines: str) -> str:
+    """Return a shader source whose body statements start on line 3."""
+    return "void main()\n{\n" + "".join(f"    {line}\n" for line in lines) + "}\n"
+
+
 R6_T3_VKXML = """\
 <registry>
   <spirvcapabilities>
@@ -641,6 +651,23 @@ class VulkanSweepTest(unittest.TestCase):
         )
         report = self.parity_report(head)
         self.assertRegex(report, r"libavfilter/vulkan/test\.comp\.glsl:\d+")
+
+    def test_cr21b_shader_mask_on_unrelated_value_reports_none(self) -> None:
+        """Port-parity reports none when the only shader mask acts on an unrelated value."""
+        cpu = "void f(const uint16_t *src) { uint16_t v = src[0] & 0xFFF0u; (void)v; }\n"
+        c_vulkan = "extern const unsigned char ff_test_comp_spv_data[];\nint f(void){return 0;}\n"
+        shader = MASK_SHADER.replace(
+            "void main() { imageLoad(img, ivec2(0)); }\n",
+            "void main()\n{\n    uvec4 px = imageLoad(img, ivec2(0));\n"
+            "    uint flags = u.bits & 0xFFu;\n}\n",
+        ).replace("raw >> 4u", "raw")
+        head = self.commit_filter(
+            c_vulkan=c_vulkan,
+            shader_name="test.comp.glsl",
+            shader=shader,
+            cpu=cpu,
+        )
+        self.assertIn("| mask | none |", self.parity_report(head))
 
     def test_port_parity_no_pair_in_diff(self) -> None:
         """Port-parity emits no hits when the diff does not touch a CPU/Vulkan pair."""
@@ -1647,6 +1674,270 @@ class VulkanSweepTest(unittest.TestCase):
             with self.subTest(label=label):
                 self.assertEqual(sweep_port_parity.cpu_sites(source), expected)
 
+    def test_cr21b_for_init_member_split_across_lines_ignored(self) -> None:
+        """CR21B F1: a line break after a member operator still marks a member access."""
+        cases = [
+            (
+                "arrow_newline",
+                cpu_line_source("for (int v = src[0]; (p->\nv & 0xff) != 0; v++) {}"),
+                [],
+            ),
+            (
+                "arrow_crlf",
+                cpu_line_source("for (int v = src[0]; (p->\r\nv & 0xff) != 0; v++) {}"),
+                [],
+            ),
+            (
+                "dot_newline",
+                cpu_line_source("for (int v = src[0]; (s.\n    v & 0xff) != 0; v++) {}"),
+                [],
+            ),
+            (
+                "real_split_use",
+                cpu_line_source("for (int v = src[0];\n    (v & 0xff) != 0; v++) {}"),
+                [(3, "mask")],
+            ),
+        ]
+        for label, source, expected in cases:
+            with self.subTest(label=label):
+                self.assertEqual(sweep_port_parity.cpu_sites(source), expected)
+
+    def test_cr21b_for_init_declarator_line_breaks_bind(self) -> None:
+        """CR21B F2: line breaks inside the for-init declarator keep the binding."""
+        cases = [
+            (
+                "after_type",
+                cpu_line_source("for (int\n    v = src[0]; (v & 0xff) != 0; v++) {}"),
+                [(4, "mask")],
+            ),
+            (
+                "before_equals",
+                cpu_line_source("for (int v\n    = src[0]; (v & 0xff) != 0; v++) {}"),
+                [(4, "mask")],
+            ),
+            (
+                "after_type_crlf",
+                cpu_line_source("for (int\r\n    v = src[0]; (v & 0xff) != 0; v++) {}"),
+                [(4, "mask")],
+            ),
+            (
+                "after_comma",
+                cpu_line_source("for (int a = 0,\n    v = src[0]; (v & 0xff) != 0; v++) {}"),
+                [(4, "mask")],
+            ),
+            (
+                "one_line",
+                cpu_line_source("for (int v = src[0]; (v & 0xff) != 0; v++) {}"),
+                [(3, "mask")],
+            ),
+        ]
+        for label, source, expected in cases:
+            with self.subTest(label=label):
+                self.assertEqual(sweep_port_parity.cpu_sites(source), expected)
+
+    def test_cr21b_every_sample_read_in_statement_classified(self) -> None:
+        """CR21B F3: each sample read of one statement is classified with its own operators."""
+        cases = [
+            (
+                "second_read_mask",
+                cpu_line_source("dst[0] = src[0] + (src[1] & 0xff);"),
+                [(3, "mask")],
+            ),
+            (
+                "second_read_shift",
+                cpu_line_source("dst[0] = src[0] + (src[1] >> 4);"),
+                [(3, "shift")],
+            ),
+            (
+                "macro_then_shift",
+                cpu_line_source("dst[0] = AV_RN16(p) + (src[1] >> 4);"),
+                [(3, "shift")],
+            ),
+            (
+                "mask_and_shift",
+                cpu_line_source("dst[0] = (src[0] & 0xff) + (src[1] >> 4);"),
+                [(3, "mask"), (3, "shift")],
+            ),
+            (
+                "same_kind_once",
+                cpu_line_source("dst[0] = (src[0] & 0xff) + (src[1] & 0x0f);"),
+                [(3, "mask")],
+            ),
+            (
+                "read_line_of_each_read",
+                "void f(void)\n{\n    dst[0] = src[0] +\n        (src[1] >> 4);\n}\n",
+                [(4, "shift")],
+            ),
+        ]
+        for label, source, expected in cases:
+            with self.subTest(label=label):
+                self.assertEqual(sweep_port_parity.cpu_sites(source), expected)
+
+    def test_cr21b_shader_site_follows_load_result(self) -> None:
+        """CR21B F4: shader normalization counts only when it acts on the load result."""
+        far_helper = (
+            "uint load(uint raw) { return raw & 0xFFF0u; }\n"
+            + "\n" * 6
+            + "void main() { load(imageLoad(img, ivec2(0)).x); }\n"
+        )
+        cases = [
+            (
+                "mask_on_other_value",
+                shader_line_source("vec4 px = imageLoad(img, pos);", "uint flags = u.bits & 0xff;"),
+                "mask",
+                None,
+            ),
+            (
+                "mask_on_other_operand",
+                shader_line_source("uint a = imageLoad(img, pos).r + (pc.flags & 0xff);"),
+                "mask",
+                None,
+            ),
+            ("far_helper", far_helper, "mask", "s.comp.glsl:8"),
+            (
+                "direct_mask",
+                shader_line_source("uint px = imageLoad(img, pos).r & 0xff;"),
+                "mask",
+                "s.comp.glsl:3",
+            ),
+            (
+                "variable_mask",
+                shader_line_source("uvec4 px = imageLoad(img, pos);", "uint m = px.r & 0xffu;"),
+                "mask",
+                "s.comp.glsl:3",
+            ),
+            (
+                "mask_on_other_name",
+                shader_line_source("uvec4 px = imageLoad(img, pos);", "uint m = q.r & 0xffu;"),
+                "mask",
+                None,
+            ),
+        ]
+        for label, source, kind, expected in cases:
+            with self.subTest(label=label):
+                self.assertEqual(
+                    sweep_port_parity.shader_site("s.comp.glsl", source, kind), expected
+                )
+
+    def test_cr21b_shader_site_follows_load_result_scopes(self) -> None:
+        """CR21B F4: shader normalization through helpers and variable scopes follows the load."""
+        cases = [
+            ("masked_helper", MASKED_SHADER, "mask", "s.comp.glsl:6"),
+            (
+                "mask_on_dot_member_of_name",
+                shader_line_source("uvec4 px = imageLoad(img, pos);", "uint m = s.px & 0xffu;"),
+                "mask",
+                None,
+            ),
+            (
+                "mask_on_arrow_member_of_name",
+                shader_line_source("uvec4 px = imageLoad(img, pos);", "uint m = s->px & 0xffu;"),
+                "mask",
+                None,
+            ),
+            (
+                "mask_after_block_closed",
+                shader_line_source(
+                    "uvec4 px = imageLoad(img, pos);", "}", "uint m = px.r & 0xffu;"
+                ),
+                "mask",
+                None,
+            ),
+            ("second_masked_helper", SECOND_MASKED_SHADER, "mask", "s.comp.glsl:6"),
+            ("shift_only_shader_has_no_mask", MASK_SHADER, "mask", None),
+        ]
+        for label, source, kind, expected in cases:
+            with self.subTest(label=label):
+                self.assertEqual(
+                    sweep_port_parity.shader_site("s.comp.glsl", source, kind), expected
+                )
+
+    def test_cr21c_shader_site_follows_wrapped_load(self) -> None:
+        """CR21C F5: a load or a use of its variable counts through parentheses and constructors."""
+        cases = [
+            (
+                "constructor_around_load_swizzle",
+                shader_line_source("uint px = uint(imageLoad(img, pos).r) & 0xffu;"),
+                "mask",
+            ),
+            (
+                "constructor_around_load_variable",
+                shader_line_source(
+                    "uvec4 px = uvec4(imageLoad(img, pos));", "uint m = px.r & 0xffu;"
+                ),
+                "mask",
+            ),
+            (
+                "grouping_around_load_swizzle",
+                shader_line_source("uint px = (imageLoad(img, pos).r) & 0xffu;"),
+                "mask",
+            ),
+            (
+                "signed_constructor_texel_fetch",
+                shader_line_source("int v = int(texelFetch(tex, pos, 0).x) & 0xff;"),
+                "mask",
+            ),
+            (
+                "constructor_around_variable_use",
+                shader_line_source(
+                    "uvec4 px = imageLoad(img, pos);", "uint m = uint(px.r) & 0xffu;"
+                ),
+                "mask",
+            ),
+            (
+                "constructor_shift",
+                shader_line_source("uint v = uint(imageLoad(img, pos).r) >> 4u;"),
+                "shift",
+            ),
+            (
+                "unwrapped_direct_mask",
+                shader_line_source("uint px = imageLoad(img, pos).r & 0xff;"),
+                "mask",
+            ),
+            (
+                "unwrapped_variable_mask",
+                shader_line_source("uvec4 px = imageLoad(img, pos);", "uint m = px.r & 0xffu;"),
+                "mask",
+            ),
+        ]
+        for label, source, kind in cases:
+            with self.subTest(label=label):
+                self.assertEqual(
+                    sweep_port_parity.shader_site("s.comp.glsl", source, kind), "s.comp.glsl:3"
+                )
+
+    def test_cr21c_shader_site_wrapped_other_value_reports_none(self) -> None:
+        """CR21C F5: a call, another value or a larger constructor is not the load result."""
+        cases = [
+            (
+                "call_not_constructor",
+                shader_line_source("uint px = pack(imageLoad(img, pos).r) & 0xffu;"),
+                "mask",
+            ),
+            (
+                "constructor_masks_other_value",
+                shader_line_source("uint a = imageLoad(img, pos).r + uint(pc.flags & 0xff);"),
+                "mask",
+            ),
+            (
+                "constructor_holds_more_than_load",
+                shader_line_source(
+                    "uvec2 px = uvec2(imageLoad(img, pos).r, q);", "uint m = px.x & 0xffu;"
+                ),
+                "mask",
+            ),
+            (
+                "shift_on_other_constructed_value",
+                shader_line_source(
+                    "vec4 c = imageLoad(img, pos);", "uint v = uint(pc.flags) >> 4u;"
+                ),
+                "shift",
+            ),
+        ]
+        for label, source, kind in cases:
+            with self.subTest(label=label):
+                self.assertIsNone(sweep_port_parity.shader_site("s.comp.glsl", source, kind))
+
     def test_cr10_4658985429_linked_shaders_dedupes_repeated_symbols(self) -> None:
         """CR10-5429: repeated extern and use symbols link one shader path in first-seen order."""
         c_source = (
@@ -2487,8 +2778,8 @@ class PortParityMutantTest(VulkanMutantHarness):
 
         self.assert_mutant_kills(
             "scripts/sweep_port_parity.py",
-            "if pattern.search(window):",
-            "if False and pattern.search(window):",
+            "if _load_normalized(",
+            "if False and _load_normalized(",
             real,
             mutant,
         )

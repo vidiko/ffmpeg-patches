@@ -45,6 +45,9 @@
 Exit status: 0 on success, 1 on findings or a failed apply, 2 when the
 tool cannot run (unreadable series files, unusable checkout).
 
+MAX_RELATED_AUTHOR_CHARS bounds related authors to 256 nonblank printable
+characters; controls and line separators are rejected.
+
 Every git call runs without global or system configuration, so user
 settings (apply.whitespace, am.keepcr, format.*, hooks) cannot change what
 is applied or exported.
@@ -56,6 +59,7 @@ import argparse
 import bisect
 import contextlib
 import functools
+import itertools
 import json
 import os
 import re
@@ -105,6 +109,16 @@ REQUIRED_EXCEPTION_KEYS = {
 }
 VALID_CATEGORIES = {"A", "B", "C", "D"}
 CATEGORY_INTERVALS = {"B": 3, "C": 10, "D": 120}
+GOES_UPSTREAM_TRIGGER = "revisit when the patch goes upstream"
+GOES_UPSTREAM_PATTERN = re.compile(rf"\b{re.escape(GOES_UPSTREAM_TRIGGER)}\b", re.ASCII)
+GOES_UPSTREAM_LIVE_STATUSES = ("unsubmitted", "submitted")
+MERGE_TRIGGER_PATTERN = re.compile(r"\brevisit at the (\d+) merge\b", re.ASCII)
+MERGE_TRIGGER_LIVE_STATES = ("open",)
+REVISIT_FIRED_PREFIX = "revisit trigger fired"
+MAX_TRIGGER_MATCHES = 32
+MAX_SERIES_EXCEPTIONS = 4096
+MAX_CONTRIBUTION_ENTRIES = 4096
+MAX_REASON_SCAN_CHARS = 4096
 DIFF_HUNK = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
 PATCH_NAME = re.compile(r"^(\d{4})-([A-Za-z0-9._-]+)\.patch$")
 FROM_LINE = re.compile(r"^From [0-9a-f]{40} Mon Sep 17 00:00:00 2001$")
@@ -129,6 +143,13 @@ CONTRIBUTION_KEYS = (
     "project",
     "note",
 )
+OPTIONAL_CONTRIBUTION_KEYS = ("fixes_issues", "related")
+RELATED_KEYS = ("number", "kind", "author", "reason", "state", "seen")
+RELATED_KINDS = ("pull", "issue")
+RELATED_REASONS = ("same-files", "same-patch-id", "same-subject")
+MAX_FIXES_ISSUES = 64
+MAX_RELATED_AUTHOR_CHARS = 256
+MAX_RELATED = 256
 # Patch status in the metadata -> state of its pull request on the forge.
 FORGE_STATES = {"submitted": "open", "merged": "merged", "rejected": "closed"}
 DAY = re.compile(r"^\d{4}-\d{2}-\d{2}$")
@@ -468,20 +489,140 @@ def check_exception_entry(
     return pair
 
 
-def check_exceptions_metadata(data: dict, name: str, findings: Findings, today: date) -> None:
+def check_exceptions_metadata(
+    data: dict[str, object], name: str, findings: Findings, today: date
+) -> None:
+    """Validate the sidecar exceptions table list, its entry cap and duplicate keys."""
     if "exceptions" not in data:
         return
     exceptions = data["exceptions"]
     if not isinstance(exceptions, list):
         findings.error(name, "'exceptions' must be an array of tables")
         return
+    if len(exceptions) > MAX_SERIES_EXCEPTIONS:
+        findings.error(name, f"'exceptions' exceeds cap of {MAX_SERIES_EXCEPTIONS}")
     seen_pairs: set[tuple[str, str]] = set()
-    for entry in exceptions:
+    for entry in exceptions[:MAX_SERIES_EXCEPTIONS]:
         pair = check_exception_entry(entry, name, findings, today)
         if pair is not None:
             if pair in seen_pairs:
                 findings.error(name, f"duplicate exception for ({pair[0]}, {pair[1]})")
             seen_pairs.add(pair)
+
+
+def _parse_contribution_states(
+    entries: list[object], record_path: Path
+) -> tuple[dict[int, str] | None, str | None]:
+    """Map contribution numbers to states, rejecting oversized or malformed lists."""
+    if len(entries) > MAX_CONTRIBUTION_ENTRIES:
+        return (
+            None,
+            f"unreadable record {record_path}: exceeds {MAX_CONTRIBUTION_ENTRIES} entries",
+        )
+    states: dict[int, str] = {}
+    for item in entries[:MAX_CONTRIBUTION_ENTRIES]:
+        if not isinstance(item, dict):
+            return None, f"unreadable record {record_path}: contribution entry is not an object"
+        number = item.get("number")
+        state = item.get("state")
+        if type(number) is not int or number <= 0 or not isinstance(state, str):
+            return None, f"unreadable record {record_path}: malformed contribution entry"
+        if number in states:
+            return None, f"unreadable record {record_path}: duplicate contribution {number}"
+        states[number] = state
+    return states, None
+
+
+def _read_contribution_states(record_path: Path) -> tuple[dict[int, str] | None, str | None]:
+    """Read contribution states from record_path, returning (states, error_detail)."""
+    if not record_path.is_file():
+        return None, f"missing record {record_path}"
+    try:
+        raw = record_path.read_text(encoding="utf-8")
+        data = json.loads(raw, object_pairs_hook=refuse_duplicates)
+    except (OSError, UnicodeDecodeError, ValueError) as exc:
+        return None, f"unreadable record {record_path}: {exc}"
+    if not isinstance(data, dict) or not isinstance(data.get("contributions"), list):
+        return None, f"unreadable record {record_path}: invalid contributions list"
+    return _parse_contribution_states(data["contributions"], record_path)
+
+
+def _revisit_trigger_error(entry: dict[str, object], trigger: str, cause: str) -> str:
+    """Format one fired revisit-trigger diagnostic with its rule, function and fix."""
+    return (
+        f"exception ({entry.get('rule')}, {entry.get('function')}): "
+        f"{REVISIT_FIRED_PREFIX} for {trigger!r} ({cause}); "
+        "restate the reason and its revisit trigger"
+    )
+
+
+def _revisit_trigger_cap_error(entry: dict[str, object]) -> str:
+    """Format one merge revisit-trigger cap error with its rule, function and limit."""
+    return (
+        f"exception ({entry.get('rule')}, {entry.get('function')}): "
+        f"more than {MAX_TRIGGER_MATCHES} merge revisit triggers in one reason; "
+        "shorten the reason"
+    )
+
+
+def _merge_trigger_cause(
+    number: int, states: dict[int, str] | None, record_error: str | None
+) -> str | None:
+    """Return the firing cause for a numbered merge trigger, or None while live."""
+    if record_error is not None or states is None:
+        return record_error or f"missing record {CONTRIBUTIONS}"
+    if number not in states:
+        return f"record {number} is not listed in {CONTRIBUTIONS}"
+    state = states[number]
+    if state not in MERGE_TRIGGER_LIVE_STATES:
+        return f"record {number} state is {state!r}"
+    return None
+
+
+def _reason_revisit_errors(
+    entry: dict[str, object],
+    status: object,
+    record_path: Path,
+    record_cache: list[tuple[dict[int, str] | None, str | None]],
+) -> list[str]:
+    """Return revisit-trigger and trigger-cap errors for one exception entry."""
+    reason = entry.get("reason")
+    if not isinstance(reason, str):
+        return []
+    bounded = reason[:MAX_REASON_SCAN_CHARS]
+    errors: list[str] = []
+    if GOES_UPSTREAM_PATTERN.search(bounded) and status not in GOES_UPSTREAM_LIVE_STATUSES:
+        errors.append(
+            _revisit_trigger_error(entry, GOES_UPSTREAM_TRIGGER, f"sidecar status is {status!r}")
+        )
+    matches = tuple(
+        itertools.islice(MERGE_TRIGGER_PATTERN.finditer(bounded), MAX_TRIGGER_MATCHES + 1)
+    )
+    for match in matches[:MAX_TRIGGER_MATCHES]:
+        if not record_cache:
+            record_cache.append(_read_contribution_states(record_path))
+        states, record_error = record_cache[0]
+        cause = _merge_trigger_cause(int(match.group(1)), states, record_error)
+        if cause is not None:
+            errors.append(_revisit_trigger_error(entry, match.group(0), cause))
+    if len(matches) > MAX_TRIGGER_MATCHES:
+        errors.append(_revisit_trigger_cap_error(entry))
+    return errors
+
+
+def check_revisit_triggers(data: dict[str, object], path: Path, findings: Findings) -> None:
+    """Report exception reasons whose upstream or pull-request revisit trigger has fired."""
+    exceptions = data.get("exceptions")
+    if not isinstance(exceptions, list):
+        return
+    status = data.get("status")
+    record_path = path.parent.parent / CONTRIBUTIONS
+    record_cache: list[tuple[dict[int, str] | None, str | None]] = []
+    for entry in exceptions[:MAX_SERIES_EXCEPTIONS]:
+        if not isinstance(entry, dict):
+            continue
+        for message in _reason_revisit_errors(entry, status, record_path, record_cache):
+            findings.error(path.name, message)
 
 
 def check_metadata(path: Path, findings: Findings, today: date | None = None) -> None:
@@ -514,6 +655,7 @@ def check_metadata(path: Path, findings: Findings, today: date | None = None) ->
     check_master_metadata(data, name, findings)
     check_covered_by(data, name, findings)
     check_exceptions_metadata(data, name, findings, today)
+    check_revisit_triggers(data, path, findings)
 
 
 def check_covered_by(data: dict, name: str, findings: Findings) -> None:
@@ -666,14 +808,125 @@ def read_contributions(root: Path, findings: Findings) -> dict | None:
     return data
 
 
+def _valid_day(raw: object) -> bool:
+    """Return True when raw is a calendar YYYY-MM-DD date string."""
+    if not isinstance(raw, str) or not DAY.fullmatch(raw):
+        return False
+    try:
+        date.fromisoformat(raw)
+    except ValueError:
+        return False
+    return True
+
+
+def check_fixes_issues(entry: dict, where: str, findings: Findings) -> None:
+    """Validate the optional fixes_issues list on a contribution record."""
+    if "fixes_issues" not in entry:
+        return
+    issues = entry["fixes_issues"]
+    if not isinstance(issues, list):
+        findings.error(where, "'fixes_issues' must be a list")
+        return
+    if len(issues) > MAX_FIXES_ISSUES:
+        findings.error(where, f"'fixes_issues' exceeds cap of {MAX_FIXES_ISSUES}")
+        return
+    for item in issues[:MAX_FIXES_ISSUES]:
+        if not isinstance(item, int) or isinstance(item, bool) or item <= 0:
+            findings.error(where, "'fixes_issues' items must be positive integers")
+            return
+    if len(set(issues)) != len(issues):
+        findings.error(where, "'fixes_issues' must not contain duplicates")
+    if issues != sorted(issues):
+        findings.error(where, "'fixes_issues' must be sorted by number")
+
+
+def valid_related_author(raw: object) -> bool:
+    """Allow bounded nonblank printable account text, excluding controls and line separators."""
+    return (
+        isinstance(raw, str)
+        and 0 < len(raw) <= MAX_RELATED_AUTHOR_CHARS
+        and bool(raw.strip())
+        and all(char.isprintable() for char in raw[:MAX_RELATED_AUTHOR_CHARS])
+    )
+
+
+def _check_related_fields(item: dict, where: str, findings: Findings) -> None:
+    """Validate the field values of a related object whose required keys are present."""
+    for field_name, allowed in (
+        ("kind", RELATED_KINDS),
+        ("reason", RELATED_REASONS),
+        ("state", tuple(FORGE_STATES.values())),
+    ):
+        value = item[field_name]
+        if not isinstance(value, str) or value not in allowed:
+            findings.error(
+                where, f"'related' field {field_name!r} must be one of {', '.join(allowed)}"
+            )
+    author = item["author"]
+    if not valid_related_author(author):
+        findings.error(
+            where,
+            f"'related' field 'author' must be nonblank printable text of at most "
+            f"{MAX_RELATED_AUTHOR_CHARS} characters",
+        )
+    if not _valid_day(item["seen"]):
+        findings.error(where, "'related' field 'seen' must be a YYYY-MM-DD date")
+
+
+def check_related_item(item: object, where: str, findings: Findings) -> int | None:
+    """Validate one object of a contribution's related list and return its number."""
+    if not isinstance(item, dict):
+        findings.error(where, "'related' items must be objects")
+        return None
+    before = len(findings.errors)
+    for key in sorted(set(item) - set(RELATED_KEYS))[:MAX_RELATED]:
+        findings.error(where, f"'related' has unknown key {key!r}")
+    for key in RELATED_KEYS:
+        if key not in item:
+            findings.error(where, f"'related' lacks key {key!r}")
+    if len(findings.errors) != before:
+        return None
+    number = item["number"]
+    if not isinstance(number, int) or isinstance(number, bool) or number <= 0:
+        findings.error(where, "'related' field 'number' must be a positive integer")
+    _check_related_fields(item, where, findings)
+    return (
+        number if isinstance(number, int) and not isinstance(number, bool) and number > 0 else None
+    )
+
+
+def check_related(entry: dict, where: str, findings: Findings) -> None:
+    """Validate the optional related list on a contribution record."""
+    if "related" not in entry:
+        return
+    related = entry["related"]
+    if not isinstance(related, list):
+        findings.error(where, "'related' must be a list")
+        return
+    if len(related) > MAX_RELATED:
+        findings.error(where, f"'related' exceeds cap of {MAX_RELATED}")
+        return
+    numbers: list[int] = []
+    for item in related[:MAX_RELATED]:
+        num = check_related_item(item, where, findings)
+        if num is not None:
+            numbers.append(num)
+    if len(numbers) == len(related):
+        if len(set(numbers)) != len(numbers):
+            findings.error(where, "'related' must not contain duplicate numbers")
+        if numbers != sorted(numbers):
+            findings.error(where, "'related' must be sorted by number")
+
+
 def entry_shape_ok(entry: object, position: int, findings: Findings) -> bool:
-    """Exactly the known keys, `number` an integer, every other value a string."""
+    """Validate required and optional contribution keys, types and list invariants."""
     where = f"{CONTRIBUTIONS}: entry {position}"
     if not isinstance(entry, dict):
         findings.error(where, "is not an object")
         return False
     before = len(findings.errors)
-    for key in sorted(set(entry) - set(CONTRIBUTION_KEYS)):
+    allowed = set(CONTRIBUTION_KEYS) | set(OPTIONAL_CONTRIBUTION_KEYS)
+    for key in sorted(set(entry) - allowed)[:MAX_RELATED]:
         findings.error(where, f"unknown key {key!r}")
     for key in CONTRIBUTION_KEYS:
         if key not in entry:
@@ -682,6 +935,8 @@ def entry_shape_ok(entry: object, position: int, findings: Findings) -> bool:
             findings.error(where, "'number' must be an integer")
         elif key != "number" and not isinstance(entry[key], str):
             findings.error(where, f"{key!r} must be a string")
+    check_fixes_issues(entry, where, findings)
+    check_related(entry, where, findings)
     return len(findings.errors) == before
 
 

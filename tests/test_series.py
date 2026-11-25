@@ -9,7 +9,6 @@ import contextlib
 import hashlib
 import io
 import json
-import os
 import re
 import shlex
 import shutil
@@ -24,6 +23,7 @@ from pathlib import Path
 
 from scripts import release_guard, series
 from tests.helpers import init_upstream, run_git
+from tests.make_env import make_environment
 
 LINES = [f"int line_{n} = {n};" for n in range(1, 41)]
 METADATA = 'status = "submitted"\nupstream = "https://example.invalid/pulls/1"\nconsumers = ["a"]\n'
@@ -2309,6 +2309,151 @@ class ContributionsTest(SeriesTestCase):
         self.assertEqual((status, out), (1, ""))
         self.assertIn("series.txt", err)
 
+    def related_item(self, number: int = 10, **changes: object) -> dict[str, object]:
+        """Build a valid related object for contribution schema tests."""
+        base: dict[str, object] = {
+            "number": number,
+            "kind": "pull",
+            "author": "other",
+            "reason": "same-files",
+            "state": "open",
+            "seen": "2026-11-12",
+        }
+        return base | changes
+
+    def test_valid_fixes_issues_and_related_pass_without_changing_table(self) -> None:
+        """Accept a contribution entry carrying valid fixes_issues and related lists."""
+        before_table = self.run_main()[1]
+        related = [
+            self.related_item(10, kind="issue", reason="same-subject", state="closed"),
+            self.related_item(20, kind="pull", reason="same-files", state="open"),
+            self.related_item(30, kind="pull", reason="same-patch-id", state="merged"),
+        ]
+        first = self.fx.record(1, fixes_issues=[100, 200], related=related)
+        self.assertEqual(self.check_with([first, self.fx.record(2)]).errors, [])
+        self.assertEqual(self.run_main()[1], before_table)
+
+    def test_fixes_issues_rules_fail_with_position_and_field(self) -> None:
+        """Reject malformed fixes_issues types, non-positive values, duplicates, order and cap."""
+        cases = (
+            ("not-a-list", "entry 1: 'fixes_issues' must be a list"),
+            ([0], "entry 1: 'fixes_issues' items must be positive integers"),
+            ([-3], "entry 1: 'fixes_issues' items must be positive integers"),
+            (["1"], "entry 1: 'fixes_issues' items must be positive integers"),
+            ([True], "entry 1: 'fixes_issues' items must be positive integers"),
+            ([False], "entry 1: 'fixes_issues' items must be positive integers"),
+            ([1.0], "entry 1: 'fixes_issues' items must be positive integers"),
+            ([None], "entry 1: 'fixes_issues' items must be positive integers"),
+            ([5, 5], "entry 1: 'fixes_issues' must not contain duplicates"),
+            ([9, 4], "entry 1: 'fixes_issues' must be sorted by number"),
+            (
+                list(range(1, series.MAX_FIXES_ISSUES + 2)),
+                f"entry 1: 'fixes_issues' exceeds cap of {series.MAX_FIXES_ISSUES}",
+            ),
+        )
+        for value, expected in cases:
+            with self.subTest(value=value):
+                entries = [self.fx.record(1, fixes_issues=value), self.fx.record(2)]
+                self.assert_error(self.check_with(entries, render=False), expected)
+
+    def test_related_number_rejects_nonintegers_without_returning_them(self) -> None:
+        """Invalid related numbers report an error and return None independently."""
+        for value in (True, False, 1.0, None, 0, -1):
+            with self.subTest(value=value):
+                findings = series.Findings()
+                result = series.check_related_item(
+                    self.related_item(1) | {"number": value}, "entry 1", findings
+                )
+                self.assert_error(findings, "'number' must be a positive integer")
+                self.assertIsNone(result)
+
+    def test_related_number_accepts_positive_integer(self) -> None:
+        """The smallest positive related number returns unchanged without findings."""
+        findings = series.Findings()
+        result = series.check_related_item(self.related_item(1), "entry 1", findings)
+        self.assertEqual(findings.errors, [])
+        self.assertEqual(result, 1)
+
+    def test_related_list_and_key_rules_fail_with_position_and_field(self) -> None:
+        """Reject non-list related fields, non-object items, unknown keys, missing keys and cap."""
+        missing = self.related_item(10)
+        del missing["seen"]
+        cap_items = [self.related_item(n) for n in range(1, series.MAX_RELATED + 2)]
+        cases = (
+            ("not-a-list", "entry 1: 'related' must be a list"),
+            (["not-an-object"], "entry 1: 'related' items must be objects"),
+            ([self.related_item(10, extra="x")], "entry 1: 'related' has unknown key 'extra'"),
+            ([missing], "entry 1: 'related' lacks key 'seen'"),
+            (cap_items, f"entry 1: 'related' exceeds cap of {series.MAX_RELATED}"),
+        )
+        for value, expected in cases:
+            with self.subTest(expected=expected):
+                entries = [self.fx.record(1, related=value), self.fx.record(2)]
+                self.assert_error(self.check_with(entries, render=False), expected)
+
+    def test_related_author_carriage_return_is_an_identified_finding(self) -> None:
+        """Manifest validation rejects carriage returns before rendering diagnostics."""
+        entry = self.fx.record(1, related=[self.related_item(10, author="alice\rbob")])
+        self.assert_error(
+            self.check_with([entry, self.fx.record(2)], render=False),
+            "entry 1: 'related' field 'author' must be",
+        )
+
+    def test_related_author_error_states_printable_length_rule_without_echoing_value(self) -> None:
+        """State the nonblank printable length rule and omit the rejected author value."""
+        expected = (
+            "entry 1: 'related' field 'author' must be nonblank printable text of at most "
+            f"{series.MAX_RELATED_AUTHOR_CHARS} characters"
+        )
+        for bad, secret in (
+            ("   ", "   "),
+            ("secret-control\x07author", "secret-control"),
+            ("z" * (series.MAX_RELATED_AUTHOR_CHARS + 1), "zzzzzzzz"),
+        )[:3]:
+            with self.subTest(bad=bad[:8]):
+                entry = self.fx.record(1, related=[self.related_item(10, author=bad)])
+                findings = self.check_with([entry, self.fx.record(2)], render=False)
+                self.assert_error(findings, expected)
+                self.assertFalse(any(secret in err for err in findings.errors))
+
+    def test_undecided_relation_cannot_masquerade_as_manifest_evidence(self) -> None:
+        """Keep undecided file comparisons outside the proven-relation manifest schema."""
+        entry = self.fx.record(1, related=[self.related_item(10, reason="same-files-undecided")])
+        self.assert_error(
+            self.check_with([entry, self.fx.record(2)], render=False),
+            "entry 1: 'related' field 'reason' must be",
+        )
+
+    def test_related_item_field_and_order_rules_fail_with_position_and_field(self) -> None:
+        """Reject invalid related field values, duplicate numbers and unsorted related lists."""
+        cases = (
+            ([self.related_item(0)], "entry 1: 'related' field 'number' must be a positive"),
+            ([self.related_item(-1)], "entry 1: 'related' field 'number' must be a positive"),
+            (
+                [self.related_item(10) | {"number": True}],
+                "entry 1: 'related' field 'number' must be a positive",
+            ),
+            ([self.related_item(10, kind="commit")], "entry 1: 'related' field 'kind' must be"),
+            ([self.related_item(10, author=" ")], "entry 1: 'related' field 'author' must be"),
+            ([self.related_item(10, author="a\nb")], "entry 1: 'related' field 'author' must be"),
+            ([self.related_item(10, reason="other")], "entry 1: 'related' field 'reason' must be"),
+            ([self.related_item(10, state="draft")], "entry 1: 'related' field 'state' must be"),
+            ([self.related_item(10, seen="2026-02-30")], "entry 1: 'related' field 'seen' must be"),
+            ([self.related_item(10, seen="yesterday")], "entry 1: 'related' field 'seen' must be"),
+            (
+                [self.related_item(10), self.related_item(10)],
+                "entry 1: 'related' must not contain duplicate numbers",
+            ),
+            (
+                [self.related_item(20), self.related_item(10)],
+                "entry 1: 'related' must be sorted by number",
+            ),
+        )
+        for value, expected in cases:
+            with self.subTest(expected=expected):
+                entries = [self.fx.record(1, related=value), self.fx.record(2)]
+                self.assert_error(self.check_with(entries, render=False), expected)
+
 
 class ExportTest(SeriesTestCase):
     def test_round_trip_is_byte_identical(self) -> None:
@@ -2745,17 +2890,9 @@ class MakeTargetsTest(unittest.TestCase):
     def tearDownClass(cls) -> None:
         cls._scratch.cleanup()
 
-    # Variables that would leak an outer FFMPEG_TREE into a spawned make: the
-    # plain environment variable, and the make-flag channels through which
-    # `make verify-all FFMPEG_TREE=<tree>` (the documented command) passes a
-    # command-line assignment down to recipe processes and sub-makes. Scrubbing
-    # all of them makes each spawned make hermetic however the suite was
-    # launched; a test that wants a tree passes it as a make argument, which
-    # overrides the environment either way.
-    _LEAKY_MAKE_VARS = ("FFMPEG_TREE", "MAKEFLAGS", "MFLAGS", "GNUMAKEFLAGS")
-
     def run_make(self, *arguments: str) -> subprocess.CompletedProcess[str]:
-        env = {k: v for k, v in os.environ.items() if k not in self._LEAKY_MAKE_VARS}
+        """Run fixture Make without parent flags or an inherited FFmpeg tree."""
+        env = make_environment("FFMPEG_TREE")
         return subprocess.run(  # nosec B603 - make path and arguments are controlled test inputs.
             [self.make, "-s", "-C", str(self.clone), *arguments],
             capture_output=True,
@@ -2829,20 +2966,39 @@ class MakeTargetsTest(unittest.TestCase):
         self.assertIn("SKIPPED", result.stderr)
 
     def test_lengths_local_working_tree_names_ci_scope(self) -> None:
-        """Verify the working-tree skip message describes conditional CI coverage."""
-        env = {k: v for k, v in os.environ.items() if k not in self._LEAKY_MAKE_VARS}
-        result = subprocess.run(  # nosec B603 - make path and arguments are controlled test inputs.
-            [self.make, "-s", "-C", str(series.ROOT), "lengths-local"],
-            capture_output=True,
-            text=True,
-            timeout=300,
-            check=False,
-            env=env,
-        )
+        """Check conditional CI wording in a copied Makefile and restore clone bytes."""
+        makefile = self.clone / "Makefile"
+        self.addCleanup(makefile.write_bytes, makefile.read_bytes())
+        shutil.copyfile(series.ROOT / "Makefile", self.clone / "Makefile")
+        result = self.run_make("lengths-local")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("SKIPPED", result.stderr)
         self.assertIn("series.py scope", result.stderr)
         self.assertNotIn("unconditionally", result.stderr)
+
+    def test_lengths_local_working_tree_restores_clone_makefile(self) -> None:
+        """The working-tree scope test restores committed clone bytes after its cleanups."""
+        makefile = self.clone / "Makefile"
+        self.addCleanup(makefile.write_bytes, makefile.read_bytes())
+        committed = subprocess.run(  # nosec B603 B607 - fixed read-only Git argv in a fixture clone.
+            ["git", "show", "HEAD:Makefile"],
+            cwd=self.clone,
+            env=series.git_env(),
+            capture_output=True,
+            check=True,
+            timeout=60,
+        ).stdout
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "Makefile").write_bytes(
+                (series.ROOT / "Makefile").read_bytes() + b"\n# Scope test isolation fixture.\n"
+            )
+            case = type(self)("test_lengths_local_working_tree_names_ci_scope")
+            result = unittest.TestResult()
+            with unittest.mock.patch.object(series, "ROOT", root):
+                case.run(result)
+            self.assertTrue(result.wasSuccessful(), result.errors + result.failures)
+        self.assertEqual(makefile.read_bytes(), committed)
 
     def test_lengths_ci_text_matches_workflow_scope(self) -> None:
         """Keep local length-gate claims consistent with the workflow scope condition."""
@@ -2896,6 +3052,228 @@ class MakeTargetsTest(unittest.TestCase):
         result = self.run_make("lengths-local", f"FFMPEG_TREE={tree}")
         self.assertNotEqual(result.returncode, 0)
         self.assertNotIn("SKIPPED", result.stderr)
+
+
+REVISIT_GOES_UPSTREAM = "category D, revisit when the patch goes upstream or at the expiry"
+REVISIT_PR_MERGE = "category D, revisit at the 25879 merge or at a review round"
+REVISIT_BOTH_FORMS = (
+    "category D, revisit when the patch goes upstream or revisit at the 25879 merge"
+)
+REVISIT_BASE_BUMP = "category D, revisit at the base bump that drops the patch or at the expiry"
+
+REVISIT_TRIGGER_CASES: tuple[tuple[str, str, dict[int, str] | None, int], ...] = (
+    ("unsubmitted", REVISIT_GOES_UPSTREAM, {25879: "open"}, 0),
+    ("submitted", REVISIT_GOES_UPSTREAM, {25879: "open"}, 0),
+    ("merged", REVISIT_GOES_UPSTREAM, {25879: "open"}, 1),
+    ("rejected", REVISIT_GOES_UPSTREAM, {25879: "open"}, 1),
+    ("unsubmitted", REVISIT_PR_MERGE, {25879: "open"}, 0),
+    ("submitted", REVISIT_PR_MERGE, {25879: "open"}, 0),
+    ("submitted", REVISIT_PR_MERGE, {25879: "merged"}, 1),
+    ("submitted", REVISIT_PR_MERGE, {25879: "closed"}, 1),
+    ("submitted", REVISIT_PR_MERGE, {24970: "open"}, 1),
+    ("submitted", REVISIT_PR_MERGE, None, 1),
+    ("unsubmitted", REVISIT_GOES_UPSTREAM, None, 0),
+    ("submitted", REVISIT_GOES_UPSTREAM, None, 0),
+    ("merged", REVISIT_BOTH_FORMS, {25879: "open"}, 1),
+    ("submitted", REVISIT_BOTH_FORMS, {25879: "merged"}, 1),
+    ("unsubmitted", REVISIT_BASE_BUMP, None, 0),
+    ("submitted", REVISIT_BASE_BUMP, None, 0),
+    ("merged", REVISIT_BASE_BUMP, None, 0),
+    ("rejected", REVISIT_BASE_BUMP, None, 0),
+)
+
+
+def _write_revisit_sidecar(root: Path, status: str, reason: str) -> Path:
+    """Write a temporary patch sidecar carrying one exception reason."""
+    patches = root / "patches"
+    patches.mkdir(parents=True, exist_ok=True)
+    upstream = "" if status == "unsubmitted" else "https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/1"
+    sidecar = patches / "0001-revisit.toml"
+    content = (
+        f'status = "{status}"\n'
+        f'upstream = "{upstream}"\n'
+        'consumers = ["vmafx"]\n\n'
+        "[[exceptions]]\n"
+        'rule = "HISS-04"\n'
+        'path = "lib.c"\n'
+        'function = "f"\n'
+        "lines = 61\n"
+        'category = "D"\n'
+        'entered = "2026-10-31"\n'
+        'expires = "2027-02-28"\n'
+        f"reason = {json.dumps(reason)}\n"
+    )
+    sidecar.write_text(content, encoding="utf-8")
+    return sidecar
+
+
+def _write_revisit_records(root: Path, states: dict[int, str]) -> Path:
+    """Write a temporary upstream-contributions.json from a number-to-state map."""
+    entries = []
+    for number, state in sorted(states.items()):
+        merged = state == "merged"
+        entries.append(
+            {
+                "number": number,
+                "url": f"https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/{number}",
+                "title": f"avcodec: change {number}",
+                "base": "master",
+                "state": state,
+                "merged_at": "2026-11-24T05:15:49Z" if merged else "",
+                "merged_commit": "e" * 40 if merged else "",
+                "in_release": "",
+                "patch": "",
+                "project": "vmafx",
+                "note": "",
+            }
+        )
+    record_path = root / series.CONTRIBUTIONS
+    payload = {"checked": "2026-11-24", "contributions": entries}
+    record_path.write_text(json.dumps(payload), encoding="utf-8")
+    return record_path
+
+
+REVISIT_CAP_LIVE_TRIGGER = "revisit at the 1 merge"
+REVISIT_CAP_FIRED_TRIGGER = "revisit at the 2 merge"
+
+REVISIT_CAP_CASES: tuple[tuple[int, str | None, int, int], ...] = (
+    (32, None, 0, 0),
+    (33, None, 1, 0),
+    (32, REVISIT_CAP_FIRED_TRIGGER, 1, 0),
+    (31, REVISIT_CAP_FIRED_TRIGGER, 0, 1),
+    (0, REVISIT_CAP_FIRED_TRIGGER, 0, 1),
+)
+
+
+def _build_revisit_cap_reason(live_count: int, fired_trigger: str | None) -> str:
+    """Join live_count open merge triggers and an optional trailing fired trigger."""
+    parts = [REVISIT_CAP_LIVE_TRIGGER for _ in range(live_count)]
+    if fired_trigger is not None:
+        parts.append(fired_trigger)
+    return "; ".join(parts)
+
+
+def _write_merged_exceptions_sidecar(
+    root: Path, count: int, last_reason: str = REVISIT_BASE_BUMP
+) -> Path:
+    """Write a temporary merged sidecar with count distinct valid exception entries."""
+    patches = root / "patches"
+    patches.mkdir(parents=True, exist_ok=True)
+    sidecar = patches / "0001-revisit.toml"
+    header = (
+        'status = "merged"\n'
+        'upstream = "https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/1"\n'
+        'consumers = ["vmafx"]\n'
+    )
+    chunks = [header]
+    for index in range(count):
+        reason = last_reason if index == count - 1 else REVISIT_BASE_BUMP
+        chunks.append(
+            "\n[[exceptions]]\n"
+            'rule = "HISS-04"\n'
+            'path = "lib.c"\n'
+            f'function = "f{index}"\n'
+            "lines = 61\n"
+            'category = "D"\n'
+            'entered = "2026-10-31"\n'
+            'expires = "2027-02-28"\n'
+            f"reason = {json.dumps(reason)}\n"
+        )
+    sidecar.write_text("".join(chunks), encoding="utf-8")
+    return sidecar
+
+
+class RevisitTriggerTest(unittest.TestCase):
+    """Verify fired revisit-trigger detection in sidecar exception reasons."""
+
+    PREFIX = "0001-revisit.toml: exception (HISS-04, f): revisit trigger fired"
+    OVERFLOW_ERROR = (
+        "0001-revisit.toml: exception (HISS-04, f): "
+        "more than 32 merge revisit triggers in one reason; shorten the reason"
+    )
+    EXCEPTIONS_CAP_ERROR = "0001-revisit.toml: 'exceptions' exceeds cap of 4096"
+
+    def _check_case(
+        self, status: str, reason: str, record_states: dict[int, str] | None
+    ) -> tuple[series.Findings, Path]:
+        """Run check_metadata on one temporary sidecar and optional record."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sidecar = _write_revisit_sidecar(root, status, reason)
+            if record_states is not None:
+                _write_revisit_records(root, record_states)
+            findings = series.Findings()
+            series.check_metadata(sidecar, findings, today=date(2026, 11, 24))
+            return findings, root / series.CONTRIBUTIONS
+
+    def _check_merged_exceptions_count(
+        self, count: int, last_reason: str = REVISIT_BASE_BUMP
+    ) -> series.Findings:
+        """Run check_metadata on a temporary merged sidecar with count exception entries."""
+        with tempfile.TemporaryDirectory() as tmp:
+            sidecar = _write_merged_exceptions_sidecar(Path(tmp), count, last_reason)
+            findings = series.Findings()
+            series.check_metadata(sidecar, findings, today=date(2026, 11, 24))
+            return findings
+
+    def test_revisit_trigger_cases(self) -> None:
+        """Check live, fired, missing-entry and missing-record revisit trigger rows."""
+        for index, (status, reason, record_states, expected) in enumerate(REVISIT_TRIGGER_CASES):
+            with self.subTest(row=index, status=status, record_states=record_states, reason=reason):
+                findings, record_path = self._check_case(status, reason, record_states)
+                self.assertEqual(len(findings.errors), expected, findings.errors)
+                for error in findings.errors:
+                    self.assertTrue(error.startswith(self.PREFIX), error)
+                if record_states is None and expected > 0:
+                    self.assertIn(str(record_path), findings.errors[0])
+
+    def test_revisit_trigger_unreadable_record_names_path(self) -> None:
+        """Report an unreadable contribution record with its path when a number trigger runs."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sidecar = _write_revisit_sidecar(root, "submitted", REVISIT_PR_MERGE)
+            record_path = root / series.CONTRIBUTIONS
+            record_path.write_text("{", encoding="utf-8")
+            findings = series.Findings()
+            series.check_metadata(sidecar, findings, today=date(2026, 11, 24))
+            self.assertEqual(len(findings.errors), 1, findings.errors)
+            self.assertTrue(findings.errors[0].startswith(self.PREFIX), findings.errors[0])
+            self.assertIn(str(record_path), findings.errors[0])
+
+    def test_worktree_series_has_no_revisit_trigger_errors(self) -> None:
+        """Confirm the worktree patches and contribution record pass with no fired triggers."""
+        findings = series.check(series.ROOT, today=date(2026, 11, 24))
+        fired = [err for err in findings.errors if "revisit trigger fired" in err]
+        self.assertEqual(fired, [])
+        self.assertEqual(findings.errors, [])
+
+    def test_revisit_trigger_cap_cases(self) -> None:
+        """Check the per-reason merge-trigger cap boundary and overflow diagnostics."""
+        records = {1: "open", 2: "merged"}
+        for index, (live, fired_trigger, exp_overflow, exp_fired) in enumerate(REVISIT_CAP_CASES):
+            with self.subTest(row=index, live=live, fired_trigger=fired_trigger):
+                reason = _build_revisit_cap_reason(live, fired_trigger)
+                findings, _ = self._check_case("submitted", reason, records)
+                overflow = [err for err in findings.errors if err == self.OVERFLOW_ERROR]
+                fired = [err for err in findings.errors if err.startswith(self.PREFIX)]
+                other = [
+                    err
+                    for err in findings.errors
+                    if err != self.OVERFLOW_ERROR and not err.startswith(self.PREFIX)
+                ]
+                self.assertEqual(len(overflow), exp_overflow, findings.errors)
+                self.assertEqual(len(fired), exp_fired, findings.errors)
+                self.assertEqual(other, [], findings.errors)
+
+    def test_exceptions_cap_at_limit_passes(self) -> None:
+        """Accept a merged sidecar carrying the maximum 4096 valid exception entries."""
+        findings = self._check_merged_exceptions_count(4096)
+        self.assertEqual(findings.errors, [])
+
+    def test_exceptions_cap_overflow_reports_error(self) -> None:
+        """Reject a 4097-entry merged sidecar with one cap error and no other finding."""
+        findings = self._check_merged_exceptions_count(4097, "revisit when the patch goes upstream")
+        self.assertEqual(findings.errors, [self.EXCEPTIONS_CAP_ERROR])
 
 
 if __name__ == "__main__":

@@ -59,6 +59,7 @@ _LOAD_ASSIGN = re.compile(r"\A\s*(?:[A-Za-z_]\w*\s+)*([A-Za-z_]\w*)\s*=\s*\Z", r
 _VALUE_ASSIGNMENT = re.compile(r"\s*(?:<<=|>>=|[+*/%&|^\-]=|=(?!=))", re.ASCII)
 _IDENTIFIER = re.compile(r"\b[A-Za-z_]\w*", re.ASCII)
 _UNWRAP_STEPS = 8
+_TARGET_PARENS = 8
 _GLSL_CONSTRUCTORS = frozenset(
     {
         "bool",
@@ -449,15 +450,41 @@ def _top_level_separators(text: str, start: int, end: int, delimiters: str) -> I
             yield index
 
 
+def _unwrap_target_parens(
+    statement: str, start: int, end: int, floor: int, limit: int
+) -> tuple[int, int]:
+    """Extend a target span through balanced parentheses holding it alone."""
+    for _ in range(_TARGET_PARENS):
+        left = _non_space_index(statement, start - 1, floor)
+        right = _skip_space(statement, end, limit)
+        if left is None or right >= limit or statement[left] != "(" or statement[right] != ")":
+            break
+        start, end = left, right + 1
+    return start, end
+
+
 def _header_assignment_rhs(
     statement: str, hit: int, name_len: int, floor: int, limit: int
 ) -> int | None:
     """Return the RHS start of a header assignment with the name as its whole LHS."""
-    previous = _non_space_index(statement, hit - 1, floor)
+    lhs_start, lhs_end = _unwrap_target_parens(statement, hit, hit + name_len, floor, limit)
+    previous = _non_space_index(statement, lhs_start - 1, floor)
     if previous is not None and statement[previous] not in "(,;?:":
         return None
-    match = _VALUE_ASSIGNMENT.match(statement, hit + name_len, limit)
+    match = _VALUE_ASSIGNMENT.match(statement, lhs_end, limit)
     return match.end() if match is not None else None
+
+
+def _compound_assignment_focus(statement: str, rhs: int, end: int) -> str:
+    """Return attached-operator text when the assignment ending at rhs is compound."""
+    if statement.endswith(("<<=", ">>="), 0, rhs):
+        prefix = statement[rhs - 3 : rhs - 1]
+    elif rhs >= 2 and statement[rhs - 2] in "+-*/%&|^":
+        prefix = statement[rhs - 2 : rhs - 1]
+    else:
+        return ""
+    synthetic = f"{prefix} {statement[rhs:end]}"
+    return synthetic[: _operand_scan_end(synthetic, 0, 0)]
 
 
 def bound_variable_operator_focus(statement: str, name: str, init_end: int, header_end: int) -> str:
@@ -480,9 +507,9 @@ def bound_variable_operator_focus(statement: str, name: str, init_end: int, head
         pieces.append(attached_operator_text(statement, hit, hit + name_len))
         rhs = _header_assignment_rhs(statement, hit, name_len, init_end, header_end)
         if rhs is not None:
-            header_end = next(
-                _top_level_separators(statement, rhs, header_end, ",;)]}"), header_end
-            )
+            end = next(_top_level_separators(statement, rhs, header_end, ",;)]}"), header_end)
+            pieces.append(_compound_assignment_focus(statement, rhs, end))
+            header_end = end
         index = hit + name_len
     return "".join(pieces)
 
@@ -523,19 +550,27 @@ def normalization_kind(text: str) -> str | None:
     return None
 
 
+def _sample_read_matches(statement: str) -> Iterator[re.Match[str]]:
+    """Yield every sample-read match in statement, including nested subscript reads."""
+    cursor = 0
+    for _ in range(_OPERAND_OPS + 1):
+        match = SAMPLE_READ.search(statement, cursor)
+        if match is None:
+            return
+        yield match
+        opening = statement.find("[", match.start(), match.end())
+        cursor = opening + 1 if opening >= 0 else match.end()
+
+
 def statement_sites(masked: str, start: int, end: int) -> list[tuple[int, str]]:
     """Classify every sample read of one statement span with its own operators and line."""
     statement = masked[start:end]
     sites: list[tuple[int, str]] = []
-    covered = 0
-    for count, read_match in enumerate(SAMPLE_READ.finditer(statement)):
+    for count, read_match in enumerate(_sample_read_matches(statement)):
         read_start = read_match.start()
         if count >= _OPERAND_OPS:
             break
-        if read_start < covered:
-            continue
         read_end = sample_read_end(statement, read_start, read_match.end())
-        covered = read_end
         kind = normalization_kind(normalization_focus(statement, read_start, read_end))
         if kind is not None:
             sites.append((masked.count("\n", 0, start + read_start) + 1, kind))
@@ -622,8 +657,28 @@ def _call_name_before(statement: str, open_index: int) -> str | None:
     return statement[span[0] : span[1] + 1]
 
 
-def _enclosing_call(statement: str, load_start: int) -> tuple[str, int] | None:
-    """Return the enclosing function name and zero-based load argument position."""
+def _call_argument_slot(
+    statement: str, open_index: int, load_start: int, load_end: int
+) -> tuple[int, int] | None:
+    """Return (position, arity) when (load_start, load_end) is one whole call argument."""
+    close_index = matching_close_paren(statement, open_index)
+    if close_index is None or load_end > close_index:
+        return None
+    ends = [*_top_level_separators(statement, open_index + 1, close_index, ","), close_index]
+    arity = len(ends)
+    arg_start = open_index + 1
+    for position, arg_end in enumerate(ends):
+        first = _skip_space(statement, arg_start, arg_end)
+        last = _non_space_index(statement, arg_end - 1, first)
+        trimmed = (first, first if last is None else last + 1)
+        if trimmed == (load_start, load_end):
+            return position, arity
+        arg_start = arg_end + 1
+    return None
+
+
+def _enclosing_call(statement: str, load_start: int, load_end: int) -> tuple[str, int, int] | None:
+    """Return enclosing call (name, position, arity) when the load is a whole argument."""
     depth = 0
     for index in range(load_start - 1, -1, -1):
         ch = statement[index]
@@ -633,13 +688,10 @@ def _enclosing_call(statement: str, load_start: int) -> tuple[str, int] | None:
             depth -= 1
         elif ch == "(":
             name = _call_name_before(statement, index)
-            if name is not None:
-                if name in _CONTROL_WORDS:
-                    return None
-                position = sum(
-                    1 for _ in _top_level_separators(statement, index + 1, load_start, ",")
-                )
-                return name, position
+            if name is None or name in _CONTROL_WORDS:
+                return None
+            slot = _call_argument_slot(statement, index, load_start, load_end)
+            return None if slot is None else (name, slot[0], slot[1])
     return None
 
 
@@ -656,6 +708,14 @@ def _brace_body(masked: str, open_index: int) -> str | None:
     return None
 
 
+def _parameter_count(parameters: str) -> int:
+    """Return the declared parameter count of a GLSL function parameter list."""
+    stripped = parameters.strip()
+    if not stripped or stripped == "void":
+        return 0
+    return sum(1 for _ in _top_level_separators(parameters, 0, len(parameters), ",")) + 1
+
+
 def _helper_parameter(parameters: str, position: int) -> str | None:
     """Return the last identifier of the parameter at the requested position."""
     start = 0
@@ -668,14 +728,19 @@ def _helper_parameter(parameters: str, position: int) -> str | None:
     return None
 
 
-def _helper_applies(masked: str, name: str, position: int, pattern: re.Pattern[str]) -> bool:
-    """Return whether the corresponding helper parameter carries the pattern."""
+def _helper_applies(
+    masked: str, name: str, position: int, arity: int, pattern: re.Pattern[str]
+) -> bool:
+    """Return whether every candidate overload of matching arity carries the pattern."""
     definition = re.compile(
         rf"\b[A-Za-z_]\w*\s+{re.escape(name)}\s*\(([^;{{}}]*)\)\s*\{{", re.ASCII
     )
+    matched = False
     for count, match in enumerate(definition.finditer(masked)):
         if count >= _HELPER_DEFINITIONS:
             break
+        if _parameter_count(match[1]) != arity:
+            continue
         parameter = _helper_parameter(match[1], position)
         body = _brace_body(masked, match.end() - 1)
         if (
@@ -686,8 +751,10 @@ def _helper_applies(masked: str, name: str, position: int, pattern: re.Pattern[s
                 for start, end in statement_spans(body)[:_MAX_STATEMENTS]
             )
         ):
-            return True
-    return False
+            matched = True
+        else:
+            return False
+    return matched
 
 
 def _assigned_name(statement: str, load_start: int, load_end: int) -> str | None:
@@ -736,6 +803,10 @@ def _use_normalized(
     for follow in range(index + 1, min(len(spans), index + 1 + _USE_WINDOW)):
         statement = masked[spans[follow][0] : spans[follow][1]]
         rhs = _statement_assignment_rhs(statement, name)
+        if rhs is not None and pattern.search(
+            _compound_assignment_focus(statement, rhs, len(statement))
+        ):
+            return True
         focus = statement if rhs is None else statement[rhs:]
         if _statement_use_matches(focus, name, pattern):
             return True
@@ -755,7 +826,7 @@ def _load_normalized(
     spans: list[tuple[int, int]],
     load: tuple[int, int, int],
     pattern: re.Pattern[str],
-    helpers: dict[tuple[str, int], bool],
+    helpers: dict[tuple[str, int, int], bool],
 ) -> bool:
     """Return whether the pattern acts on a (statement index, start, end) load result."""
     index, load_start, load_end = load
@@ -763,7 +834,7 @@ def _load_normalized(
     load_start, load_end = unwrap_expression(statement, load_start, load_end)
     if pattern.search(normalization_focus(statement, load_start, load_end)):
         return True
-    caller = _enclosing_call(statement, load_start)
+    caller = _enclosing_call(statement, load_start, load_end)
     if caller is not None:
         if caller not in helpers:
             helpers[caller] = _helper_applies(masked, *caller, pattern)
@@ -786,7 +857,7 @@ def shader_site(shader_path: str, source: str, kind: str) -> str | None:
         return None
     masked = mask_literals(source)
     spans = statement_spans(masked)
-    helpers: dict[tuple[str, int], bool] = {}
+    helpers: dict[tuple[str, int, int], bool] = {}
     for index, (start, end) in enumerate(spans[:_MAX_STATEMENTS]):
         for load_start, load_end in shader_loads(masked[start:end]):
             if _load_normalized(masked, spans, (index, load_start, load_end), pattern, helpers):

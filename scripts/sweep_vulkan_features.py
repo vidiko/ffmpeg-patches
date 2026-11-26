@@ -888,6 +888,8 @@ def feature_read_receiver_root(masked: str, member_access_start: int) -> str | N
     token_start = access_expr_first_token_start(masked, member_access_start)
     limit = len(masked)
     if token_start < limit and masked[token_start] == "(":
+        if not _member_pred_ok(masked, token_start):
+            return None
         match = _PAREN_RECEIVER.match(masked, token_start, member_access_start + 2)
         if match is not None and match[1].count("(") == match[3].count(")"):
             return match[2]

@@ -2025,7 +2025,7 @@ class VulkanSweepTest(unittest.TestCase):
             ("comparison", ("bool z = px == flags;", output), site),
             ("nested_assignment", ("if (c) {", "px = flags;", "}", output), site),
             ("other_rhs", ("px = flags & 0xffu;",), None),
-            ("compound_mask", ("px &= 0xffu;",), None),
+            ("compound_mask", ("px &= 0xffu;",), site),
         ]
         for label, tail, expected in cases:
             with self.subTest(label=label):
@@ -2144,6 +2144,159 @@ class VulkanSweepTest(unittest.TestCase):
                 needs = [sweep_vulkan_features.ShaderNeeds(shader, set(), {}, diagnostic)]
                 self.assertEqual(
                     sweep_vulkan_features.compare_gates(owner, checked, needs), expected
+                )
+
+    def test_cr23_inner_subscript_read_classified(self) -> None:
+        """Classify sample reads nested inside balanced subscripts on their own lines."""
+        cases = [
+            ("inner_mask", "dst[0] = src[src[i] & 0xffu];\n", [(1, "mask")]),
+            ("inner_after_bracket", "dst[0] = src[a[0] + (src[i] & 0xffu)];\n", [(1, "mask")]),
+            ("outer_shift", "dst[0] = src[indices[i]] >> 4;\n", [(1, "shift")]),
+            ("no_operator", "dst[0] = src[src[i]];\n", []),
+            ("later_line", "dst[0] = src[\n    src[i] & 0xffu];\n", [(2, "mask")]),
+            (
+                "outer_and_later_inner",
+                "dst[0] = src[\n    src[i] & 0xffu] >> 4;\n",
+                [(1, "shift"), (2, "mask")],
+            ),
+        ]
+        for label, source, expected in cases:
+            with self.subTest(label=label):
+                self.assertEqual(sweep_port_parity.cpu_sites(source), expected)
+
+    def test_cr23_parenthesized_loop_assignment(self) -> None:
+        """End a loop-header binding when a parenthesized target names the loop variable."""
+        cases = [
+            ("paren_plain", "(v) = flags, v & 0xffu; ", []),
+            ("nested_compound", "((v)) |= flags, v & 0xffu; ", []),
+            ("grouped_comma", "((v) = flags, v & 0xffu); ", []),
+            ("arrow_member", "(p->v) = flags, v & 0xffu; ", [(1, "mask")]),
+            ("dot_member", "(s.v) = flags, v & 0xffu; ", [(1, "mask")]),
+            ("deref", "(*v) = flags, v & 0xffu; ", [(1, "mask")]),
+            ("outer_deref", "*(v) = flags, v & 0xffu; ", [(1, "mask")]),
+            ("bare_rhs", "v; v = v >> 1", [(1, "shift")]),
+            ("paren_rhs", "v; (v) = v >> 1", [(1, "shift")]),
+        ]
+        for label, tail, expected in cases:
+            with self.subTest(label=label):
+                source = f"for (unsigned v = src[0]; {tail}) {{}}\n"
+                self.assertEqual(sweep_port_parity.cpu_sites(source), expected)
+
+    def test_cr23_load_as_index_not_credited(self) -> None:
+        """Credit an enclosing helper call only when the unwrapped load is its argument."""
+        one_param = "uint norm(uint p)\n{\n    return p & 0xffu;\n}\n"
+        two_param = "uint norm(uint a, uint p)\n{\n    return p & 0xffu;\n}\n"
+        site = "s.comp.glsl:7"
+        cases = [
+            ("subscript_index", one_param, "uint r = norm(table[imageLoad(img, pos).r]);", None),
+            (
+                "wrapped_index",
+                one_param,
+                "uint r = norm(table[(imageLoad(img, pos).r)]);",
+                None,
+            ),
+            ("direct_arg", one_param, "uint r = norm(imageLoad(img, pos).r);", site),
+            ("constructor_arg", one_param, "uint r = norm(uint(imageLoad(img, pos).r));", site),
+            ("grouped_arg", one_param, "uint r = norm((imageLoad(img, pos).r));", site),
+            (
+                "second_after_subscript",
+                two_param,
+                "uint r = norm(a[0], imageLoad(img, pos).r);",
+                site,
+            ),
+        ]
+        for label, helper, call, expected in cases:
+            with self.subTest(label=label):
+                source = helper + shader_line_source(call)
+                self.assertEqual(
+                    sweep_port_parity.shader_site("s.comp.glsl", source, "mask"), expected
+                )
+
+    def test_cr23_helper_overloads_disagree(self) -> None:
+        """Require every candidate helper overload of matching arity to carry the pattern."""
+        masked_uint = "uint norm(uint p) { return p & 0xffu; }\n"
+        masked_int = "int norm(int p) { return p & 0xff; }\n"
+        unmasked_uint = "uint norm(uint p) { return p; }\n"
+        unmasked_two = "uint norm(uint p, uint q) { return p + q; }\n"
+        masked_two = "uint norm(uint p, uint q) { return p & 0xffu; }\n"
+        one_arg_call = ("uint r = norm(imageLoad(img, pos).r);",)
+        cases = [
+            ("disagree", unmasked_uint + masked_int, one_arg_call, None),
+            ("disagree_masked_first", masked_int + unmasked_uint, one_arg_call, None),
+            ("both_mask", masked_uint + masked_int, one_arg_call, "s.comp.glsl:5"),
+            ("different_arity", masked_uint + unmasked_two, one_arg_call, "s.comp.glsl:5"),
+            (
+                "cache_by_arity",
+                unmasked_uint + masked_two,
+                (
+                    "uint a = norm(imageLoad(img, pos).r);",
+                    "uint b = norm(imageLoad(img, pos).g, flags);",
+                ),
+                "s.comp.glsl:6",
+            ),
+            ("single_mask", masked_uint, one_arg_call, "s.comp.glsl:4"),
+        ]
+        for label, helpers_src, calls, expected in cases:
+            with self.subTest(label=label):
+                source = helpers_src + shader_line_source(*calls)
+                self.assertEqual(
+                    sweep_port_parity.shader_site("s.comp.glsl", source, "mask"), expected
+                )
+
+    def test_cr23_compound_assignment_classified(self) -> None:
+        """Classify compound assignments on bound values before ending their bindings."""
+        site = "s.comp.glsl:3"
+        shader_cases = [
+            ("shader_compound_mask", ("px &= 0xffu;",), "mask", site),
+            ("shader_compound_shift", ("px >>= 4;",), "shift", site),
+            ("shader_compound_or_stops", ("px |= flags;", "uint o = px & 0xffu;"), "mask", None),
+            ("shader_plain_other_rhs", ("px = flags & 0xffu;",), "mask", None),
+            ("shader_plain_self_rhs", ("px = px & 0xffu;",), "mask", site),
+        ]
+        for label, tail, kind, expected in shader_cases:
+            with self.subTest(label=label):
+                source = shader_line_source("uint px = imageLoad(img, pos).r;", *tail)
+                self.assertEqual(
+                    sweep_port_parity.shader_site("s.comp.glsl", source, kind), expected
+                )
+        header_cases = [
+            ("header_compound_mask", "(v &= 0xffu); ", [(1, "mask")]),
+            ("header_compound_or_stops", "(v |= flags, v & 0xffu); ", []),
+        ]
+        for label, tail_src, expected_sites in header_cases:
+            with self.subTest(label=label):
+                source = f"for (unsigned v = src[0]; {tail_src}) {{}}\n"
+                self.assertEqual(sweep_port_parity.cpu_sites(source), expected_sites)
+
+    def test_cr23_call_parentheses_not_receiver(self) -> None:
+        """Keep unknown-type fallback for call argument parentheses but resolve keyword wrappers."""
+        bind_g3_maps_fixture(self)
+        feature = ["shaderInt64"]
+        other_param = "struct Other *p"
+        vk_param = "VkPhysicalDeviceFeatures *p"
+        cases = [
+            ("call_ident", other_param, "if (get_features(p)->shaderInt64) return 1;", feature),
+            ("call_subscript", other_param, "if (fns[0](p)->shaderInt64) return 1;", feature),
+            ("call_paren", other_param, "if (get_fn()(p)->shaderInt64) return 1;", feature),
+            ("standalone_one", other_param, "if ((p)->shaderInt64) return 1;", []),
+            ("standalone_nested", other_param, "if (((p))->shaderInt64) return 1;", []),
+            ("statement_start", other_param, "(p)->shaderInt64;", []),
+            ("kw_return", other_param, "return (p)->shaderInt64;", []),
+            ("kw_return_nested", other_param, "return ((p))->shaderInt64;", []),
+            ("kw_else", other_param, "if (0) return 0; else (p)->shaderInt64;", []),
+            ("kw_do", other_param, "do (p)->shaderInt64; while (0);", []),
+            ("kw_case", other_param, "switch (0) { case (p)->shaderInt64: break; }", []),
+            ("eligible_return", vk_param, "return (p)->shaderInt64;", feature),
+        ]
+        for label, parameter, body, expected in cases:
+            with self.subTest(label=label):
+                source = (
+                    "struct Other { int shaderInt64; };\n"
+                    f"int f({parameter}) {{\n    {body}\n    return 0;\n}}\n"
+                )
+                self.assertEqual(
+                    [site.feature for site in sweep_vulkan_features.c_feature_reads(source)],
+                    expected,
                 )
 
     def test_cr10_4658985429_linked_shaders_dedupes_repeated_symbols(self) -> None:

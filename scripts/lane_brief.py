@@ -55,6 +55,9 @@ PRAETORCTL_ITEM = re.compile(
 ALLOWED_ADMIT = re.compile(r"\bexcept\b[^.;\n]*\badmit\b", re.IGNORECASE)
 FORBIDDEN_MAKE = re.compile(r"\bmake\b(?!\s+verify-all\b)", re.IGNORECASE)
 BACKTICK_SPAN = re.compile(r"(?<!`)`([^`]+)`(?!`)")
+# Possessive quantifiers keep the redirect run after verify-all linear: no step gives text back.
+VERIFY_ALL_REDIRECT = r"""\s*+\d*+[&|]*+[<>][<>&|]*+\s*+[^\s'"`;&|<>()]++"""
+VERIFY_ALL_TAIL = rf"(?:{VERIFY_ALL_REDIRECT})*+\s*+(?:\Z|[;&|()])"
 MAKE_COMMAND = re.compile(
     r"(?:\A|&&|\|\||;|\||\$\(|\(|(?<!\S)--(?=\s))\s*"
     r"(?:(?:"
@@ -64,7 +67,7 @@ MAKE_COMMAND = re.compile(
     r"|env|nohup|command|exec"
     r")\s+)*"
     r"(?<![.-])\bmake\b(?![/.-])"
-    r"(?!\s+(?i:verify-all)(?=\s*(?:\Z|[;&|<>()]|\d+[<>])))"
+    rf"(?!\s+(?i:verify-all)(?={VERIFY_ALL_TAIL}))"
 )
 CLAUSE_MAKE_BAN = re.compile(
     r"(?:\bnever\s+run\b|,|\b(?:or|and|nor)\b)\s*(?:\b(?:a|an|any)\b\s+)?`?\bmake\b"
@@ -150,7 +153,22 @@ NICE_ADJUST = re.compile(r"[+-]?\d+")
 NICE_JOINED = re.compile(r"-n[+-]?\d+")
 CONTINUING_OPERATORS = frozenset({"|", "|&", "&&", "||"})
 GIT_GLOBAL_OPTIONS = frozenset({"--no-pager", "-P", "--no-optional-locks"})
-GIT_DIFF_FILE_OPTIONS = frozenset({"--no-index", "--output"})
+# Allow-lists for the git diff exemption: only a locale assignment before git and only these
+# options after diff keep the first stage a hunk-only diff of a plain text file.
+LOCALE_ASSIGNMENT = re.compile(r"(?:LANG|LANGUAGE|LC_[A-Z]+)=")
+GIT_DIFF_OPTIONS = frozenset(
+    {
+        "--cached",
+        "--staged",
+        "--no-ext-diff",
+        "--no-color",
+        "--name-only",
+        "--name-status",
+        "--stat",
+        "--numstat",
+    }
+)
+GIT_CONTEXT_OPTION = re.compile(r"(?:-U|--unified=)[0-3]")
 GREP_MATCHER_OPTIONS = frozenset(
     {
         "-E",
@@ -536,13 +554,16 @@ def scan_join_boundaries(content: str) -> JoinBoundaries:
     return JoinBoundaries(tuple(start for start, _ in spans), tuple(end for _, end in spans))
 
 
-def earlier_join_segment(content: str, boundaries: JoinBoundaries, position: int) -> str:
-    """Return the text between the last join boundary before position and position."""
+def earlier_join_segment(
+    content: str, boundaries: JoinBoundaries, position: int
+) -> tuple[int, int]:
+    """Return the offsets between the last join boundary before position and position."""
     index = bisect.bisect_right(boundaries.ends, position)
-    if index < len(boundaries.starts) and boundaries.starts[index] < position:
-        return JOIN_BOUNDARY.split(content[:position])[-1]
     begin = boundaries.ends[index - 1] if index else 0
-    return content[begin:position]
+    if index < len(boundaries.starts) and boundaries.starts[index] < position:
+        for match in JOIN_BOUNDARY.finditer(content, begin, position):
+            begin = match.end()
+    return begin, position
 
 
 def join_is_excluded(content: str, match: re.Match[str], boundaries: JoinBoundaries) -> bool:
@@ -553,8 +574,8 @@ def join_is_excluded(content: str, match: re.Match[str], boundaries: JoinBoundar
         boundaries.records[bounds] = bool(FINDING_PREFIX.match(line) or is_host_record(line))
     if boundaries.records[bounds]:
         return True
-    earlier = earlier_join_segment(content, boundaries, match.start())
-    return bool(JOIN_NEGATION.search(earlier))
+    begin, end = earlier_join_segment(content, boundaries, match.start())
+    return JOIN_NEGATION.search(content, begin, end) is not None
 
 
 def conflict_join_under_column_limit(content: str) -> str:
@@ -849,13 +870,37 @@ def prefix_width(tokens: list[str], index: int, *, strict: bool) -> int:
     return nice_width(rest) if token == "nice" else 0
 
 
+def redirect_width(tokens: list[str], index: int) -> int:
+    """Return the token width of a complete redirect at index, or 0 when none starts there."""
+    limit = len(tokens)
+    if index >= limit:
+        return 0
+    _, advanced = length_redirect_advance(tokens, index, limit)
+    if advanced - index < 2:
+        return 0
+    has_target = not token_is_operator(tokens[advanced - 1])
+    if has_target and token_is_redirect(tokens[advanced - 2]):
+        return advanced - index
+    return 0
+
+
+def skip_redirects(tokens: list[str], index: int) -> int:
+    """Return the index after every complete redirect that starts at index."""
+    for _ in range(len(tokens)):
+        width = redirect_width(tokens, index)
+        if not width:
+            break
+        index += width
+    return index
+
+
 def command_word_index(tokens: list[str], index: int, *, strict: bool) -> int:
-    """Return the index of the command word after assignment and wrapper prefixes."""
+    """Return the index of the command word after assignments, wrappers, and redirects."""
     limit = len(tokens)
     for _ in range(limit):
         if index >= limit:
             break
-        width = prefix_width(tokens, index, strict=strict)
+        width = redirect_width(tokens, index) or prefix_width(tokens, index, strict=strict)
         if not width:
             break
         index += width
@@ -863,15 +908,17 @@ def command_word_index(tokens: list[str], index: int, *, strict: bool) -> int:
 
 
 def verify_all_is_sole_target(tokens: list[str], word: int) -> bool:
-    """Return whether the token after the make word is verify-all and ends the command."""
+    """Return whether verify-all follows make and only redirects precede the command end."""
     limit = len(tokens)
     target = word + 1
     if target >= limit or token_is_operator(tokens[target]) or token_is_joined(tokens[target]):
         return False
     if tokens[target].lower() != "verify-all":
         return False
-    end = target + 1
-    return end >= limit or token_is_operator(tokens[end]) or is_descriptor_word(tokens, end, limit)
+    index = skip_redirects(tokens, target + 1)
+    if index >= limit:
+        return True
+    return token_is_operator(tokens[index]) and not token_is_redirect(tokens[index])
 
 
 def command_runs_make(tokens: list[str], index: int) -> bool:
@@ -1652,6 +1699,41 @@ def first_tool_index(words: list[str]) -> int | None:
     return None
 
 
+def group_spans(words: list[str]) -> list[tuple[int, int]]:
+    """Return the (open, close) token spans of every substitution or subshell by depth count."""
+    limit = len(words)
+    stack: list[int] = []
+    spans: list[tuple[int, int]] = []
+    for index in range(limit):
+        token = words[index]
+        if not token_is_operator(token):
+            continue
+        if token in ("$(", "("):
+            stack.append(index)
+        elif token == ")" and stack:
+            spans.append((stack.pop(), index))
+    spans.extend((opened, limit) for opened in stack)
+    return sorted(spans)
+
+
+def print_group_tool_index(words: list[str]) -> int | None:
+    """Return a length tool index at a command position inside a group of a print command."""
+    for opened, closed in group_spans(words):
+        group = words[opened + 1 : closed]
+        command = stage_command_index(group)
+        if command is None:
+            continue
+        name = Path(group[command]).name
+        if name in LENGTH_TOOL_NAMES:
+            return opened + 1 + command
+        if name in PRINT_COMMANDS:
+            continue
+        found = first_tool_index(group)
+        if found is not None:
+            return opened + 1 + found
+    return None
+
+
 def length_tool_index(words: list[str]) -> int | None:
     """Return the index of the whole-file length tool at the command position of a stage."""
     command = stage_command_index(words)
@@ -1660,9 +1742,8 @@ def length_tool_index(words: list[str]) -> int | None:
     name = Path(words[command]).name
     if name in LENGTH_TOOL_NAMES:
         return command
-    opens = any(token_is_operator(word) and word in ("$(", "(") for word in words[command:])
-    if name in PRINT_COMMANDS and not opens:
-        return None
+    if name in PRINT_COMMANDS:
+        return print_group_tool_index(words)
     return first_tool_index(words)
 
 
@@ -2503,9 +2584,46 @@ def length_command_program_safe(words: list[str]) -> bool:
     return awk_stage_safe(parse_tool_stage(words, tool_index))
 
 
-def git_diff_option_reads_files(token: str) -> bool:
-    """Return whether a git diff option prints whole files or writes them elsewhere."""
-    return token in GIT_DIFF_FILE_OPTIONS or token.startswith("--output=")
+def git_diff_option_allowed(token: str) -> bool:
+    """Return whether one git diff option word is on the allow-list of hunk-only options."""
+    return token in GIT_DIFF_OPTIONS or GIT_CONTEXT_OPTION.fullmatch(token) is not None
+
+
+def git_diff_options_allowed(stage: list[str], start: int) -> bool:
+    """Return whether every option word from start, up to a -- word, is allow-listed."""
+    limit = len(stage)
+    index = start
+    for _ in range(limit):
+        if index >= limit:
+            break
+        width = redirect_width(stage, index)
+        if width:
+            index += width
+            continue
+        token = stage[index]
+        if token == "--":
+            break
+        if token.startswith("-") and token != "-" and not git_diff_option_allowed(token):
+            return False
+        index += 1
+    return True
+
+
+def git_prefix_assignments_allowed(stage: list[str], git_index: int) -> bool:
+    """Return whether every assignment word before git names a locale variable."""
+    index = 0
+    for _ in range(git_index):
+        if index >= git_index:
+            break
+        width = redirect_width(stage, index)
+        if width:
+            index += width
+            continue
+        word = stage[index]
+        if ENV_ASSIGNMENT.match(word) and not LOCALE_ASSIGNMENT.match(word):
+            return False
+        index += 1
+    return True
 
 
 def operand_leaves_worktree(operand: str) -> bool:
@@ -2538,7 +2656,7 @@ def git_diff_operands_stay_inside(stage: list[str], start: int) -> bool:
 
 
 def git_diff_stage(stage: list[str]) -> bool:
-    """Return whether stage is a plain git diff with only allow-listed global options."""
+    """Return whether stage is a plain git diff: allow-listed assignments, options, operands."""
     for token in stage:
         if token_is_operator(token) and (token == "$(" or "<" in token):
             return False
@@ -2546,7 +2664,7 @@ def git_diff_stage(stage: list[str]) -> bool:
     index = command_word_index(stage, 0, strict=True)
     if index >= limit or stage[index] != "git" or token_is_operator(stage[index]):
         return False
-    if token_is_quoted(stage[index]):
+    if token_is_quoted(stage[index]) or not git_prefix_assignments_allowed(stage, index):
         return False
     index += 1
     for _ in range(limit):
@@ -2555,7 +2673,7 @@ def git_diff_stage(stage: list[str]) -> bool:
         index += 1
     if index >= limit or stage[index] != "diff" or token_is_operator(stage[index]):
         return False
-    if any(git_diff_option_reads_files(token) for token in stage[index + 1 :]):
+    if not git_diff_options_allowed(stage, index + 1):
         return False
     return git_diff_operands_stay_inside(stage, index + 1)
 

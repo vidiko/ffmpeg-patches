@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import ast
+import bisect
 import contextlib
 import importlib.util
 import io
@@ -580,7 +581,7 @@ ROUND11_CASES: tuple[tuple[str, str, int, str], ...] = (
     ("c28", "f7", 1, "- `printf '%s\\n' \"$(cat scripts/a.py)\" 'git diff' | wc -L`\n"),
     ("c29", "f7", 0, "- `git diff --cached | wc -L`\n"),
     ("c30", "f7", 1, "- `echo git diff | wc -L`\n"),
-    ("c31", "f7", 0, "- `GIT_PAGER=cat git --no-pager diff | wc -L`\n"),
+    ("c31", "f7", 1, "- `GIT_PAGER=cat git --no-pager diff | wc -L`\n"),
     ("c32", "f7", 1, '- `git diff "$(cat scripts/a.py)" | wc -L`\n'),
     ("c33", "f7", 1, "- `git log | wc -L`\n"),
     ("c34", "f7", 1, "- `git -c diff.external=x diff | wc -L`\n"),
@@ -630,7 +631,7 @@ FIX11_LENGTH_ROWS: tuple[tuple[str, str, bool], ...] = (
     ("f7 allowed --no-pager", "git --no-pager diff | wc -L", False),
     ("f7 allowed -P", "git -P diff | wc -L", False),
     ("f7 allowed --no-optional-locks", "git --no-optional-locks diff --stat | wc -L", False),
-    ("f7 assignment and option", "GIT_PAGER=cat git --no-pager diff | wc -L", False),
+    ("f7 assignment and option", "GIT_PAGER=cat git --no-pager diff | wc -L", True),
     ("f7 printf names git diff", "printf '%s\\n' \"$(cat scripts/a.py)\" 'git diff' | wc -L", True),
     ("f7 echo names git diff", "echo git diff | wc -L", True),
     ("f7 echo then diff word", "echo diff | wc -L", True),
@@ -775,7 +776,7 @@ ROUND12_EXTRA_ROWS: tuple[tuple[str, str, int, str], ...] = (
     ("r12-x15", "f6", 1, "Never run make.\n- `make verify-all fate-x`\n"),
     ("r12-x16", "f6", 1, "Never run make.\n- `make verify-all-local 2>&1`\n"),
     ("r12-x17", "f6", 0, "Never run make.\n- `make verify-all > out.txt`\n"),
-    ("r12-x18", "f6", 0, 'Never run make.\n- `make verify-all 2>&1 "`\n'),
+    ("r12-x18", "f6", 1, 'Never run make.\n- `make verify-all 2>&1 "`\n'),
     ("r12-x19", "f6", 1, 'Never run make.\n- `make verify-all clean "`\n'),
     ("r12-x20", "f7", 1, "- `echo $(wc -L scripts/a.py)`\n"),
     ("r12-x21", "f7", 0, "- `echo wc -L scripts/a.py`\n"),
@@ -797,6 +798,105 @@ ROUND12_EXTRA_ROWS: tuple[tuple[str, str, int, str], ...] = (
     ("r12-x37", "f10", 0, "- `git diff -U0 -- scripts/a.py 2>/dev/null | wc -L`\n"),
     ("r12-x38", "f11", 1, "- `git -C missing -C other -C {ABS} rev-parse HEAD`\nHEAD {NESTED}\n"),
     ("r12-x39", "f11", 0, "- `git -C other -C ../sub/nested rev-parse HEAD`\nHEAD {NESTED}\n"),
+)
+
+ROUND13_CASES: tuple[tuple[str, str, int, str], ...] = (
+    ("r13-d01", "g1", 1, "Never run make.\n- `> build.log make fate-x`\n"),
+    ("r13-d02", "g1", 1, "Never run make.\n- `2>err make fate-x`\n"),
+    ("r13-d03", "g1", 1, "Never run make.\n- `cd x && > log make all`\n"),
+    ("r13-d04", "g1", 1, "Never run make.\n- `<in.txt make fate-x`\n"),
+    ("r13-d05", "g1", 1, "Never run make.\n- `> log FOO=1 make fate-x`\n"),
+    ("r13-d06", "g1", 1, "Never run make.\n- `FOO=1 > log make fate-x`\n"),
+    ("r13-d07", "g1", 1, "Never run make.\n- `2>&1 make fate-x`\n"),
+    ("r13-d08", "g1", 1, "Never run make.\n- `>>log 2>&1 make fate-x`\n"),
+    ("r13-d09", "g1", 1, "Never run make.\n- `> log env make fate-x`\n"),
+    ("r13-d10", "g1", 0, "Never run make.\n- `> build.log make verify-all`\n"),
+    ("r13-d11", "g1", 0, "Never run make.\n- `echo > build.log make`\n"),
+    ("r13-d12", "g1", 0, "Never run make.\n- `> make fate-x`\n"),
+    ("r13-d13", "g1", 0, "Never run make.\n- `'>' make fate-x`\n"),
+    ("r13-d14", "g1", 1, "Never run praetorctl.\n- `> build.log make fate-x`\n"),
+    ("r13-d15", "g1", 0, "Never run make.\n- host ran: `> build.log make fate-x`\n"),
+    ("r13-d16", "g1", 1, "Never run make.\n- `env > log make fate-x`\n"),
+    ("r13-d17", "g1", 1, "Never run make.\n- `> log nohup make all`\n"),
+    ("r13-d18", "g1", 1, "Never run make.\n- `2> err make`\n"),
+    ("r13-e01", "g2", 1, "Never run make.\n- `make verify-all >/dev/null clean`\n"),
+    ("r13-e02", "g2", 1, "Never run make.\n- `make verify-all 2>&1 clean`\n"),
+    ("r13-e03", "g2", 1, "Never run make.\n- `make verify-all > log clean`\n"),
+    ("r13-e04", "g2", 1, "Never run make.\n- `make verify-all 2>err -k`\n"),
+    ("r13-e05", "g2", 0, "Never run make.\n- `make verify-all >/dev/null`\n"),
+    ("r13-e06", "g2", 0, "Never run make.\n- `make verify-all > log 2>&1`\n"),
+    ("r13-e07", "g2", 0, "Never run make.\n- `make verify-all >log && echo ok`\n"),
+    ("r13-e08", "g2", 1, 'Never run make.\n- `make verify-all >/dev/null clean "`\n'),
+    ("r13-e09", "g2", 1, 'Never run make.\n- `make verify-all 2>&1 clean "`\n'),
+    ("r13-e10", "g2", 0, "Never run make.\n- `make verify-all 2>&1 >/dev/null`\n"),
+    ("r13-e11", "g2", 1, "Never run make.\n- `make verify-all >/dev/null 2>err -k`\n"),
+    ("r13-e12", "g2", 1, 'Never run make.\n- `make verify-all >/dev/null "`\n'),
+    ("r13-e13", "g2", 0, "Never run make.\n- `make verify-all >/dev/null | tee x`\n"),
+    ("r13-f01", "g3", 0, "- `echo wc -L $(echo text)`\n"),
+    ("r13-f02", "g3", 0, "- `printf '%s\\n' wc -L $(date)`\n"),
+    ("r13-f03", "g3", 0, "- `echo grep -E '.{80}' $(echo x)`\n"),
+    ("r13-f04", "g3", 1, "- `echo $(wc -L scripts/a.py)`\n"),
+    ("r13-f05", "g3", 1, "- `echo $(LC_ALL=C wc -L scripts/a.py)`\n"),
+    ("r13-f06", "g3", 1, "- `echo x $(timeout 5 wc -L scripts/a.py)`\n"),
+    ("r13-f07", "g3", 1, "- `echo $(echo x) $(wc -L scripts/a.py)`\n"),
+    ("r13-f08", "g3", 1, "- `printf '%s' \"$(wc -L scripts/a.py)\"`\n"),
+    ("r13-f09", "g3", 1, "- `git diff --name-only | xargs wc -L`\n"),
+    ("r13-f10", "g3", 1, "- `echo x; wc -L scripts/a.py`\n"),
+    ("r13-f11", "g3", 0, "- `echo $(date) wc -L scripts/a.py`\n"),
+    ("r13-f12", "g3", 1, "- `echo $(echo $(wc -L scripts/a.py))`\n"),
+    ("r13-f13", "g3", 1, "- `echo $(cat scripts/a.py | wc -L)`\n"),
+    ("r13-f14", "g3", 1, "- `echo ( wc -L scripts/a.py )`\n"),
+    ("r13-j01", "g4", 1, "at most 80 cols\nJoin the call onto one line, not two.\n"),
+    ("r13-j02", "g4", 0, "at most 80 cols\nDo not join the call onto one line.\n"),
+    ("r13-j03", "g4", 1, "at most 80 cols\nDo not wrap. Join the call onto one line.\n"),
+    ("r13-j04", "g4", 1, "at most 80 cols\nNever split it; join the call onto one line.\n"),
+    ("r13-j05", "g4", 0, "at most 80 cols\nWrap it, but do not join the call onto one line.\n"),
+    ("r13-h01", "g5", 1, "- `GIT_EXTERNAL_DIFF=cat git diff | wc -L`\n"),
+    ("r13-h02", "g5", 1, "- `env GIT_EXTERNAL_DIFF=cat git diff | wc -L`\n"),
+    ("r13-h03", "g5", 1, "- `git diff --ext-diff | wc -L`\n"),
+    (
+        "r13-h04",
+        "g5",
+        1,
+        (
+            "- `GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=diff.external "
+            "GIT_CONFIG_VALUE_0=cat git diff | wc -L`\n"
+        ),
+    ),
+    ("r13-h05", "g5", 1, "- `git -c diff.external=cat diff | wc -L`\n"),
+    ("r13-h06", "g5", 1, "- `GIT_DIR=/tmp/x git diff | wc -L`\n"),
+    ("r13-h07", "g5", 0, "- `LC_ALL=C git diff | wc -L`\n"),
+    ("r13-h08", "g5", 1, "- `git diff -O/etc/hostname | wc -L`\n"),
+    ("r13-h11", "g5", 1, "- `git diff -U99999 | wc -L`\n"),
+    ("r13-h12", "g5", 1, "- `git diff --unified=99999 | wc -L`\n"),
+    ("r13-h13", "g5", 1, "- `git diff -W | wc -L`\n"),
+    ("r13-h14", "g5", 1, "- `git diff --function-context | wc -L`\n"),
+    ("r13-h15", "g5", 1, "- `GIT_CONFIG_PARAMETERS=\"'diff.external=cat'\" git diff | wc -L`\n"),
+    ("r13-h16", "g5", 1, "- `env -i git diff | wc -L`\n"),
+    ("r13-h17", "g5", 0, "- `env LC_ALL=C git diff | wc -L`\n"),
+    ("r13-h18", "g5", 0, "- `git diff --staged | wc -L`\n"),
+    ("r13-h19", "g5", 0, "- `git diff --cached --no-ext-diff -- scripts/a.py | wc -L`\n"),
+    ("r13-h20", "g5", 0, "- `git diff HEAD~1..HEAD -- scripts/a.py | wc -L`\n"),
+    ("r13-h21", "g5", 1, "- `LANG=C GIT_EXTERNAL_DIFF=cat git diff | wc -L`\n"),
+    ("r13-h09", "g5", 0, "- `git diff --no-ext-diff | wc -L`\n"),
+    ("r13-h10", "g5", 0, "- `git diff | wc -L`\n"),
+    ("r13-k01", "g6", 1, "- `printf '%s\\n' \"$(cat scripts/a.py)\" 'git diff' | wc -L`\n"),
+)
+
+ROUND13_G5_LENGTH_ROWS: tuple[tuple[str, str, bool], ...] = (
+    ("context 3 accepted", "git diff -U3 | wc -L", False),
+    ("context 4 refused", "git diff -U4 | wc -L", True),
+    ("long context 3 accepted", "git diff --unified=3 | wc -L", False),
+    ("long context 4 refused", "git diff --unified=4 | wc -L", True),
+    ("locale upper-case name accepted", "LC_CTYPE=C git diff | wc -L", False),
+    ("locale lower-case name refused", "LC_ctype=C git diff | wc -L", True),
+    ("pager assignment without option refused", "GIT_PAGER=cat git diff | wc -L", True),
+    ("leading output redirect accepted", "> out.txt git diff | wc -L", False),
+    ("leading input redirect refused", "< scripts/a.py git diff | wc -L", True),
+    ("allow-listed option after redirect", "git diff 2>/dev/null --stat | wc -L", False),
+    ("refused option after redirect", "git diff 2>/dev/null --ext-diff | wc -L", True),
+    ("options stop at double dash", "git diff -- --ext-diff | wc -L", False),
+    ("pager option still allowed", "git --no-pager diff | wc -L", False),
 )
 
 FALLBACK_TOOLS = ("awk", "gawk", "mawk", "nawk", "grep", "egrep", "fgrep", "rg", "wc", "cat")
@@ -834,6 +934,48 @@ JOIN_DIFFERENTIAL_BRIEFS: tuple[str, ...] = (
     "limit: at most 80 columns.\n\n"
     + "Do not join it onto one line.\n\nJoin it onto one line.\n" * 20,
 )
+
+
+JOIN_COST_HEAD = "at most 80 cols\n"
+JOIN_COST_LINE = "Do not join the call onto one line\n"
+JOIN_COST_COPIES = 9000
+JOIN_COST_LIMIT = 4
+
+
+def reference_join_segment(
+    content: str, boundaries: lane_brief.JoinBoundaries, position: int
+) -> str:
+    """Return the segment as the slice-based helper of the previous version built it."""
+    index = bisect.bisect_right(boundaries.ends, position)
+    if index < len(boundaries.starts) and boundaries.starts[index] < position:
+        return lane_brief.JOIN_BOUNDARY.split(content[:position])[-1]
+    begin = boundaries.ends[index - 1] if index else 0
+    return content[begin:position]
+
+
+def reference_join_excluded(
+    content: str, match: re.Match[str], boundaries: lane_brief.JoinBoundaries
+) -> bool:
+    """Return the exclusion verdict as the slice-based helper of the previous version did."""
+    start, end = lane_brief.line_bounds(content, match.start(), match.end())
+    line = content[start:end]
+    if lane_brief.FINDING_PREFIX.match(line) or lane_brief.is_host_record(line):
+        return True
+    segment = reference_join_segment(content, boundaries, match.start())
+    return bool(lane_brief.JOIN_NEGATION.search(segment))
+
+
+class SliceCountingStr(str):
+    """A str that counts the characters copied by slices taken from it."""
+
+    copied = 0
+
+    def __getitem__(self, key: int | slice) -> str:
+        """Return the item and count the characters of a slice."""
+        result = super().__getitem__(key)
+        if isinstance(key, slice):
+            self.copied += len(result)
+        return result
 
 
 class CountingPattern:
@@ -2130,16 +2272,26 @@ class LaneBriefTest(unittest.TestCase):
         extra_ids = [row[0] for row in ROUND12_EXTRA_ROWS]
         self.assertEqual(len(extra_ids), len(set(extra_ids)))
 
-    def round12_rows(self, finding: str) -> None:
-        """Check the round-12 rows of one finding against their wanted status."""
+    def case_rows(
+        self, finding: str, *tables: tuple[tuple[str, str, int, str], ...], minimum: int = 2
+    ) -> None:
+        """Check the rows of one finding in the given case tables against their wanted status."""
         worktree, _outer, nested_commit = self.nested_commit_fixture()
         absolute = str(worktree.resolve() / "sub" / "nested")
-        rows = [row for row in (*ROUND12_CASES, *ROUND12_EXTRA_ROWS) if row[1] == finding]
-        self.assertGreater(len(rows), 2)
+        rows = [row for table in tables for row in table if row[1] == finding]
+        self.assertGreater(len(rows), minimum)
         for case_id, _finding, want, content in rows:
             text = content.replace("{ABS}", absolute).replace("{NESTED}", nested_commit)
             with self.subTest(case=case_id):
                 self.assertEqual(self.conflict_rc(text, worktree), want)
+
+    def round12_rows(self, finding: str) -> None:
+        """Check the round-12 rows of one finding against their wanted status."""
+        self.case_rows(finding, ROUND12_CASES, ROUND12_EXTRA_ROWS)
+
+    def round13_rows(self, finding: str, *, minimum: int = 2) -> None:
+        """Check the round-13 rows of one finding against their wanted status."""
+        self.case_rows(finding, ROUND13_CASES, minimum=minimum)
 
     def test_round12_f1_cases_stay_refused(self) -> None:
         """Keep malformed spans with a length check refused and others accepted."""
@@ -2216,6 +2368,141 @@ class LaneBriefTest(unittest.TestCase):
     def test_round12_f11_every_c_step_must_exist(self) -> None:
         """Skip a nested repository when any git -C step names no directory."""
         self.round12_rows("f11")
+
+    def test_round13_case_ids_complete(self) -> None:
+        """Keep all 72 round-13 case ids present exactly once with six findings."""
+        ids = [row[0] for row in ROUND13_CASES]
+        self.assertEqual(len(ids), 72)
+        self.assertEqual(len(set(ids)), 72)
+        self.assertTrue(all(case_id.startswith("r13-") for case_id in ids))
+        counts = [sum(row[1] == f"g{n}" for row in ROUND13_CASES) for n in range(1, 7)]
+        self.assertEqual(counts, [18, 13, 14, 5, 21, 1])
+
+    def test_round13_g1_leading_redirect_runs_make(self) -> None:
+        """Find make after leading redirects, assignments, and wrappers in any order."""
+        self.round13_rows("g1")
+
+    def test_round13_g1_command_word_index_skips_redirects(self) -> None:
+        """Find the command word after joined descriptor, wrapper, and target-named redirects."""
+        rows = (
+            ("2>err make x", "make", 3),
+            ("env >log make x", "make", 3),
+            ("> make fate-x", "fate-x", 2),
+            ("FOO=1 2>&1 nohup >log make", "make", 7),
+            ("'>' make fate-x", ">", 0),
+            (">", ">", 0),
+            ("2>", "2", 0),
+        )
+        for span, word, want in rows:
+            with self.subTest(span=span):
+                tokens = lane_brief.span_shell_tokens(span)
+                self.assertIsNotNone(tokens)
+                index = lane_brief.command_word_index(tokens, 0, strict=False)
+                self.assertEqual((str(tokens[index]), index), (word, want))
+        widths = (("2>err make", 3), ("> make fate-x", 2), ("<in make", 2), ("make", 0), ("2>", 0))
+        for span, want in widths:
+            with self.subTest(width=span):
+                tokens = lane_brief.span_shell_tokens(span)
+                self.assertEqual(lane_brief.redirect_width(tokens, 0), want)
+
+    def test_round13_g2_redirect_then_word_is_another_target(self) -> None:
+        """Refuse a word after the redirects that follow verify-all, parsed or not."""
+        self.round13_rows("g2")
+
+    def test_round13_g2_fallback_redirect_run_is_linear(self) -> None:
+        """Judge 10000 redirects after verify-all with possessive quantifiers only."""
+        quantifiers = re.findall(r"[*+?]+", lane_brief.VERIFY_ALL_TAIL.replace("(?:", "("))
+        self.assertTrue(quantifiers)
+        self.assertEqual(set(quantifiers), {"*+", "++"})
+        redirects = " >/dev/null" * 10000
+        rows = (
+            (f"make verify-all{redirects}", False),
+            (f"make verify-all{redirects} && true", False),
+            (f'make verify-all{redirects} "', True),
+            (f"make verify-all{redirects} clean", True),
+            ('make verify-all 2>&1 "', True),
+            ("make verify-all 2>&1 | tail '", False),
+        )
+        for span, refused in rows:
+            with self.subTest(span=span[:40], size=len(span)):
+                self.assertEqual(lane_brief.MAKE_COMMAND.search(span) is not None, refused)
+
+    def test_round13_g3_group_spans_by_depth(self) -> None:
+        """Pair each opening token with its matching close; an open group ends at the stage end."""
+        words = lane_brief.span_shell_tokens("echo $(a (b) c) d")
+        self.assertEqual(lane_brief.group_spans(words), [(1, 7), (3, 5)])
+        self.assertEqual(lane_brief.group_spans(["echo", "(", "wc"]), [(1, 3)])
+        self.assertEqual(lane_brief.group_spans(["echo", ")", "wc"]), [])
+
+    def test_round13_g3_group_command_position(self) -> None:
+        """Judge each substitution or subshell of a print command by its own command word."""
+        self.round13_rows("g3")
+
+    def test_round13_g4_join_negation_cases(self) -> None:
+        """Keep the join negation results while the search runs on offsets."""
+        self.round13_rows("g4", minimum=4)
+
+    def compare_join_reference(self, content: str) -> int:
+        """Compare segment and exclusion of every join match with the reference; count them."""
+        boundaries = lane_brief.scan_join_boundaries(content)
+        reference = lane_brief.scan_join_boundaries(content)
+        seen = 0
+        for match in lane_brief.ONE_LINE_JOIN.finditer(content):
+            seen += 1
+            begin, end = lane_brief.earlier_join_segment(content, boundaries, match.start())
+            want = reference_join_segment(content, reference, match.start())
+            self.assertEqual(content[begin:end], want, content[:60])
+            got_excluded = lane_brief.join_is_excluded(content, match, boundaries)
+            want_excluded = reference_join_excluded(content, match, reference)
+            self.assertEqual(got_excluded, want_excluded, content[:60])
+        return seen
+
+    def test_round13_g4_segments_equal_slice_reference(self) -> None:
+        """Match the slice-based reference on every join match, also across a straddling match."""
+        rows = [row[3] for row in ROUND13_CASES if row[1] == "g4"]
+        seen = sum(self.compare_join_reference(content) for content in JOIN_DIFFERENTIAL_BRIEFS)
+        seen += sum(self.compare_join_reference(content) for content in rows)
+        self.assertGreater(seen, 100)
+        pattern = re.compile(r"x\s*join|x ")
+        straddling = (
+            "x join into one line",
+            "x x join onto one line",
+            "a x join into one line. x joins into one line",
+        )
+        with patch.object(lane_brief, "JOIN_BOUNDARY", pattern):
+            inside = sum(self.compare_join_reference(content) for content in straddling)
+        self.assertEqual(inside, 4)
+
+    def test_round13_g4_join_check_copies_little_text(self) -> None:
+        """Copy at most four times the content length through slices on the join cost input."""
+        content = SliceCountingStr(JOIN_COST_HEAD + JOIN_COST_LINE * JOIN_COST_COPIES)
+        self.assertEqual(lane_brief.conflict_join_under_column_limit(content), "")
+        self.assertLessEqual(content.copied, JOIN_COST_LIMIT * len(content))
+
+    def test_round13_g5_allow_list_cases(self) -> None:
+        """Accept only locale assignments and allow-listed git diff options."""
+        self.round13_rows("g5")
+
+    def test_round13_g5_allow_list_boundaries(self) -> None:
+        """Hold the context size, locale name, redirect, and option boundaries of the allow-list."""
+        for tag, span, want in ROUND13_G5_LENGTH_ROWS:
+            with self.subTest(tag=tag):
+                self.assertEqual(lane_brief.span_whole_file_length_refused(span), want)
+
+    def test_round13_g5_option_and_assignment_judges(self) -> None:
+        """Judge single option words and assignment words directly."""
+        for token in ("--cached", "--stat", "-U0", "-U3", "--unified=2"):
+            self.assertTrue(lane_brief.git_diff_option_allowed(token), token)
+        for token in ("-U4", "-U03", "-U", "--unified=4", "-W", "-O", "--ext-diff", "--output=x"):
+            self.assertFalse(lane_brief.git_diff_option_allowed(token), token)
+        stage = ["LANG=C", "LC_ALL=C", "git", "diff"]
+        self.assertTrue(lane_brief.git_prefix_assignments_allowed(stage, 2))
+        stage = ["LANG=C", "GIT_DIR=x", "git", "diff"]
+        self.assertFalse(lane_brief.git_prefix_assignments_allowed(stage, 2))
+
+    def test_round13_g6_printf_first_stage_stays_refused(self) -> None:
+        """Keep a printf first stage that only names git diff refused."""
+        self.round13_rows("g6", minimum=0)
 
     def test_fix11_g1_scanner_flags(self) -> None:
         """Pin quoted, operator, and joined flags of scanner tokens."""
@@ -2318,8 +2605,10 @@ class LaneBriefTest(unittest.TestCase):
             for match in lane_brief.ONE_LINE_JOIN.finditer(content):
                 seen += 1
                 want = lane_brief.JOIN_BOUNDARY.split(content[: match.start()])[-1]
-                got = lane_brief.earlier_join_segment(content, boundaries, match.start())
-                self.assertEqual(got, want, content[:60])
+                got_begin, got_end = lane_brief.earlier_join_segment(
+                    content, boundaries, match.start()
+                )
+                self.assertEqual(content[got_begin:got_end], want, content[:60])
         self.assertGreater(seen, 100)
 
     def test_fix11_f3_straddling_boundary_matches_split(self) -> None:
@@ -2333,7 +2622,8 @@ class LaneBriefTest(unittest.TestCase):
             self.assertLess(boundaries.starts[0], match.start())
             self.assertLess(match.start(), boundaries.ends[0])
             want = pattern.split(content[: match.start()])[-1]
-            got = lane_brief.earlier_join_segment(content, boundaries, match.start())
+            begin, end = lane_brief.earlier_join_segment(content, boundaries, match.start())
+        got = content[begin:end]
         self.assertEqual(got, want)
         self.assertEqual(got, "")
 

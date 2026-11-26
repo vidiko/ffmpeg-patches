@@ -126,7 +126,10 @@ class MessageTest(GitFixture):
                 self.assertEqual(result.returncode, expected, result.stderr)
                 if expected:
                     self.assertIn("no Signed-off-by", result.stderr)
-                    self.assertIn("amend with the sign-off option", result.stderr)
+                    self.assertIn(
+                        "retry the refused git commit command with the sign-off option",
+                        result.stderr,
+                    )
                     self.assertIn("in-progress merge", result.stderr)
                     self.assertNotIn("merge with the sign-off option", result.stderr)
                     self.assertNotIn("git merge", result.stderr)
@@ -182,7 +185,11 @@ class MessageTest(GitFixture):
         message = self.root / "message"
         other = "Signed-off-by: Other <other@example.invalid>"
         cases = (
-            ("Subject\n", "amend with the sign-off option", "exactly one"),
+            (
+                "Subject\n",
+                "retry the refused git commit command with the sign-off option",
+                "exactly one",
+            ),
             (f"Subject\n\n{TRAILER}\n{TRAILER}\n", "exactly one", "amend with"),
             (f"Subject\n\n{other}\n", "exactly one", "amend with"),
         )
@@ -256,6 +263,56 @@ class MessageTest(GitFixture):
                 result = self.cli(message)
                 self.assertEqual(result.returncode, expected, result.stderr)
         self.assertEqual(signoff.message_values(percent, str(self.root)), [])
+
+    def test_trailer_key_alias_is_not_counted(self) -> None:
+        """Ignore trailer.<token>.key aliases from repo, environment and global config."""
+        aliased = f"Subject\n\nApproved-by: {IDENTITY}\n"
+        self.git("config", "trailer.Approved-by.key", "Signed-off-by")
+        self.assertEqual(signoff.message_values(aliased, str(self.root)), [])
+        literal = f"Subject\n\nOne\nTwo\nThree\n{TRAILER}\n"
+        folded = "Subject\n\nSigned-off-by: Signoff Fixture\n <signoff@example.invalid>\n"
+        self.assertEqual(signoff.message_values(literal, str(self.root)), [IDENTITY])
+        self.assertEqual(signoff.message_values(folded, str(self.root)), [IDENTITY])
+        self.git("config", "--unset", "trailer.Approved-by.key")
+        param = "'trailer.Approved-by.key=Signed-off-by'"
+        with unittest.mock.patch.dict(os.environ, {"GIT_CONFIG_PARAMETERS": param}):
+            self.assertEqual(signoff.message_values(aliased, str(self.root)), [])
+        count_env = {
+            "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_KEY_0": "trailer.Approved-by.key",
+            "GIT_CONFIG_VALUE_0": "Signed-off-by",
+        }
+        with unittest.mock.patch.dict(os.environ, count_env):
+            self.assertEqual(signoff.message_values(aliased, str(self.root)), [])
+        global_cfg = self.root / "global.gitconfig"
+        global_cfg.write_text('[trailer "Approved-by"]\n\tkey = Signed-off-by\n', encoding="utf-8")
+        with unittest.mock.patch.dict(os.environ, {"GIT_CONFIG_GLOBAL": str(global_cfg)}):
+            self.assertEqual(signoff.message_values(aliased, str(self.root)), [])
+
+    def test_main_commit_msg_repair_texts_never_advise_amend(self) -> None:
+        """Print commit-msg retry and edit instructions without advising --amend."""
+        previous = Path.cwd()
+        os.chdir(self.root)
+        self.addCleanup(os.chdir, previous)
+        message = self.root / "COMMIT_MSG"
+        message.write_text("Subject without signoff\n", encoding="utf-8")
+        status, _, err = capture_main(signoff.main, "--message-file", str(message))
+        self.assertEqual(status, 1, err)
+        self.assertIn(
+            "retry the refused git commit command with the sign-off option (git commit --signoff); "
+            "an in-progress merge also concludes with git commit --signoff",
+            err,
+        )
+        self.assertNotIn("--amend", err)
+        message.write_text(f"Subject\n\n{TRAILER}\n{TRAILER}\n", encoding="utf-8")
+        status, _, err = capture_main(signoff.main, "--message-file", str(message))
+        self.assertEqual(status, 1, err)
+        self.assertIn(
+            "edit the message so exactly one Signed-off-by trailer with the expected identity "
+            "remains, then retry the refused git commit command",
+            err,
+        )
+        self.assertNotIn("--amend", err)
 
 
 class CommitRangeTest(GitFixture):
@@ -438,6 +495,35 @@ class CommitRangeTest(GitFixture):
                 self.assertRaises(ValueError),
             ):
                 signoff.check_commits(sha, ZERO, str(self.root))
+
+    def test_commit_trailer_key_alias_is_not_counted(self) -> None:
+        """Refuse an Approved-by commit aliased to Signed-off-by in repo or env config."""
+        aliased = self.commit(f"Subject\n\nApproved-by: {IDENTITY}", signed=False)
+        self.git("config", "trailer.Approved-by.key", "Signed-off-by")
+        self.assertEqual(
+            signoff.check_commits(aliased, ZERO, str(self.root)),
+            f"commit {aliased}: no Signed-off-by trailer",
+        )
+        signed = self.commit("signed with alias configured", signed=True)
+        self.assertIsNone(signoff.check_commits(signed, aliased, str(self.root)))
+        self.git("config", "--unset", "trailer.Approved-by.key")
+        param = "'trailer.Approved-by.key=Signed-off-by'"
+        with unittest.mock.patch.dict(os.environ, {"GIT_CONFIG_PARAMETERS": param}):
+            self.assertEqual(
+                signoff.check_commits(aliased, ZERO, str(self.root)),
+                f"commit {aliased}: no Signed-off-by trailer",
+            )
+
+    def test_log_output_encoding_requests_utf8(self) -> None:
+        """Decode non-ASCII sign-off identities as UTF-8 despite i18n.logOutputEncoding."""
+        self.git("config", "user.name", "José Fixture")
+        self.git("config", "i18n.logOutputEncoding", "ISO-8859-1")
+        sha = self.commit("utf8 signoff", signed=True)
+        try:
+            reason = signoff.check_commits(sha, ZERO, str(self.root))
+        except ValueError as exc:
+            self.fail(f"UTF-8 commit failed under logOutputEncoding: {exc}")
+        self.assertIsNone(reason)
 
 
 class MessagePathStdinTest(GitFixture):
@@ -718,6 +804,15 @@ class SignoffDeadlineTest(unittest.TestCase):
             clock.now = 200
             signoff.git(["remote"])
         self.assertEqual(run.call_args.kwargs["timeout"], signoff.GIT_TIMEOUT)
+
+    def test_nested_deadline_scope_keeps_outer_deadline(self) -> None:
+        """Keep the outer clock, start and limit when entering a nested deadline_scope."""
+        clock = FakeClock()
+        with signoff.deadline_scope(limit=5, clock=clock):
+            clock.now = 4.0
+            with signoff.deadline_scope():
+                self.assertLessEqual(signoff.call_timeout(), 1.0)
+            self.assertLessEqual(signoff.call_timeout(), 1.0)
 
 
 if __name__ == "__main__":

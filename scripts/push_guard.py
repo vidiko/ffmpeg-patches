@@ -4,30 +4,40 @@
 """Refuse invalid sign-offs, revived closed pull requests and unanswered bot review bodies.
 
 At most 256 pull request lookups may start within a 120-second check deadline,
-and review reads end by that deadline. The local sign-off reads of all updates
-run first under their own 120-second sign-off deadline, before the check
-deadline starts. Remote configuration queries share a 30-second deadline.
+and review reads end by that deadline. Reading pre-push updates from stdin,
+proving remote history attribution and checking local commit sign-offs all share
+one prior 120-second sign-off deadline (with the stdin wait bounded by the
+smaller of 10 seconds and the sign-off time left), before the pull request check
+deadline starts. Remote configuration queries for repository discovery share a
+30-second deadline.
 
     push_guard.py REMOTE_NAME REMOTE_URL
         Read Git pre-push ref updates from stdin. For each branch update,
         validate introduced commits (including merges) against the configured
-        sign-off identity before any GitHub query. Named pushes check introduced
-        history against the destination remote only; bare URLs check only the
-        advertised head. Then query its pull requests
-        through gh, newest first (fewer than 100). Non-GitHub remotes still
-        require valid sign-offs; tags and
-        branch deletions skip sign-off checks. These updates pass without
-        querying GitHub. For each open pull request, read its reviews and
-        issue comments in the pull request's base repository (at most 10
-        pages of 100 each) and refuse while a bot review with a body has no
-        later human review or comment.
+        sign-off identity using Git's config-isolated literal trailer parser
+        before any GitHub query. Tracking refs of REMOTE_NAME limit introduced
+        commits only when REMOTE_NAME is configured, is not nested under another
+        configured remote, every configured remote uses its default fetch refspec,
+        and REMOTE_URL equals Git's expanded fetch URL for REMOTE_NAME (excluding
+        refs of any remote nested under REMOTE_NAME); otherwise, as for bare URLs,
+        only the advertised head limits history. Refusal advice recommends --amend
+        only when the rejected commit is the checked-out HEAD. Then query its pull
+        requests through gh, newest first (fewer than 100). Non-GitHub remotes still
+        require valid sign-offs; tags and branch deletions skip sign-off checks.
+        These updates pass without querying GitHub. For each open pull request,
+        read its reviews and issue comments in the pull request's base repository
+        (at most 10 pages of 100 each) and refuse while a bot review with a body
+        has no later human review or comment.
 
     push_guard.py --from-config
         Check each update against every GitHub repository in configured remote
         expanded push URLs because lefthook cannot safely pass the pushed remote.
-        Sign-off checks use every configured remote and only add refusals;
-        a stale second remote missing origin history may refuse until fetched or
-        removed. A matching closed PR head in another repository also refuses
+        Sign-off checks union introduced commits across every configured remote;
+        a remote's tracking history counts only when every configured remote has
+        its default fetch refspec, the remote is not nested under another
+        configured remote, and its expanded push URLs are a single URL equal to
+        its fetch URL, so any unproved or stale remote widens the checked set.
+        A matching closed PR head in another repository also refuses
         the push (fail closed); rename the branch to proceed.
         Known gap: a push to a bare URL absent from all configured remotes
         is not seen in this mode.
@@ -497,12 +507,11 @@ def branch_update(line: str) -> tuple[str, str, str] | None:
     return remote_ref.removeprefix("refs/heads/"), local_sha, remote_sha
 
 
-def signoff_considered_remotes(remote_name: str, cwd: str | None) -> list[str]:
-    """Return the push destination alone when it is configured, otherwise an empty list."""
-    names = signoff.configured_remotes(cwd)
-    if remote_name in names:
-        return [remote_name]
-    return []
+def signoff_considered_remotes(
+    remote_name: str, remote_url: str, cwd: str | None
+) -> tuple[list[str], tuple[str, ...]]:
+    """Prove whether the destination remote limits history and list nested exclusions."""
+    return signoff.attributable_remotes(cwd, (remote_name, remote_url))
 
 
 def check_signoff_update(line: str, considered_remotes: list[str] | None = None) -> int:
@@ -513,10 +522,8 @@ def check_signoff_update(line: str, considered_remotes: list[str] | None = None)
     branch, local_sha, remote_sha = update
     reason = signoff.check_commits(local_sha, remote_sha, considered_remotes=considered_remotes)
     if reason:
-        print(
-            f"push_guard: refusing branch {branch}: {reason}; {signoff.repair_text(reason)}",
-            file=sys.stderr,
-        )
+        repair = signoff.repair_text(reason, branch=branch, head_sha=signoff.checked_out_head())
+        print(f"push_guard: refusing branch {branch}: {reason}; {repair}", file=sys.stderr)
         return 1
     return 0
 
@@ -553,16 +560,19 @@ def _collect_stdin(stream: TextIO, chunks: list[str], errors: list[Exception]) -
 
 
 def read_stdin() -> io.StringIO:
-    """Collect text stdin with a portable deadline and a UTF-8 byte cap."""
+    """Collect text stdin within STDIN_DEADLINE and any active sign-off deadline."""
+    timeout = signoff.call_timeout(STDIN_DEADLINE)
     chunks: list[str] = []
     errors: list[Exception] = []
     worker = threading.Thread(target=_collect_stdin, args=(sys.stdin, chunks, errors), daemon=True)
     worker.start()
-    worker.join(timeout=STDIN_DEADLINE)
+    worker.join(timeout=timeout)
     if worker.is_alive():
-        raise ValueError(f"stdin deadline exceeded ({STDIN_DEADLINE} seconds)")
+        signoff.call_timeout(STDIN_DEADLINE)
+        raise ValueError(f"stdin deadline exceeded ({timeout} seconds)")
     if errors:
         raise errors[0]
+    signoff.call_timeout(STDIN_DEADLINE)
     return io.StringIO("".join(chunks))
 
 
@@ -629,6 +639,7 @@ def read_update_lines(updates: TextIO) -> list[str]:
 def check_signoffs(lines: list[str], considered_remotes: list[str] | None) -> int:
     """Check every update's sign-offs under one sign-off deadline; the first refusal wins."""
     with signoff.deadline_scope():
+        signoff.call_timeout()
         for line in lines:
             status = check_signoff_update(line, considered_remotes)
             if status:
@@ -647,8 +658,9 @@ def check_updates(
     try:
         if len(repositories) > MAX_REPOSITORIES:
             raise ValueError(f"more than {MAX_REPOSITORIES} GitHub repositories")
-        lines = read_update_lines(read_stdin())
-        status = check_signoffs(lines, considered_remotes)
+        with signoff.deadline_scope():
+            lines = read_update_lines(read_stdin())
+            status = check_signoffs(lines, considered_remotes)
         if status:
             return status
         start = clock()
@@ -689,19 +701,27 @@ def main(
         return 2
     if not repositories:
         print("push_guard: non-GitHub remote; skipping pull request checks", file=sys.stderr)
-    considered: list[str] | None = None
-    if not args.from_config:
-        try:
-            considered = signoff_considered_remotes(args.remote_name, None)
-        except ValueError as exc:
-            print(
-                f"push_guard: cannot read configured remotes: {exc}; refusing (fail closed)",
-                file=sys.stderr,
+    with signoff.deadline_scope():
+        considered: list[str] | None = None
+        excluded: tuple[str, ...] = ()
+        if not args.from_config:
+            try:
+                considered, excluded = signoff_considered_remotes(
+                    args.remote_name, args.remote_url, None
+                )
+            except ValueError as exc:
+                print(
+                    f"push_guard: cannot read configured remotes: {exc}; refusing (fail closed)",
+                    file=sys.stderr,
+                )
+                return 2
+        with signoff.excluded_remotes_scope(excluded):
+            return check_updates(
+                repositories,
+                reader,
+                activity=activity_reader,
+                considered_remotes=considered,
             )
-            return 2
-    return check_updates(
-        repositories, reader, activity=activity_reader, considered_remotes=considered
-    )
 
 
 if __name__ == "__main__":

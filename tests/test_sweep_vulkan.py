@@ -427,9 +427,12 @@ void main() {
 
 
 def load_mutant_module(rel_path: str, old: str, new: str, tmp: Path) -> ModuleType:
-    """Load one mutated sweep module copy from a temporary directory."""
+    """Load a sweep module copy with exactly one matching mutation anchor."""
     root = Path(__file__).resolve().parents[1]
     source = (root / rel_path).read_text(encoding="utf-8")
+    anchor_count = source.count(old)
+    if anchor_count != 1:
+        raise RuntimeError(f"{rel_path}: expected one mutation anchor, found {anchor_count}")
     mutant_path = tmp / "mutant.py"
     mutant_path.write_text(source.replace(old, new, 1), encoding="utf-8")
     name = f"mutant_{mutant_path.stem}_{id(mutant_path)}"
@@ -1938,6 +1941,211 @@ class VulkanSweepTest(unittest.TestCase):
             with self.subTest(label=label):
                 self.assertIsNone(sweep_port_parity.shader_site("s.comp.glsl", source, kind))
 
+    def test_cr22_balanced_sample_subscripts(self) -> None:
+        """Sample operators follow the outer subscript and keep the read's line."""
+        cases = [
+            ("nested_shift", "x = src[indices[i]] >> 4;", [(1, "shift")]),
+            ("nested_mask", "x = src[a[b[i]]] & 0xff;", [(1, "mask")]),
+            ("multiline", "x = src[indices[\n    i]] >> 4;", [(1, "shift")]),
+            ("flat", "x = src[i] >> 4;", [(1, "shift")]),
+            ("addition", "x = src[indices[i]] + 4;", []),
+            ("unbalanced", "x = src[indices[i] >> 4;", [(1, "shift")]),
+        ]
+        for label, source, expected in cases:
+            with self.subTest(label=label):
+                self.assertEqual(sweep_port_parity.cpu_sites(source + "\n"), expected)
+
+    def test_cr22_loop_header_binding_ends_at_assignment(self) -> None:
+        """A loop-header assignment ends the sample binding after its right-hand side."""
+        cases = [
+            ("plain", "(v = flags, v & 0xffu); ", []),
+            ("compound", "(v |= flags, v & 0xffu); ", []),
+            ("shift_assign", "(v >>= 1, v & 0xffu); ", []),
+            ("mask_before_write", "(v & 0xffu, v = flags); ", [(1, "mask")]),
+            ("equal", "(v == 3, v & 0xffu); ", [(1, "mask")]),
+            ("not_equal", "(v != 3, v & 0xffu); ", [(1, "mask")]),
+            ("less_equal", "(v <= 3, v & 0xffu); ", [(1, "mask")]),
+            ("greater_equal", "(v >= 3, v & 0xffu); ", [(1, "mask")]),
+            ("mask_only", "v & 0xffu; ", [(1, "mask")]),
+            ("rhs", "v; v = v >> 1", [(1, "shift")]),
+            ("shift_before_write", "(v >> 4, v = flags); ", [(1, "shift")]),
+        ]
+        for label, tail, expected in cases:
+            with self.subTest(label=label):
+                source = f"for (unsigned v = src[0]; {tail}) {{}}\n"
+                self.assertEqual(sweep_port_parity.cpu_sites(source), expected)
+
+    def test_cr22_helper_parameter_at_load_position(self) -> None:
+        """A helper attributes normalization to the load's own parameter."""
+        px_first = "uint px, uint flags"
+        flags_first = "uint flags, uint px"
+        load_first = "uint r = combine(imageLoad(img, pos).r, flags);"
+        load_second = "uint r = combine(flags, imageLoad(img, pos).r);"
+        cases = [
+            ("other_parameter", px_first, "flags", (load_first,), None),
+            ("wrong_position", flags_first, "px", (load_first,), None),
+            ("first", px_first, "px", (load_first,), "s.comp.glsl:7"),
+            ("second", flags_first, "px", (load_second,), "s.comp.glsl:7"),
+            ("qualified", "in uint px, in uint flags", "px", (load_first,), "s.comp.glsl:7"),
+            (
+                "cache_by_position",
+                px_first,
+                "flags",
+                (load_first, "uint b = combine(flags, imageLoad(img, pos).g);"),
+                "s.comp.glsl:8",
+            ),
+            ("too_few_parameters", "uint px", "px", (load_second,), None),
+            ("member", px_first, "flags.px", (load_first,), None),
+            (
+                "nested_comma",
+                flags_first,
+                "px",
+                ("uint r = combine(pair(flags, mask), imageLoad(img, pos).r);",),
+                "s.comp.glsl:7",
+            ),
+        ]
+        for label, parameters, operand, calls, expected in cases:
+            with self.subTest(label=label):
+                helper = f"uint combine({parameters})\n{{\n    return {operand} & 0xffu;\n}}\n"
+                source = helper + shader_line_source(*calls)
+                self.assertEqual(
+                    sweep_port_parity.shader_site("s.comp.glsl", source, "mask"), expected
+                )
+
+    def test_cr22_shader_binding_ends_at_overwrite(self) -> None:
+        """Only an overwrite at the load's block depth ends the forward scan."""
+        output = "uint o = px & 0xffu;"
+        site = "s.comp.glsl:3"
+        cases = [
+            ("plain", ("px = flags;", output), None),
+            ("compound", ("px |= flags;", output), None),
+            ("rhs", ("px = px & 0xffu;",), site),
+            ("mask_only", (output,), site),
+            ("mask_before_write", (output, "px = flags;"), site),
+            ("comparison", ("bool z = px == flags;", output), site),
+            ("nested_assignment", ("if (c) {", "px = flags;", "}", output), site),
+            ("other_rhs", ("px = flags & 0xffu;",), None),
+            ("compound_mask", ("px &= 0xffu;",), None),
+        ]
+        for label, tail, expected in cases:
+            with self.subTest(label=label):
+                source = shader_line_source("uint px = imageLoad(img, pos).r;", *tail)
+                self.assertEqual(
+                    sweep_port_parity.shader_site("s.comp.glsl", source, "mask"), expected
+                )
+
+    def test_cr22_shader_symbol_identifier_boundaries(self) -> None:
+        """Shader symbols link only as whole identifiers in first-seen order."""
+        path = "libavfilter/vulkan/test.comp.glsl"
+        cases = [
+            ("suffix", "x = ff_test_comp_spv_data_backup;", []),
+            ("prefix_letter", "x = xff_test_comp_spv_data;", []),
+            ("prefix_underscore", "x = _ff_test_comp_spv_data;", []),
+            ("exact", "x = ff_test_comp_spv_data;", [path]),
+            (
+                "ordered_unique",
+                (
+                    "extern const unsigned char ff_test_comp_spv_data[];\n"
+                    "p = &ff_test_comp_spv_data;\nq = ff_b_comp_spv_data;\n"
+                ),
+                [path, "libavfilter/vulkan/b.comp.glsl"],
+            ),
+        ]
+        for label, source, expected in cases:
+            with self.subTest(label=label):
+                self.assertEqual(sweep_vulkan_features.linked_shaders(source), expected)
+
+    def test_cr22_generic_declaration_separator(self) -> None:
+        """Generic declarations accept one space without backtracking over the separator."""
+        bind_g3_maps_fixture(self)
+        pattern = sweep_vulkan_features.GENERIC_DECL
+        gate = [("GateFeatures", "p")]
+        cases = [
+            ("single_space", "GateFeatures p;", gate),
+            ("tab", "GateFeatures\tp;", gate),
+            ("initialized", "int a = 1;", [("int", "a")]),
+            ("two_spaces", "GateFeatures  p;", gate),
+            ("pointer", "GateFeatures *p;", gate),
+            ("spaced_pointer", "GateFeatures * p;", gate),
+            ("double_pointer", "GateFeatures  **p,", gate),
+            ("no_space", "GateFeatures*p;", []),
+            ("no_space_before_star", "GateFeatures* p;", []),
+            ("pointer_shape", "x * y;", [("x", "y")]),
+        ]
+        for label, source, expected in cases:
+            with self.subTest(label=label):
+                self.assertEqual(
+                    [(match[1], match[3]) for match in pattern.finditer(source)], expected
+                )
+        for gap in (" ", "  "):
+            with self.subTest(typedef_gap=gap):
+                source = (
+                    "struct Other { int shaderInt64; };\ntypedef struct Other OtherT;\n"
+                    f"int f(void) {{\n    OtherT{gap}p;\n"
+                    "    if (p.shaderInt64) return 1;\n    return 0;\n}\n"
+                )
+                self.assertEqual(sweep_vulkan_features.c_feature_reads(source), [])
+        with self.subTest(separator_length=50_000):
+            source = "a" + " " * 50_000 + "!"
+            start = time.monotonic()
+            self.assertEqual(list(pattern.finditer(source)), [])
+            self.assertLess(time.monotonic() - start, 2.0)
+
+    def test_cr22_parenthesized_feature_receiver(self) -> None:
+        """Redundant parentheses preserve the feature receiver's root type."""
+        bind_g3_maps_fixture(self)
+        feature = ["shaderInt64"]
+        cases = [
+            ("bare", "struct Other *p", "p->", []),
+            ("one_pair", "struct Other *p", "(p)->", []),
+            ("nested", "struct Other *p", "((p))->", []),
+            ("spaced", "struct Other *p", "( p )->", []),
+            ("unresolved", "struct Other *p", "(q)->", feature),
+            ("feature_struct", "VkPhysicalDeviceFeatures *feats", "(feats)->", feature),
+            ("dereference", "struct Other *p", "(*p).", feature),
+            ("member_chain", "struct Outer *p", "((p))->other.", []),
+        ]
+        for label, parameter, receiver, expected in cases:
+            with self.subTest(label=label):
+                source = (
+                    "struct Other { int shaderInt64; };\n"
+                    "struct Outer { struct Other other; };\n"
+                    f"int f({parameter}) {{\n    if ({receiver}shaderInt64) return 1;\n"
+                    "    return 0;\n}\n"
+                )
+                self.assertEqual(
+                    [site.feature for site in sweep_vulkan_features.c_feature_reads(source)],
+                    expected,
+                )
+
+    def test_cr22_unanalyzed_shader_suppresses_required_unused(self) -> None:
+        """An absence row requires every linked shader to have been analyzed."""
+        bind_g3_maps_fixture(self)
+        owner = "libavfilter/vf_t_vulkan.c"
+        shader = "libavfilter/vulkan/a.comp.glsl"
+        checked = [sweep_vulkan_features.FeatureSite(3, "shaderInt64")]
+        cases = [
+            (
+                "unanalyzed",
+                "error: bad",
+                [
+                    (
+                        f"{shader}:1",
+                        "scalarBlockLayout",
+                        "spirv-val rejected both layouts: error: bad",
+                        "unanalyzed",
+                    )
+                ],
+            ),
+            ("analyzed", "", [(f"{owner}:3", "shaderInt64", "none", "required-unused")]),
+        ]
+        for label, diagnostic, expected in cases:
+            with self.subTest(label=label):
+                needs = [sweep_vulkan_features.ShaderNeeds(shader, set(), {}, diagnostic)]
+                self.assertEqual(
+                    sweep_vulkan_features.compare_gates(owner, checked, needs), expected
+                )
+
     def test_cr10_4658985429_linked_shaders_dedupes_repeated_symbols(self) -> None:
         """CR10-5429: repeated extern and use symbols link one shader path in first-seen order."""
         c_source = (
@@ -2731,6 +2939,39 @@ class VulkanFullReportTest(unittest.TestCase):
         self.assertTrue(variant_sweep.validate_full_report(self.output, head))
 
 
+class MutantLoaderTest(unittest.TestCase):
+    """Exercise the source anchor contract independently of the Vulkan tools."""
+
+    def test_cr22_mutant_anchor_exact_once(self) -> None:
+        """Reject missing and repeated anchors and load a unique mutation."""
+        rel_path = "scripts/sweep_vulkan_features.py"
+        source = (Path(__file__).resolve().parents[1] / rel_path).read_text(encoding="utf-8")
+        missing = "MUTANT_LOADER_MISSING_ANCHOR"
+        repeated = "\n    return "
+        unique = "MAX_DIAGNOSTIC = 160"
+        self.assertEqual(source.count(missing), 0)
+        repeated_count = source.count(repeated)
+        self.assertGreaterEqual(repeated_count, 2)
+        self.assertEqual(source.count(unique), 1)
+        cases = (
+            ("missing", missing, missing, 0),
+            ("repeated", repeated, repeated, repeated_count),
+            ("unique", unique, "MAX_DIAGNOSTIC = 161", 1),
+        )
+        for label, old, new, count in cases:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as scratch:
+                if count == 1:
+                    module = load_mutant_module(rel_path, old, new, Path(scratch))
+                    self.assertEqual(module.MAX_DIAGNOSTIC, 161)
+                else:
+                    with self.assertRaises(RuntimeError) as error:
+                        load_mutant_module(rel_path, old, new, Path(scratch))
+                    self.assertEqual(
+                        str(error.exception),
+                        f"{rel_path}: expected one mutation anchor, found {count}",
+                    )
+
+
 class VulkanMutantHarness(unittest.TestCase):
     """Shared synthetic repository setup for planted mutant checks."""
 
@@ -2901,14 +3142,15 @@ class VulkanMutantTest(VulkanMutantHarness):
             self.assertNotIn("| required-unused |", report)
 
         required_branch = (
-            "elif site.feature not in used and not anyof_group_satisfied(\n"
-            "            site.feature, used, checked_names\n"
-            "        ):"
+            "elif (\n"
+            "            fully_analyzed\n"
+            "            and site.feature not in used\n"
+            "            and not anyof_group_satisfied(site.feature, used, checked_names)"
         )
         self.assert_mutant_kills(
             "scripts/sweep_vulkan_features.py",
             required_branch,
-            required_branch.replace("elif site", "elif False and site", 1),
+            required_branch.replace("fully_analyzed", "False and fully_analyzed", 1),
             real,
             mutant,
         )
@@ -3246,11 +3488,13 @@ class VulkanUnvalidatedShaderTest(unittest.TestCase):
 
     def test_diagnostic_is_bounded_and_table_safe(self) -> None:
         """A long stderr line with a pipe yields at most 160 characters and no pipe."""
-        line = ("x" * 200 + "|" + "y" * 300).encode()
+        pipe_index = 80
+        line = ("x" * pipe_index + "|" + "y" * 300).encode()
         with self.assertRaises(sweep_vulkan_features.ShaderValidationError) as caught:
             self.run_scalar((1, b"a\n"), (1, line + b"\n"))
         self.assertLessEqual(len(str(caught.exception)), 160)
         self.assertNotIn("|", str(caught.exception))
+        self.assertEqual(str(caught.exception)[pipe_index], "/")
 
     def test_scalar_verdicts_unchanged(self) -> None:
         """Default-fail then scalar-pass needs scalar; both passing does not."""

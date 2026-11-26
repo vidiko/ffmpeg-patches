@@ -38,7 +38,7 @@ MAX_VULKAN_FILES = 64
 MAX_SHADERS = 64
 MAX_TOOL_BYTES = 8 * 1024 * 1024
 MAX_DIAGNOSTIC = 160
-SHADER_SYMBOL = re.compile(r"ff_(\w+)_comp_spv_data", re.ASCII)
+SHADER_SYMBOL = re.compile(r"\bff_(\w+)_comp_spv_data\b", re.ASCII)
 FEATURE_READ = re.compile(r"(?:\.\s*|->\s*)([A-Za-z]\w*)", re.ASCII)
 FEATURE_STRUCT_DECL = re.compile(
     r"\b(VkPhysicalDevice\w+)\s*(\*+\s*|\s+)(\w+)\s*(?=[,;=)])",
@@ -317,6 +317,10 @@ def collect_targets(
 
 
 _IDENT_TAIL = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_")
+_PAREN_RECEIVER = re.compile(
+    r"((?:\(\s*)+)([A-Za-z_]\w*)((?:\s*\))+)(?=\s*(?:\.|->))",
+    re.ASCII,
+)
 PLAIN_ASSIGN_WINDOW = 256
 WRAPPER_PRED_KEYWORDS = frozenset({"return", "else", "do", "case"})
 
@@ -514,7 +518,7 @@ STRUCT_TAG_DECL = re.compile(
 )
 GENERIC_DECL = re.compile(
     r"\b(?!VkPhysicalDevice|struct|if|for|while|return|sizeof|switch)"
-    r"([A-Za-z_]\w*)\s+(\*+\s*|\s+)(\w+)\s*(?=[,;=)])",
+    r"([A-Za-z_]\w*)\s+(\*+\s*)?(\w+)\s*(?=[,;=)])",
     re.ASCII,
 )
 MEMBER_FIELD_DECL = re.compile(
@@ -883,6 +887,11 @@ def feature_read_receiver_root(masked: str, member_access_start: int) -> str | N
     """Return the root identifier for the receiver of one feature member access."""
     token_start = access_expr_first_token_start(masked, member_access_start)
     limit = len(masked)
+    if token_start < limit and masked[token_start] == "(":
+        match = _PAREN_RECEIVER.match(masked, token_start, member_access_start + 2)
+        if match is not None and match[1].count("(") == match[3].count(")"):
+            return match[2]
+        return None
     for index in range(token_start, limit):
         if masked[index] not in _IDENT_TAIL:
             end = index
@@ -1354,11 +1363,14 @@ def compare_gates(
             evidence_by_feature.setdefault(feature, text)
     rows: list[tuple[str, str, str, str]] = []
     checked_names = {site.feature for site in checked}
+    fully_analyzed = not any(entry.unvalidated for entry in needs)
     for site in checked:
         if site.feature not in MAP_STATE.derivable:
             rows.append((f"{c_path}:{site.line}", site.feature, "n/a", "unmapped"))
-        elif site.feature not in used and not anyof_group_satisfied(
-            site.feature, used, checked_names
+        elif (
+            fully_analyzed
+            and site.feature not in used
+            and not anyof_group_satisfied(site.feature, used, checked_names)
         ):
             rows.append((f"{c_path}:{site.line}", site.feature, "none", "required-unused"))
     for feature in sorted(used - checked_names):

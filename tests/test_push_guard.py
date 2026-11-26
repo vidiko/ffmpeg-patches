@@ -11,6 +11,7 @@ import json
 import os
 import re
 import subprocess  # nosec B404 - mocked queries and local temporary Git repositories.
+import sys
 import tempfile
 import threading
 import time
@@ -18,7 +19,7 @@ import unittest
 import unittest.mock
 from collections.abc import Callable
 
-from scripts import push_guard, signoff
+from scripts import push_guard
 from tests.helpers import GIT_ENVIRONMENT_NAMES, capture_main
 from tests.helpers import isolated_git_environment as without_repository_variables
 from tests.test_signoff import FakeClock, GitFixture, empty_run
@@ -1868,10 +1869,10 @@ class SignoffDeadlinePhaseTest(unittest.TestCase):
         clock = FakeClock()
         run = empty_run(clock, 121)
         reader = unittest.mock.Mock(side_effect=AssertionError("unexpected PR read"))
-        scope = functools.partial(signoff.deadline_scope, clock=clock)
+        scope = functools.partial(push_guard.signoff.deadline_scope, clock=clock)
         with (
             unittest.mock.patch("scripts.signoff.subprocess.run", run),
-            unittest.mock.patch.object(signoff, "deadline_scope", scope),
+            unittest.mock.patch.object(push_guard.signoff, "deadline_scope", scope),
             unittest.mock.patch("sys.stdin", io.StringIO(update())),
         ):
             status, _, err = capture_main(
@@ -1884,6 +1885,42 @@ class SignoffDeadlinePhaseTest(unittest.TestCase):
         self.assertIsNone(re.search(r"(?<!sign-off )check deadline of 120 s passed", err))
         self.assertEqual(run.call_count, 1)
         reader.assert_not_called()
+
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def run_python(*args: str) -> subprocess.CompletedProcess[str]:
+    """Run the current interpreter at the repository root with a deadline and no shell."""
+    return subprocess.run(  # nosec B603 - fixed argv with the running interpreter, no shell.
+        [sys.executable, "-B", *args],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+        stdin=subprocess.DEVNULL,
+        timeout=push_guard.CONFIG_DEADLINE,
+        env=isolated_git_environment(),
+    )
+
+
+class OneSignoffModuleTest(unittest.TestCase):
+    def test_package_import_binds_the_package_signoff_with_scripts_on_sys_path(self) -> None:
+        """Bind scripts.signoff in scripts.push_guard even with the scripts directory first."""
+        code = (
+            "import sys\n"
+            "sys.path.insert(0, sys.argv[1])\n"
+            "from scripts import push_guard, signoff\n"
+            "print(push_guard.signoff is signoff)\n"
+        )
+        done = run_python("-c", code, os.path.join(ROOT, "scripts"))
+        self.assertEqual((done.returncode, done.stdout.strip()), (0, "True"), done.stderr)
+
+    def test_script_run_imports_the_sibling_signoff_as_the_hook_does(self) -> None:
+        """Run scripts/push_guard.py as a script, where only the sibling signoff imports."""
+        done = run_python("scripts/push_guard.py", "origin", "https://example.com/x.git")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn("non-GitHub remote", done.stderr)
 
 
 if __name__ == "__main__":

@@ -56,10 +56,12 @@ from datetime import datetime
 from typing import TextIO
 from urllib.parse import quote, urlsplit
 
-try:
-    import signoff
-except ModuleNotFoundError:
+# Choose by how this file was loaded, never by which import succeeds: with the scripts
+# directory on sys.path the plain import would bind a second module next to scripts.signoff.
+if __package__ == "scripts":
     from scripts import signoff
+else:  # Run as a script by the pre-push hook: only the sibling file is importable.
+    import signoff
 
 MAX_UPDATES = 1000
 MAX_REPOSITORIES = 32

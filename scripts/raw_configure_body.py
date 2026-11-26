@@ -770,6 +770,7 @@ def _inline_twin_node(raw: bytes, scan: _Scan) -> tuple[Any, bytes] | None:
         scan.refusal = hit
         return None
     scan.syntax_roots[twin_raw] = twin_root
+    _prime_inline_verdicts(scan, twin_raw)
     return twin_root, twin_raw
 
 
@@ -788,6 +789,7 @@ def _queue_inline(body: str, scan: _Scan, *, source: bool = False, charge: bool 
         scan.refusal = hit
         return
     scan.syntax_roots[raw] = root
+    _prime_inline_verdicts(scan, raw)
     if source:
         watched = set(scan.literals) | {o for o in scan.script_dirs.values() if o is not None}
         names = _assignment_texts(root, raw, scan.budget, scan.var_scope)
@@ -1509,6 +1511,13 @@ def _prime_fd_tail_verdicts(
     scan.redirect_target_ok[raw] = verdicts
 
 
+def _prime_inline_verdicts(scan: _Scan, raw: bytes) -> None:
+    """Prime a registered inline root; a tail with targets stays unprimed to avoid a call cycle."""
+    tail = find_descriptor_herestring_tail(raw)
+    if tail is not None and not tail[3]:
+        scan.redirect_target_ok[raw] = {}
+
+
 def _fd_herestring_tail_allowlisted(scan: _Scan, raw: bytes) -> bool:
     """Return whether descriptor here-string ERROR spans match the narrow allow-list."""
     if scan.budget.suppress_fd_tail_allow:
@@ -1519,7 +1528,7 @@ def _fd_herestring_tail_allowlisted(scan: _Scan, raw: bytes) -> bool:
     allowed = False
     root = scan.syntax_roots.get(raw)
     tail = find_descriptor_herestring_tail(raw) if root is not None else None
-    if root is not None and tail is not None:
+    if root is not None and tail is not None and raw in scan.redirect_target_ok:
         digit_byte, _line_start, line_end, targets = tail
         errors = collect_error_nodes(root)
         if errors is None:
@@ -1590,17 +1599,24 @@ def _error_hit(node: Any, raw: bytes, scan: _Scan) -> str | None:
     root = scan.syntax_roots.get(raw)
     tail = find_descriptor_herestring_tail(raw) if root is not None else None
     verdicts = scan.redirect_target_ok.get(raw, {})
-    if tail is not None and verdicts:
+    if tail is not None:
         digit_byte, _, line_end, targets = tail
         errors = collect_error_nodes(root)
+        row = node.start_point.row + 1
+        if errors is None:
+            return f"unparsable shell text naming a command near line {row}"
         spans_ok = errors is not None and (
             not errors or errors_within_tail_span(errors, digit_byte, line_end, len(raw))
         )
-        blocked = spans_ok and any(
-            not verdicts.get(piece.decode("utf-8", "surrogateescape"), False) for piece in targets
+        blocked = (
+            bool(verdicts)
+            and spans_ok
+            and any(
+                not verdicts.get(piece.decode("utf-8", "surrogateescape"), False)
+                for piece in targets
+            )
         )
         if blocked:
-            row = node.start_point.row + 1
             return f"unparsable shell text naming a command near line {row}"
     text = _text(node, raw)
     if _dangerous_unparsed_text(text):

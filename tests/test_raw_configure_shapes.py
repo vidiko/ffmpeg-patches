@@ -541,6 +541,29 @@ _R12_SECOND_CAT_ROWS = (
     ("c02", "exec 3<<<moved; cat 0<&3-; cat <&3", ["moved", "moved"]),
     ("c03", "exec 3<<<moved; exec 0<&3-; cat <&3", [None]),
 )
+_R13_UNSTABLE_ROWS = (
+    ("s01", ': first; exec 3<<<"$_"; : second; cat <&3'),
+    ("s03", ': first; exec 3<<<"$_"; cat <&3'),
+    ("s05", 'false; exec 3<<<"$?"; true; cat <&3'),
+    ("s07", 'false; exec 3<<<"$?"; cat <&3'),
+    ("s12", 'set -- first; exec 3<<<"$1"; : second; cat <&3'),
+    ("s13", 'exec 3<<<"$LINENO"; : second; cat <&3'),
+    ("s14", "exec 3<<<\"$(printf '%s' first)\"; : second; cat <&3"),
+    ("s15", 'd=first; exec 3<<<"${d:-x}"; : second; cat <&3'),
+    ("x01", 'exec 3<<<"$!"; : second; cat <&3'),
+    ("x02", 'exec 3<<<"$$"; : second; cat <&3'),
+    ("x03", 'exec 3<<<"$#"; : second; cat <&3'),
+    ("x04", 'd=a; exec 3<<<"${d[0]}"; : second; cat <&3'),
+    ("x05", 'd=a; exec 3<<<"${#d}"; : second; cat <&3'),
+    ("x06", 'exec 3<<<"`date`"; : second; cat <&3'),
+    ("x07", 'exec 3<<<"${PWD}"; : second; cat <&3'),
+    ("x08", 'cat 3<<<"$_" 0<&3'),
+)
+_R13_STABLE_ROWS = (
+    ("s09", 'd=first; exec 3<<<"${d}"; : second; cat <&3', "${d}"),
+    ("s11", 'myVar=first; exec 3<<<"$myVar"; : second; cat <&3', "$myVar"),
+    ("x09", 'd=a; e=b; exec 3<<<"$d$e"; : second; cat <&3', "$d$e"),
+)
 
 
 def _first(items: list[str | None]) -> str | None:
@@ -1817,6 +1840,88 @@ class RawConfigureShapeTest(RawConfigureGuardBase):
         context = self._shape_context()
         self.assertEqual(scan_body(stale, context, BodyBudget())[0], _STALE_REASON)
         self.assertEqual(scan_body(unknown, context, BodyBudget())[0], _UNKNOWN_REASON)
+
+    def test_r13_saved_word_stability_table_both_surfaces(self) -> None:
+        """Refuse a saved word that expands a shell value and keep a plain application name."""
+        for label, command in _R13_UNSTABLE_ROWS:
+            with self.subTest(label=label, surface="tokens"):
+                self._saved_word_want(self._cat_stdin_from_tokens(command), _STALE_REASON)
+            with self.subTest(label=label, surface="bytes"):
+                self._saved_word_want(self._cat_stdin_from_bytes(command), _STALE_REASON)
+        for label, command, want in _R13_STABLE_ROWS:
+            with self.subTest(label=label, surface="tokens"):
+                self._saved_word_want(self._cat_stdin_from_tokens(command), want)
+            with self.subTest(label=label, surface="bytes"):
+                self._saved_word_want(self._cat_stdin_from_bytes(command), want)
+
+    def test_r13_underscore_word_refused_in_script_body(self) -> None:
+        """Refuse the saved underscore expansion when a script body is decided."""
+        body = ': first\nexec 3<<<"$_"\n: second\ncat <&3\n'
+        self.assertEqual(lex_mod.descriptor_dup_refusal(body.encode("utf-8")), _STALE_REASON)
+        self.assertEqual(scan_body(body, self._shape_context(), BodyBudget())[0], _STALE_REASON)
+
+    def _unprimed_scan(self, raw: bytes) -> Any:
+        """Build a scan whose syntax root for raw is registered without any priming."""
+        parser = body_mod.bash_parser()
+        if isinstance(parser, str):
+            self.skipTest(parser)
+        scan = body_mod._Scan(self._shape_context(), BodyBudget())
+        scan.syntax_roots[raw] = parser.parse(raw).root_node
+        return scan
+
+    def test_r13_unprimed_tail_without_targets_is_refused(self) -> None:
+        """Refuse an unprimed tail that names no redirect target; the primed raw passes."""
+        raw = b'delay=$((1 << 2))\npython3 - x 3<<<"/tmp/x"\n'
+        self.assertFalse(body_mod._fd_herestring_tail_allowlisted(self._unprimed_scan(raw), raw))
+        primed = self._unprimed_scan(raw)
+        body_mod._prime_inline_verdicts(primed, raw)
+        self.assertTrue(body_mod._fd_herestring_tail_allowlisted(primed, raw))
+
+    def test_r13_inline_tail_is_primed_at_registration(self) -> None:
+        """Decide an inline targetless tail like the top script only through its priming."""
+        tail = 'delay=$((1 << 2))\npython3 - x 3<<<"/tmp/x"\n'
+        context = self._shape_context()
+        self.assertIsNone(scan_body(tail, context, BodyBudget())[0])
+        inline = f"eval '{tail}'\n"
+        self.assertIsNone(scan_body(inline, context, BodyBudget())[0])
+        with unittest.mock.patch.object(body_mod, "_prime_inline_verdicts"):
+            hit = scan_body(inline, context, BodyBudget())[0]
+        self.assertIn("unparsable shell text naming a command", hit or "")
+
+    def test_r13_escaped_arithmetic_marker_keeps_the_heredoc_visible(self) -> None:
+        """Block the allow-list when an escaped arithmetic marker precedes a heredoc opener."""
+        rows = (
+            b': "\\$((" ; cat <<X ; : "))"\nbody\nX\n: 3<<<foo\necho tail\n',
+            b': "\\$(("; cat <<X\nX\necho after\n',
+        )
+        for raw in rows:
+            line = raw.split(b"\n")[0]
+            opener = line.find(b"<<X")
+            with self.subTest(raw=raw):
+                self.assertTrue(lex_mod.script_blocks_fd_herestring_allowlist(raw))
+                spans = lex_mod._line_arith_spans(line)
+                self.assertFalse(any(begin <= opener < end for begin, end in spans))
+
+    def test_r13_truncated_collection_keeps_the_redirect_target_refusal(self) -> None:
+        """Refuse a refused redirect target when the ERROR collection is truncated."""
+        body = 'delay=$((1 << 2))\npython3 - x 3<<<"$d" > y\n'
+        context = self._shape_context()
+        real = lex_mod.collect_error_nodes
+
+        def truncate(node: Any) -> Any:
+            """Return None for the descriptor script root and the real walk for any other."""
+            return None if b"3<<<" in node.text else real(node)
+
+        refuse = unittest.mock.patch.object(
+            body_mod, "_probe_clean_redirect_target", return_value=False
+        )
+        with refuse:
+            control = scan_body(body, context, BodyBudget())[0]
+            cut = unittest.mock.patch.object(body_mod, "collect_error_nodes", side_effect=truncate)
+            with cut:
+                truncated = scan_body(body, context, BodyBudget())[0]
+        self.assertEqual(control, "unparsable shell text naming a command near line 2")
+        self.assertEqual(truncated, control)
 
     def test_r12_arithmetic_span_balances_nested_parentheses(self) -> None:
         """Close an arithmetic expansion only at the pair that matches its opener."""

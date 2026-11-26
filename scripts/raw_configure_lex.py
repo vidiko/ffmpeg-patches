@@ -42,7 +42,7 @@ _DUP_STDIN = re.compile(rf"(?:{_DESCRIPTOR_PREFIX_STR})?<&([0-9]+)-?{_DUP_OPERAN
 _DUP_STDIN_BYTES = re.compile(
     rb"(?:" + _DESCRIPTOR_PREFIX + rb")?<&\s*([0-9]+)-?" + _DUP_OPERAND_END
 )
-_HS_FD_TAG = re.compile(r"^__RCG_HS_FD([0-9]+)_([0-9]+)(V?)__$")
+_HS_FD_TAG = re.compile(r"^__RCG_HS_FD([0-9]+)_([0-9]+)([VU]?)__$")
 _HS_ZERO_TAG = re.compile(r"^__RCG_HS_0_([0-9]+)__$")
 _DUP_OR_CLOSE_TOK = re.compile(
     rf"^(?:{_DESCRIPTOR_PREFIX_STR})?(<&|>&)([0-9]+-?|-){_DUP_OPERAND_END_STR}"
@@ -528,7 +528,7 @@ def _herestring_tag(prefix: str, val: str, idx: int, herestrings: dict[str, str]
     if _is_stdin_descriptor(prefix):
         tag = f"__RCG_HS_0_{idx}__"
     elif (fd := _descriptor_fd(prefix)) is not None:
-        tag = f"__RCG_HS_FD{fd}_{idx}{'V' if _word_volatile(val) else ''}__"
+        tag = f"__RCG_HS_FD{fd}_{idx}{_word_class(val)}__"
         herestrings[f"__RCG_HS_0_{idx}__"] = val
     else:
         tag = f"__RCG_HS_BR_{idx}__"
@@ -630,6 +630,10 @@ _ASSIGN_WORD = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(?:\[[^\]]*\])?\+?=")
 _FN_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_.:-]*$")
 _NON_ASSIGNING = frozenset(("cat", "echo", "true", ":", "test", "[", "printf"))
 _ARITH_MARKS = ("$((", "$[", "((", "${")
+_PLAIN_EXPANSION = re.compile(
+    r"\$(?:\{(?=[A-Za-z0-9_]*[a-z])[A-Za-z_][A-Za-z0-9_]*\}"
+    r"|(?=[A-Za-z0-9_]*[a-z])[A-Za-z_][A-Za-z0-9_]*)"
+)
 _SUB_TAG = "__RCG_SUB_"
 _TERM_KIND = {
     ";": ";",
@@ -644,7 +648,7 @@ _TERM_KIND = {
 
 
 class _Bound(NamedTuple):
-    """One here-string word held by a descriptor; volatile when it expands a variable."""
+    """One here-string word held by a descriptor; volatile when it expands an application name."""
 
     word: Any
     volatile: bool
@@ -686,11 +690,19 @@ class _Frame:
         self.assigned = False
 
 
-def _word_volatile(word: str | bytes) -> bool:
-    """Return whether a here-string word can expand a variable or run a substitution."""
-    if isinstance(word, bytes):
-        return b"$" in word or b"`" in word
-    return "$" in word or "`" in word
+def _word_class(word: str | bytes) -> str:
+    """Return empty for a literal word, V for plain application names only, U otherwise."""
+    text = word.decode("utf-8", "surrogateescape") if isinstance(word, bytes) else word
+    if "`" in text:
+        return "U"
+    if "$" not in text:
+        return ""
+    return "U" if "$" in _PLAIN_EXPANSION.sub("", text) else "V"
+
+
+def _bound_word(word: Any, flag: str) -> Any:
+    """Return the table value for a saved word: stale at once when its expansion is unstable."""
+    return _STALE if flag == "U" else _Bound(word, bool(flag))
 
 
 def _leading_words(words: list[str]) -> list[str]:
@@ -906,7 +918,7 @@ def _step_stage_token(stage: list[str], idx: int, state: _StageState) -> int:
     if tok.startswith(("__RCG_HD_", "__RCG_HS_")):
         if (fd_match := _HS_FD_TAG.fullmatch(tok)) is not None:
             tag = f"__RCG_HS_0_{fd_match.group(2)}__"
-            state.fds[int(fd_match.group(1))] = _Bound(tag, bool(fd_match.group(3)))
+            state.fds[int(fd_match.group(1))] = _bound_word(tag, fd_match.group(3))
         elif _HS_ZERO_TAG.fullmatch(tok) is not None:
             state.fds[0] = tok
         elif tok.startswith("__RCG_HD_"):
@@ -1442,7 +1454,7 @@ def _step_segment_redirect(
         fd = _descriptor_fd(match.group("hs_fd"))
         if fd is not None:
             word = seg[word_span[0] : word_span[1]]
-            stage.fds[fd] = _Bound(word, _word_volatile(word))
+            stage.fds[fd] = _bound_word(word, _word_class(word))
         return word_span[1], None
     if match.group("dup") is not None:
         stage.stripped[start:end] = b" " * (end - start)

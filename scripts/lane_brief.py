@@ -48,11 +48,13 @@ NEVER_RUN_CLAUSE = re.compile(
     r"\bnever\s+run\b(?:[^\n;.]|\.(?!\s|$)|\n(?![ \t]*(?:$|[-*`]|\d+\.|\w+:)))*",
     re.IGNORECASE,
 )
-FORBIDDEN_PRAETORCTL = re.compile(r"\bpraetorctl\b(?!\s+(?:gate|admit)\b)", re.IGNORECASE)
+CLAUSE_ITEM_SPLIT = re.compile(r",|\b(?:never\s+run|or|and|nor)\b", re.IGNORECASE)
+PRAETORCTL_ITEM = re.compile(
+    r"\s*(?:(?:a|an|any)\s+)?`?praetorctl(?![\w./-])(?!\s+(?:gate|admit)\b)", re.IGNORECASE
+)
 ALLOWED_ADMIT = re.compile(r"\bexcept\b[^.;\n]*\badmit\b", re.IGNORECASE)
 FORBIDDEN_MAKE = re.compile(r"\bmake\b(?!\s+verify-all\b)", re.IGNORECASE)
 BACKTICK_SPAN = re.compile(r"(?<!`)`([^`]+)`(?!`)")
-MAKE_INVOCATION = re.compile(r"(?<![.-])\bmake\b(?![/.-])(?!\s+(?i:verify-all)\b)")
 MAKE_COMMAND = re.compile(
     r"(?:\A|&&|\|\||;|\||\$\(|\(|(?<!\S)--(?=\s))\s*"
     r"(?:(?:"
@@ -61,7 +63,8 @@ MAKE_COMMAND = re.compile(
     r"|nice(?:\s+-n\s*[+-]?\d+)?"
     r"|env|nohup|command|exec"
     r")\s+)*"
-    r"(?<![.-])\bmake\b(?![/.-])(?!\s+(?i:verify-all)\b)"
+    r"(?<![.-])\bmake\b(?![/.-])"
+    r"(?!\s+(?i:verify-all)(?=\s*(?:\Z|[;&|<>()]|\d+[<>])))"
 )
 CLAUSE_MAKE_BAN = re.compile(
     r"(?:\bnever\s+run\b|,|\b(?:or|and|nor)\b)\s*(?:\b(?:a|an|any)\b\s+)?`?\bmake\b"
@@ -88,16 +91,43 @@ JOIN_BOUNDARY = re.compile(
     re.IGNORECASE,
 )
 FINDING_PREFIX = re.compile(r"^[ \t]*(?:(?:[-*+]|\d+[.)])[ \t]+)*finding:", re.IGNORECASE)
+HOST_RECORD = re.compile(
+    r"[ \t]*(?:(?:[-*+]|\d+[.)])[ \t]+)*host[ \t]+ran(?=[: \t]|$)", re.IGNORECASE
+)
+AWK_TOOL_PART = r"\b[gmn]?awk\b"
+AWK_LENGTH_PART = r"(?<![/.-])\blength\b(?:\s*\(\s*(?:\$0\s*)?\)|(?![/.-]|\s*\())"
+GREP_TOOL_PART = r"\b(?:[ef]?grep|rg)\b"
+GREP_LENGTH_PART = r"(?<!\\)\.\\?\{\d{2,3}(?:,\d*)?\\?\}"
+WC_LENGTH_PART = r"\bwc\s+(?:-[a-zA-Z]*L\b|--max-line-length\b)"
+AWK_TOOL_WORD = re.compile(AWK_TOOL_PART)
+AWK_LENGTH_EXPR = re.compile(AWK_LENGTH_PART)
+GREP_TOOL_WORD = re.compile(GREP_TOOL_PART)
+GREP_LENGTH_EXPR = re.compile(GREP_LENGTH_PART)
+WC_LENGTH = re.compile(WC_LENGTH_PART)
+# Reference only: the differential test compares the linear fallback with this search.
 WHOLE_FILE_LENGTH = re.compile(
-    r"\b[gmn]?awk\b[\s\S]*?(?<![/.-])\blength\b(?:\s*\(\s*(?:\$0\s*)?\)|(?![/.-]|\s*\())"
-    r"|\b(?:[ef]?grep|rg)\b[\s\S]*?(?<!\\)\.\\?\{\d{2,3}(?:,\d*)?\\?\}"
-    r"|\bwc\s+(?:-[a-zA-Z]*L\b|--max-line-length\b)"
+    rf"{AWK_TOOL_PART}[\s\S]*?{AWK_LENGTH_PART}"
+    rf"|{GREP_TOOL_PART}[\s\S]*?{GREP_LENGTH_PART}"
+    rf"|{WC_LENGTH_PART}"
 )
 AWK_LENGTH_PROGRAM = re.compile(
     r"(?<![/.-])\blength\b(?:\s*\(\s*(?:\$0\s*)?\)|(?![/.-]|\s*\())",
     re.IGNORECASE,
 )
-GREP_COUNTED_DOT = re.compile(r"(?<!\\)\.\\?\{\d{2,3}(?:,\d*)?\\?\}")
+GREP_DOT_BASIC = re.compile(r"(?<!\\)\.\\\{\d{2,3}(?:,\d*)?\\\}")
+GREP_DOT_EXTENDED = re.compile(r"(?<!\\)\.\{\d{2,3}(?:,\d*)?\}")
+GREP_MATCHER_KINDS = {
+    "-E": "E",
+    "--extended-regexp": "E",
+    "-G": "G",
+    "--basic-regexp": "G",
+    "-P": "P",
+    "--perl-regexp": "P",
+    "-F": "F",
+    "--fixed-strings": "F",
+}
+IMPLICIT_MATCHER_KIND = {"egrep": "E", "fgrep": "F"}
+PRINT_COMMANDS = frozenset({"printf", "echo"})
 LENGTH_TOOL_NAMES = frozenset({"wc", "awk", "gawk", "mawk", "nawk", "grep", "egrep", "fgrep", "rg"})
 STANDALONE_OBJECT = re.compile(r"(?<![0-9a-fA-F])[0-9a-fA-F]{40}(?![0-9a-fA-F])")
 GIT_C_ARGUMENT = r"""(?:"[^"\n]*"|'[^'\n]*'|[^\s`'";,|&()<>]+)"""
@@ -118,7 +148,7 @@ WRAPPER_WORDS = frozenset({"env", "nohup", "command", "exec"})
 TIMEOUT_DURATION = re.compile(r"\d+(?:\.\d+)?[smhd]?")
 NICE_ADJUST = re.compile(r"[+-]?\d+")
 NICE_JOINED = re.compile(r"-n[+-]?\d+")
-VERIFY_ALL = re.compile(r"verify-all\b", re.IGNORECASE)
+CONTINUING_OPERATORS = frozenset({"|", "|&", "&&", "||"})
 GIT_GLOBAL_OPTIONS = frozenset({"--no-pager", "-P", "--no-optional-locks"})
 GIT_DIFF_FILE_OPTIONS = frozenset({"--no-index", "--output"})
 GREP_MATCHER_OPTIONS = frozenset(
@@ -427,13 +457,18 @@ def non_clause_spans(content: str) -> list[re.Match[str]]:
     return outside
 
 
+def is_host_record(line: str) -> bool:
+    """Return whether line is a host record: it starts with host ran after list markers."""
+    return HOST_RECORD.match(line) is not None
+
+
 def active_make_span(content: str) -> str:
-    """Return the first non-clause, non-host-ran backtick span with make in command position."""
+    """Return the first non-clause, non-host-record backtick span with make in command position."""
     return next(
         (
             match.group(1)
             for match in non_clause_spans(content)
-            if "host ran" not in line_slice(content, match.start(), match.end()).lower()
+            if not is_host_record(line_slice(content, match.start(), match.end()))
             and span_runs_make(match.group(1))
         ),
         "",
@@ -456,6 +491,12 @@ def conflict_forbidden_make(content: str, clauses: list[str]) -> str:
     )
 
 
+def clause_bans_praetorctl(clause: str) -> bool:
+    """Return whether praetorctl is the command word of an item of a Never run clause."""
+    items = CLAUSE_ITEM_SPLIT.split(clause)[:MAX_LINES]
+    return any(PRAETORCTL_ITEM.match(item) for item in items)
+
+
 def conflict_make_without_praetorctl(content: str) -> str:
     """Report a brief with a make command span while Never run bans praetorctl or make."""
     clauses = [content[start:end] for start, end in never_run_clause_spans(content)]
@@ -463,7 +504,7 @@ def conflict_make_without_praetorctl(content: str) -> str:
         (
             clause
             for clause in clauses
-            if FORBIDDEN_PRAETORCTL.search(clause) and not ALLOWED_ADMIT.search(clause)
+            if clause_bans_praetorctl(clause) and not ALLOWED_ADMIT.search(clause)
         ),
         "",
     )
@@ -509,7 +550,7 @@ def join_is_excluded(content: str, match: re.Match[str], boundaries: JoinBoundar
     bounds = line_bounds(content, match.start(), match.end())
     if bounds not in boundaries.records:
         line = content[bounds[0] : bounds[1]]
-        boundaries.records[bounds] = bool(FINDING_PREFIX.match(line) or "host ran" in line.lower())
+        boundaries.records[bounds] = bool(FINDING_PREFIX.match(line) or is_host_record(line))
     if boundaries.records[bounds]:
         return True
     earlier = earlier_join_segment(content, boundaries, match.start())
@@ -632,9 +673,17 @@ class _ShellScan:
         self.emit(text, start=self.pos, end=end, quoted=False, operator=True)
         self.pos = end
 
+    def continues_command(self) -> bool:
+        """Return whether the cursor follows a pipe or list operator with only blanks between."""
+        if not self.tokens:
+            return False
+        last = self.tokens[-1]
+        gap = self.text[self.prev_end : self.pos]
+        return last.operator and last in CONTINUING_OPERATORS and not gap.strip(SHELL_BLANKS)
+
     def blank(self) -> bool:
         """End the pending word at whitespace; an unquoted newline also separates commands."""
-        if self.text[self.pos] == "\n":
+        if self.text[self.pos] == "\n" and not self.continues_command():
             self.operator(";")
             return True
         self.flush()
@@ -813,21 +862,24 @@ def command_word_index(tokens: list[str], index: int, *, strict: bool) -> int:
     return index
 
 
+def verify_all_is_sole_target(tokens: list[str], word: int) -> bool:
+    """Return whether the token after the make word is verify-all and ends the command."""
+    limit = len(tokens)
+    target = word + 1
+    if target >= limit or token_is_operator(tokens[target]) or token_is_joined(tokens[target]):
+        return False
+    if tokens[target].lower() != "verify-all":
+        return False
+    end = target + 1
+    return end >= limit or token_is_operator(tokens[end]) or is_descriptor_word(tokens, end, limit)
+
+
 def command_runs_make(tokens: list[str], index: int) -> bool:
     """Return whether the command starting at index runs make other than make verify-all."""
     word = command_word_index(tokens, index, strict=False)
-    if word >= len(tokens) or tokens[word] != "make":
+    if word >= len(tokens) or tokens[word] != "make" or token_is_operator(tokens[word]):
         return False
-    if token_is_operator(tokens[word]) or token_is_quoted(tokens[word]):
-        return False
-    after = tokens[word + 1 : word + 2]
-    exempt = (
-        after
-        and not token_is_operator(after[0])
-        and not token_is_joined(after[0])
-        and VERIFY_ALL.match(after[0])
-    )
-    return not exempt
+    return not verify_all_is_sole_target(tokens, word)
 
 
 def tokens_run_make(tokens: list[str]) -> bool:
@@ -1583,8 +1635,8 @@ SED_SIMPLE_COMMANDS = frozenset(
 )
 
 
-def length_tool_index(words: list[str]) -> int | None:
-    """Return the index of the first non-redirect whole-file length program word."""
+def first_tool_index(words: list[str]) -> int | None:
+    """Return the index of the first non-redirect word that names a length tool."""
     limit = len(words)
     index = 0
     for _ in range(limit):
@@ -1598,6 +1650,20 @@ def length_tool_index(words: list[str]) -> int | None:
             return index
         index += 1
     return None
+
+
+def length_tool_index(words: list[str]) -> int | None:
+    """Return the index of the whole-file length tool at the command position of a stage."""
+    command = stage_command_index(words)
+    if command is None:
+        return None
+    name = Path(words[command]).name
+    if name in LENGTH_TOOL_NAMES:
+        return command
+    opens = any(token_is_operator(word) and word in ("$(", "(") for word in words[command:])
+    if name in PRINT_COMMANDS and not opens:
+        return None
+    return first_tool_index(words)
 
 
 def stage_command_index(words: list[str]) -> int | None:
@@ -1859,6 +1925,19 @@ def searches_fixed_strings(parsed: StageParse) -> bool:
     return False
 
 
+def grep_dot_patterns(parsed: StageParse) -> tuple[re.Pattern[str], ...]:
+    """Return the counted-dot spellings that the effective matcher dialect of a stage reads."""
+    if parsed.tool == "rg":
+        return (GREP_DOT_EXTENDED,)
+    kinds = {GREP_MATCHER_KINDS[opt] for opt in grep_matcher_options(parsed)}
+    kinds.update(IMPLICIT_MATCHER_KIND.get(parsed.tool, ""))
+    if kinds <= {"G"}:
+        return (GREP_DOT_BASIC,)
+    if len(kinds) == 1 and kinds != {"F"}:
+        return (GREP_DOT_EXTENDED,)
+    return (GREP_DOT_BASIC, GREP_DOT_EXTENDED)
+
+
 def grep_is_length_check(words: list[str], tool_index: int | None = None) -> bool:
     """Return whether grep or rg uses a pattern file or counted-dot column-width pattern."""
     resolved = length_tool_index(words) if tool_index is None else tool_index
@@ -1870,7 +1949,8 @@ def grep_is_length_check(words: list[str], tool_index: int | None = None) -> boo
     if not parsed.refused and searches_fixed_strings(parsed):
         return False
     candidates = (*parsed.programs, *parsed.operands) if parsed.refused else parsed.programs
-    return any(GREP_COUNTED_DOT.search(token) for token in candidates)
+    patterns = grep_dot_patterns(parsed)
+    return any(pattern.search(token) for pattern in patterns for token in candidates)
 
 
 def command_is_length_check(words: list[str]) -> bool:
@@ -1909,10 +1989,21 @@ def is_descriptor_word(words: list[str], index: int, limit: int) -> bool:
     return token_is_redirect(following) and token_is_joined(following)
 
 
+def redirect_descriptors(operator: str, joined: str | None) -> frozenset[int]:
+    """Return the descriptors a redirect changes: the joined word, else the operator default."""
+    if joined is not None:
+        return frozenset({int(joined)})
+    if operator.startswith("&"):
+        return frozenset({1, 2})
+    return frozenset({0}) if operator.startswith("<") else frozenset({1})
+
+
 def length_redirect_advance(words: list[str], index: int, limit: int) -> tuple[list[str], int]:
-    """Collect stdin operands and skip redirects starting at index."""
+    """Collect operands that replace stdin and skip redirects starting at index."""
     found: list[str] = []
+    joined = None
     if is_descriptor_word(words, index, limit):
+        joined = words[index]
         index += 1
     token = words[index]
     if not token_is_redirect(token):
@@ -1921,8 +2012,11 @@ def length_redirect_advance(words: list[str], index: int, limit: int) -> tuple[l
         found.append(words[index + 1])
         return found, index + 2
     next_index = index + 1
-    if next_index < limit and token != "<" and not token_is_operator(words[next_index]):
+    has_target = next_index < limit and not token_is_operator(words[next_index])
+    if has_target:
         next_index += 1
+    if token != "<" and 0 in redirect_descriptors(token, joined):
+        found.append(words[index + 1] if has_target else "\x00redirect")
     return found, next_index
 
 
@@ -2414,6 +2508,35 @@ def git_diff_option_reads_files(token: str) -> bool:
     return token in GIT_DIFF_FILE_OPTIONS or token.startswith("--output=")
 
 
+def operand_leaves_worktree(operand: str) -> bool:
+    """Return whether a git diff operand may name a path outside the worktree."""
+    if operand.startswith(("/", "~")) or "$" in operand or "`" in operand:
+        return True
+    return ".." in operand.split("/")
+
+
+def git_diff_operands_stay_inside(stage: list[str], start: int) -> bool:
+    """Return whether no git diff operand from start names a path outside the worktree."""
+    limit = len(stage)
+    index = start
+    past_dashes = False
+    for _ in range(limit):
+        if index >= limit:
+            break
+        redirect = length_redirect_operands(stage, index, limit)
+        if redirect is not None:
+            index = redirect[0]
+            continue
+        token = stage[index]
+        index += 1
+        is_operand = past_dashes or not token.startswith("-") or token == "-"
+        if not past_dashes and token == "--":
+            past_dashes = True
+        elif is_operand and operand_leaves_worktree(token):
+            return False
+    return True
+
+
 def git_diff_stage(stage: list[str]) -> bool:
     """Return whether stage is a plain git diff with only allow-listed global options."""
     for token in stage:
@@ -2432,7 +2555,9 @@ def git_diff_stage(stage: list[str]) -> bool:
         index += 1
     if index >= limit or stage[index] != "diff" or token_is_operator(stage[index]):
         return False
-    return not any(git_diff_option_reads_files(token) for token in stage[index + 1 :])
+    if any(git_diff_option_reads_files(token) for token in stage[index + 1 :]):
+        return False
+    return git_diff_operands_stay_inside(stage, index + 1)
 
 
 def length_command_allowed(words: list[str], pipeline: list[list[str]], command_index: int) -> bool:
@@ -2448,11 +2573,26 @@ def length_command_allowed(words: list[str], pipeline: list[list[str]], command_
     )
 
 
+def search_after_tool(tool: re.Pattern[str], expression: re.Pattern[str], span: str) -> bool:
+    """Return whether expression occurs at or after the end of the first tool word in span."""
+    word = tool.search(span)
+    return word is not None and expression.search(span, word.end()) is not None
+
+
+def fallback_length_refused(span: str) -> bool:
+    """Return whether an unparseable span holds a length check, in two linear searches per tool."""
+    return (
+        search_after_tool(AWK_TOOL_WORD, AWK_LENGTH_EXPR, span)
+        or search_after_tool(GREP_TOOL_WORD, GREP_LENGTH_EXPR, span)
+        or WC_LENGTH.search(span) is not None
+    )
+
+
 def span_whole_file_length_refused(span: str) -> bool:
     """Return whether any parsed length command in the span must be refused."""
     tokens = span_shell_tokens(span)
     if tokens is None:
-        return bool(WHOLE_FILE_LENGTH.search(span))
+        return fallback_length_refused(span)
     for pipeline in span_token_command_groups(tokens):
         parsed = [stage for stage in pipeline if stage]
         for command_index, words in enumerate(parsed):
@@ -2466,7 +2606,7 @@ def span_whole_file_length_refused(span: str) -> bool:
 def conflict_whole_file_length_check(content: str) -> str:
     """Report a backtick line-length command that does not read a git diff."""
     for match in non_clause_spans(content):
-        if "host ran" in line_slice(content, match.start(), match.end()).lower():
+        if is_host_record(line_slice(content, match.start(), match.end())):
             continue
         span = match.group(1)
         if span_whole_file_length_refused(span):
@@ -2516,26 +2656,31 @@ def valid_nested_root(path: Path, worktree_root: Path) -> bool:
     return False
 
 
-def resolve_git_c_chain(worktree_root: Path, chain: str) -> Path:
-    """Resolve successive git -C values in order, as git(1) does, and return the directory."""
+def resolve_git_c_chain(worktree_root: Path, chain: str) -> Path | None:
+    """Resolve git -C values in order, as git(1) does; None when a step names no directory."""
     current = worktree_root
     for match in list(GIT_C_VALUE.finditer(chain))[:MAX_LINES]:
         value = match.group(1).strip("\"'")
-        if value:
-            current = Path(value) if Path(value).is_absolute() else current / value
+        if not value:
+            continue
+        current = Path(value) if Path(value).is_absolute() else current / value
+        if not current.is_dir():
+            return None
     return current.resolve()
 
 
 def nested_repositories(content: str, worktree_root: Path) -> list[Path]:
-    """Collect up to 8 resolved nested repository roots named with git -C."""
-    candidates: list[Path] = []
+    """Collect up to 8 nested repository roots named with git -C; a failed chain fills a slot."""
+    candidates: list[Path | None] = []
     for match in list(NESTED_GIT_C.finditer(content))[:MAX_LINES]:
         resolved = resolve_git_c_chain(worktree_root, match.group(1))
-        if resolved not in candidates:
+        if resolved is None or resolved not in candidates:
             candidates.append(resolved)
         if len(candidates) >= MAX_NESTED_REPOS:
             break
-    return [path for path in candidates if valid_nested_root(path, worktree_root)]
+    return [
+        path for path in candidates if path is not None and valid_nested_root(path, worktree_root)
+    ]
 
 
 def object_exists(repositories: list[Path], name: str) -> bool:

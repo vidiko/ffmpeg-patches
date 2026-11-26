@@ -241,10 +241,10 @@ FIX5_G1_PARSE_CASES: tuple[tuple[str, bool], ...] = (
     ("wc -L --files0-from=.lane/tmp/list .lane/tmp/a.txt", True),
     ("wc --max-line-length file", True),
     ("wc --max-line-length .lane/tmp/a.txt", False),
-    ("grep -nA3 '.{80}' file", True),
-    ("grep -nA3 '.{80}' .lane/tmp/a.txt", False),
-    ("grep --regexp='.{80}' file", True),
-    ("grep --regexp='.{80}' .lane/tmp/a.txt", False),
+    ("grep -nA3 '.\\{80\\}' file", True),
+    ("grep -nA3 '.\\{80\\}' .lane/tmp/a.txt", False),
+    ("grep --regexp='.\\{80\\}' file", True),
+    ("grep --regexp='.\\{80\\}' .lane/tmp/a.txt", False),
     ("grep -E -- '.{80}' .lane/tmp/a.txt", False),
     ("grep -rE '.{80}'", True),
     ("grep -rE '.{80}' .lane/tmp/a.txt", True),
@@ -572,7 +572,7 @@ ROUND11_CASES: tuple[tuple[str, str, int, str], ...] = (
     ("c20", "f5", 0, "- `grep -iF '.{80}' scripts/a.py`\n"),
     ("c21", "f5", 0, "- `rg -F '.{80}' scripts/a.py`\n"),
     ("c22", "f5", 1, "- `rg -F --no-fixed-strings '.{80}' scripts/a.py`\n"),
-    ("c23", "f5", 1, "- `grep '.{80}' scripts/a.py`\n"),
+    ("c23", "f5", 0, "- `grep '.{80}' scripts/a.py`\n"),
     ("c24", "f6", 1, "- `wc -L .lane/tmp/a.txt 2 > /dev/null`\n"),
     ("c25", "f6", 0, "- `wc -L .lane/tmp/a.txt 2>/dev/null`\n"),
     ("c26", "f6", 1, "- `wc -L .lane/tmp/a.txt '2'>/dev/null`\n"),
@@ -619,7 +619,7 @@ FIX11_LENGTH_ROWS: tuple[tuple[str, str, bool], ...] = (
     ("f5 fgrep -E mixed", "fgrep -E '.{80}' scripts/a.py", True),
     ("f5 fgrep -P mixed", "fgrep -P '.{80}' scripts/a.py", True),
     ("f5 egrep stays regex", "egrep '.{80}' scripts/a.py", True),
-    ("f5 grep basic regex", "grep '.{80}' scripts/a.py", True),
+    ("f5 grep basic braces literal", "grep '.{80}' scripts/a.py", False),
     ("f5 grep -E regex", "grep -E '.{80}' scripts/a.py", True),
     ("f5 rg regex", "rg '.{80}' scripts/a.py", True),
     ("f5 rg --no-fixed-strings last", "rg -F --no-fixed-strings '.{80}' scripts/a.py", True),
@@ -648,6 +648,171 @@ FIX11_LENGTH_ROWS: tuple[tuple[str, str, bool], ...] = (
     ("f7 spaced --output option", "git diff --output x | wc -L", True),
     ("f7 quoted git word", "'git' diff | wc -L", True),
 )
+
+ROUND12_CASES: tuple[tuple[str, str, int, str], ...] = (
+    ("r12-c01", "f1", 1, "- `awk 'length > 80' scripts/a.py \"`\n"),
+    ("r12-c02", "f1", 1, "- `grep -E '.{80}' scripts/a.py \"`\n"),
+    ("r12-c03", "f1", 0, "- `awk '{print $1}' scripts/a.py \"`\n"),
+    ("r12-c04", "f2", 1, "Never run make.\n- `make fate-x`; the host ran the old build.\n"),
+    ("r12-c05", "f2", 0, "Never run make.\n- host ran: `make fate-x`\n"),
+    ("r12-c06", "f2", 0, "Never run make.\n- host ran `make fate-x` (rc 0)\n"),
+    ("r12-c07", "f2", 0, "Never run make.\n1. host ran: `make fate-x`\n"),
+    ("r12-c08", "f2", 0, "Never run make.\n- Host ran: `make fate-x`\n"),
+    ("r12-c09", "f2", 1, "Never run make.\n- Note: host ran earlier; now run `make fate-x`.\n"),
+    ("r12-c10", "f2", 1, "- Check `wc -L scripts/a.py` as the host ran it.\n"),
+    ("r12-c11", "f2", 0, "- host ran: `wc -L scripts/a.py` (rc 0)\n"),
+    (
+        "r12-c12",
+        "f2",
+        1,
+        (
+            "Keep lines at most 80 columns.\n"
+            "- Join the call onto one line; the host ran the old form.\n"
+        ),
+    ),
+    (
+        "r12-c13",
+        "f2",
+        0,
+        "Keep lines at most 80 columns.\n- host ran: joined the call into one line.\n",
+    ),
+    ("r12-c14", "f3", 0, "Never run echo praetorctl.\n- `make fate-x`\n"),
+    ("r12-c15", "f3", 0, "Never run grep praetorctl AGENTS.md.\n- `make fate-x`\n"),
+    ("r12-c16", "f3", 1, "Never run push or praetorctl.\n- `make fate-x`\n"),
+    ("r12-c17", "f3", 1, "Never run praetorctl.\n- `make fate-x`\n"),
+    ("r12-c18", "f3", 1, "Never run git push, praetorctl, or lefthook.\n- `make fate-x`\n"),
+    ("r12-c19", "f3", 1, "Never run lefthook and praetorctl.\n- `make fate-x`\n"),
+    ("r12-c20", "f3", 1, "Never run `praetorctl audit`.\n- `make fate-x`\n"),
+    ("r12-c21", "f3", 0, "Never run praetorctl except admit.\n- `make fate-x`\n"),
+    ("r12-c22", "f4", 0, "- `git diff |\nwc -L`\n"),
+    ("r12-c23", "f4", 0, "- `git diff | \n  wc -L`\n"),
+    ("r12-c24", "f4", 1, "- `cat scripts/a.py |\nwc -L`\n"),
+    ("r12-c25", "f4", 1, "- `git diff\nwc -L scripts/a.py`\n"),
+    ("r12-c26", "f4", 0, "- `git diff &&\ngit diff --cached | wc -L`\n"),
+    ("r12-c27", "f4", 1, "Never run make.\n- `cd tests &&\nmake fate-x`\n"),
+    ("r12-c28", "f5", 1, "Never run make.\n- `'make' fate-x`\n"),
+    ("r12-c29", "f5", 1, 'Never run make.\n- `"make" fate-x`\n'),
+    ("r12-c30", "f5", 1, "Never run make.\n- `m'ake' fate-x`\n"),
+    ("r12-c31", "f5", 0, "Never run make.\n- `echo 'make' fate-x`\n"),
+    ("r12-c32", "f5", 0, "Never run make.\n- `'make verify-all'`\n"),
+    ("r12-c33", "f5", 0, "Never run make.\n- `'make' verify-all`\n"),
+    ("r12-c34", "f6", 1, "Never run make.\n- `make verify-all clean`\n"),
+    ("r12-c35", "f6", 1, "Never run make.\n- `make verify-all-local`\n"),
+    ("r12-c36", "f6", 1, "Never run make.\n- `make verify-all.x`\n"),
+    ("r12-c37", "f6", 0, "Never run make.\n- `make verify-all`\n"),
+    ("r12-c38", "f6", 0, "Never run make.\n- `make verify-all && echo ok`\n"),
+    ("r12-c39", "f6", 0, "Never run make.\n- `make verify-all | tail -3`\n"),
+    ("r12-c40", "f6", 0, "Never run make.\n- `make verify-all 2>&1 | tail -3`\n"),
+    ("r12-c41", "f6", 1, 'Never run make.\n- `make verify-all-local "`\n'),
+    ("r12-c42", "f7", 0, "- `printf '%s\\n' wc -L`\n"),
+    ("r12-c43", "f7", 0, "- `echo grep -E '.{80}' scripts/a.py`\n"),
+    ("r12-c44", "f7", 1, "- `git diff --name-only | xargs wc -L`\n"),
+    ("r12-c45", "f7", 1, "- `env LC_ALL=C wc -L scripts/a.py`\n"),
+    ("r12-c46", "f7", 1, "- `timeout 5 wc -L scripts/a.py`\n"),
+    ("r12-c47", "f7", 1, "- `nice -n 5 grep -E '.{80}' scripts/a.py`\n"),
+    ("r12-c48", "f7", 1, "- `command wc -L scripts/a.py`\n"),
+    ("r12-c49", "f7", 1, "- `/usr/bin/wc -L scripts/a.py`\n"),
+    ("r12-c50", "f7", 1, "- `LC_ALL=C wc -L scripts/a.py`\n"),
+    ("r12-c51", "f7", 1, "- `find scripts -name '*.py' -exec wc -L {} +`\n"),
+    ("r12-c52", "f7", 1, "- `sudo wc -L scripts/a.py`\n"),
+    ("r12-c53", "f8", 0, "- `grep '.{80}' scripts/a.py`\n"),
+    ("r12-c54", "f8", 1, "- `grep '.\\{80\\}' scripts/a.py`\n"),
+    ("r12-c55", "f8", 1, "- `grep -e '.\\{80\\}' scripts/a.py`\n"),
+    ("r12-c56", "f8", 1, "- `grep -G '.\\{80\\}' scripts/a.py`\n"),
+    ("r12-c57", "f8", 0, "- `grep -G '.{80}' scripts/a.py`\n"),
+    ("r12-c58", "f8", 1, "- `grep -E '.{80}' scripts/a.py`\n"),
+    ("r12-c59", "f8", 0, "- `grep -E '.\\{80\\}' scripts/a.py`\n"),
+    ("r12-c60", "f8", 1, "- `egrep '.{80}' scripts/a.py`\n"),
+    ("r12-c61", "f8", 1, "- `grep -P '.{80}' scripts/a.py`\n"),
+    ("r12-c62", "f8", 1, "- `rg '.{80}' scripts/a.py`\n"),
+    ("r12-c63", "f8", 0, "- `rg '.\\{80\\}' scripts/a.py`\n"),
+    ("r12-c64", "f8", 1, "- `grep -E -G '.\\{80\\}' scripts/a.py`\n"),
+    ("r12-c65", "f9", 1, "- `git diff | wc -L 0<>scripts/a.py`\n"),
+    ("r12-c66", "f9", 1, "- `git diff | wc -L <>scripts/a.py`\n"),
+    ("r12-c67", "f9", 1, "- `git diff | wc -L 0>&3`\n"),
+    ("r12-c68", "f9", 1, "- `git diff | wc -L <&3`\n"),
+    ("r12-c69", "f9", 1, "- `git diff | 0<>scripts/a.py wc -L`\n"),
+    ("r12-c70", "f9", 1, "- `git diff | sort 0<>scripts/a.py | wc -L`\n"),
+    ("r12-c71", "f9", 1, "- `git diff | wc -L 3<scripts/a.py`\n"),
+    ("r12-c72", "f9", 1, "- `git diff | wc -L 0< scripts/a.py`\n"),
+    ("r12-c73", "f9", 0, "- `git diff | wc -L 2>/dev/null`\n"),
+    ("r12-c74", "f9", 0, "- `git diff | wc -L 2>&1`\n"),
+    ("r12-c75", "f9", 0, "- `git diff | wc -L`\n"),
+    ("r12-c76", "f9", 0, "- `git diff | grep -E '.{80}' 2>/dev/null`\n"),
+    ("r12-c77", "f10", 1, "- `git diff /dev/null scripts/a.py | wc -L`\n"),
+    ("r12-c78", "f10", 1, "- `git diff -- /dev/null scripts/a.py | wc -L`\n"),
+    ("r12-c79", "f10", 1, "- `git diff ../outside.txt scripts/a.py | wc -L`\n"),
+    ("r12-c80", "f10", 1, "- `git diff /etc/hostname scripts/a.py | wc -L`\n"),
+    ("r12-c81", "f10", 1, "- `git diff ~/x scripts/a.py | wc -L`\n"),
+    ("r12-c82", "f10", 1, '- `git diff "$HOME/x" scripts/a.py | wc -L`\n'),
+    ("r12-c83", "f10", 0, "- `git diff -U0 -- scripts/a.py | wc -L`\n"),
+    ("r12-c84", "f10", 0, "- `git diff HEAD~1 -- scripts/a.py | wc -L`\n"),
+    ("r12-c85", "f10", 0, "- `git diff scripts/a.py scripts/b.py | wc -L`\n"),
+    ("r12-c86", "f10", 0, "- `git diff --cached | wc -L`\n"),
+    ("r12-c87", "f11", 0, "- `git -C other -C {ABS} rev-parse HEAD`\nHEAD {NESTED}\n"),
+    ("r12-c88", "f11", 1, "- `git -C missing -C {ABS} rev-parse HEAD`\nHEAD {NESTED}\n"),
+    ("r12-c89", "f11", 1, "- `git -C sub/missing -C ../nested rev-parse HEAD`\nHEAD {NESTED}\n"),
+    ("r12-c90", "f11", 1, "- `git -C sub -C missing -C {ABS} rev-parse HEAD`\nHEAD {NESTED}\n"),
+    ("r12-c91", "f11", 0, "- `git -C sub -C nested rev-parse HEAD`\nHEAD {NESTED}\n"),
+    ("r12-c92", "f11", 0, "- `git -C '' -C sub/nested rev-parse HEAD`\nHEAD {NESTED}\n"),
+)
+
+ROUND12_EXTRA_ROWS: tuple[tuple[str, str, int, str], ...] = (
+    ("r12-x01", "f2", 0, "Never run make.\n- HOST RAN: `make fate-x`\n"),
+    ("r12-x02", "f2", 0, "Never run make.\n  2) host ran: `make fate-x`\n"),
+    ("r12-x03", "f2", 1, "Never run make.\n- hosted ran: `make fate-x`\n"),
+    ("r12-x04", "f2", 1, "Never run make.\n- the host ran: `make fate-x`\n"),
+    ("r12-x05", "f3", 0, "Never run praetorctl gate.\n- `make fate-x`\n"),
+    ("r12-x06", "f3", 1, "Never run an echo or any praetorctl audit.\n- `make fate-x`\n"),
+    ("r12-x07", "f3", 0, "Never run echo and grep praetorctl.\n- `make fate-x`\n"),
+    ("r12-x08", "f4", 1, "- `git diff '|'\nwc -L scripts/a.py`\n"),
+    ("r12-x09", "f4", 0, "- `git diff |&\nwc -L`\n"),
+    ("r12-x10", "f4", 1, "- `git diff ||\nwc -L scripts/a.py`\n"),
+    ("r12-x11", "f5", 1, 'Never run make.\n- `"make"`\n'),
+    ("r12-x12", "f5", 0, 'Never run make.\n- `echo "make" verify-all-local`\n'),
+    ("r12-x13", "f6", 0, "Never run make.\n- `make verify-all 2>&1`\n"),
+    ("r12-x14", "f6", 0, "Never run make.\n- `make VERIFY-ALL 2>/dev/null`\n"),
+    ("r12-x15", "f6", 1, "Never run make.\n- `make verify-all fate-x`\n"),
+    ("r12-x16", "f6", 1, "Never run make.\n- `make verify-all-local 2>&1`\n"),
+    ("r12-x17", "f6", 0, "Never run make.\n- `make verify-all > out.txt`\n"),
+    ("r12-x18", "f6", 0, 'Never run make.\n- `make verify-all 2>&1 "`\n'),
+    ("r12-x19", "f6", 1, 'Never run make.\n- `make verify-all clean "`\n'),
+    ("r12-x20", "f7", 1, "- `echo $(wc -L scripts/a.py)`\n"),
+    ("r12-x21", "f7", 0, "- `echo wc -L scripts/a.py`\n"),
+    ("r12-x22", "f8", 1, "- `grep -G -E '.\\{80\\}' scripts/a.py`\n"),
+    ("r12-x23", "f8", 1, "- `grep -E -G '.{80}' scripts/a.py`\n"),
+    ("r12-x24", "f8", 0, "- `grep -P '.\\{80\\}' scripts/a.py`\n"),
+    ("r12-x25", "f8", 1, "- `fgrep -E '.\\{80\\}' scripts/a.py`\n"),
+    ("r12-x26", "f8", 1, "- `egrep -G '.\\{80\\}' scripts/a.py`\n"),
+    ("r12-x27", "f8", 0, "- `egrep '.\\{80\\}' scripts/a.py`\n"),
+    ("r12-x28", "f8", 1, "- `grep --basic-regexp '.\\{80,\\}' scripts/a.py`\n"),
+    ("r12-x29", "f9", 1, "- `git diff | wc -L <<<x`\n"),
+    ("r12-x30", "f9", 1, "- `git diff | wc -L 0<<<x`\n"),
+    ("r12-x31", "f9", 0, "- `git diff | wc -L 1>/dev/null`\n"),
+    ("r12-x32", "f9", 0, "- `git diff | wc -L &>/dev/null`\n"),
+    ("r12-x33", "f10", 0, "- `git diff HEAD~1..HEAD -- scripts/a.py | wc -L`\n"),
+    ("r12-x34", "f10", 0, "- `git diff a..b | wc -L`\n"),
+    ("r12-x35", "f10", 1, "- `git diff -- ../a.py | wc -L`\n"),
+    ("r12-x36", "f10", 1, "- `git diff -- sub/../../a.py | wc -L`\n"),
+    ("r12-x37", "f10", 0, "- `git diff -U0 -- scripts/a.py 2>/dev/null | wc -L`\n"),
+    ("r12-x38", "f11", 1, "- `git -C missing -C other -C {ABS} rev-parse HEAD`\nHEAD {NESTED}\n"),
+    ("r12-x39", "f11", 0, "- `git -C other -C ../sub/nested rev-parse HEAD`\nHEAD {NESTED}\n"),
+)
+
+FALLBACK_TOOLS = ("awk", "gawk", "mawk", "nawk", "grep", "egrep", "fgrep", "rg", "wc", "cat")
+FALLBACK_EXPRESSIONS = (
+    "length > 80",
+    "length($0)",
+    "length(x)",
+    "x.length",
+    "-L",
+    "-c",
+    ".{80}",
+    ".\\{80\\}",
+    "\\.{80}",
+    ".{8}",
+)
+
 
 JOIN_DIFFERENTIAL_BRIEFS: tuple[str, ...] = (
     "at most 80 cols.\njoin the call onto a single line.\n",
@@ -1334,6 +1499,7 @@ class LaneBriefTest(unittest.TestCase):
         worktree, outer_commit = self.commit_fixture()
         nested = worktree / "sub" / "nested"
         nested.parent.mkdir(parents=True)
+        (worktree / "other").mkdir()
         repo(nested)
         run_git(nested, "commit", "-q", "--allow-empty", "-m", "nested-only", preserve_config=True)
         nested_commit = run_git(nested, "rev-parse", "HEAD", preserve_config=True)
@@ -1957,6 +2123,100 @@ class LaneBriefTest(unittest.TestCase):
             with self.subTest(case=case_id, finding=finding):
                 self.assertEqual(self.conflict_rc(content, worktree), want)
 
+    def test_round12_case_ids_complete(self) -> None:
+        """Keep all 92 round-12 case ids present exactly once."""
+        ids = [row[0] for row in ROUND12_CASES]
+        self.assertEqual(ids, [f"r12-c{number:02d}" for number in range(1, 93)])
+        extra_ids = [row[0] for row in ROUND12_EXTRA_ROWS]
+        self.assertEqual(len(extra_ids), len(set(extra_ids)))
+
+    def round12_rows(self, finding: str) -> None:
+        """Check the round-12 rows of one finding against their wanted status."""
+        worktree, _outer, nested_commit = self.nested_commit_fixture()
+        absolute = str(worktree.resolve() / "sub" / "nested")
+        rows = [row for row in (*ROUND12_CASES, *ROUND12_EXTRA_ROWS) if row[1] == finding]
+        self.assertGreater(len(rows), 2)
+        for case_id, _finding, want, content in rows:
+            text = content.replace("{ABS}", absolute).replace("{NESTED}", nested_commit)
+            with self.subTest(case=case_id):
+                self.assertEqual(self.conflict_rc(text, worktree), want)
+
+    def test_round12_f1_cases_stay_refused(self) -> None:
+        """Keep malformed spans with a length check refused and others accepted."""
+        self.round12_rows("f1")
+
+    def test_round12_f1_fallback_equals_reference_search(self) -> None:
+        """Match the lazy reference search on malformed spans with every tool word."""
+        spans = ['wc -L "scripts/a.py', "echo 'a | make b", "make 'x", 'awk "', 'rg "']
+        for before in FALLBACK_TOOLS:
+            for after in FALLBACK_TOOLS:
+                for expression in FALLBACK_EXPRESSIONS:
+                    spans.append(f'{before} {expression} {after} "')
+                    spans.append(f'{expression} {before} {after} "')
+                    spans.append(f'{before} x {after} {expression} "')
+        refused = 0
+        for span in spans:
+            want = bool(lane_brief.WHOLE_FILE_LENGTH.search(span))
+            refused += int(want)
+            self.assertEqual(lane_brief.fallback_length_refused(span), want, span)
+        self.assertGreater(refused, 100)
+        self.assertLess(refused, len(spans))
+
+    def test_round12_f1_fallback_search_count_is_flat(self) -> None:
+        """Run the same few searches for 50 and for 200 tool words."""
+        names = ("AWK_TOOL_WORD", "AWK_LENGTH_EXPR", "GREP_TOOL_WORD", "GREP_LENGTH_EXPR")
+        for tail, verdict, want in (('"', False, [1, 1, 1, 0]), ('length "', True, [1, 1, 0, 0])):
+            totals = []
+            for count in (50, 200):
+                wrappers = {name: CountingPattern(getattr(lane_brief, name)) for name in names}
+                with contextlib.ExitStack() as stack:
+                    for name, wrapper in wrappers.items():
+                        stack.enter_context(patch.object(lane_brief, name, wrapper))
+                    got = lane_brief.fallback_length_refused("awk " * count + tail)
+                self.assertEqual(got, verdict)
+                totals.append([wrappers[name].calls for name in names])
+            self.assertEqual(totals, [want, want])
+
+    def test_round12_f2_host_record_starts_the_line(self) -> None:
+        """Exempt a host record only when it starts the line after list markers."""
+        self.round12_rows("f2")
+
+    def test_round12_f3_praetorctl_at_command_position(self) -> None:
+        """Count praetorctl as banned only at the command word of a Never run item."""
+        self.round12_rows("f3")
+
+    def test_round12_f4_newline_after_pipe_continues(self) -> None:
+        """Treat a newline after an unquoted pipe or list operator as a blank."""
+        self.round12_rows("f4")
+
+    def test_round12_f5_quoted_command_word_runs_make(self) -> None:
+        """Decide the make command word by its text after quote removal."""
+        self.round12_rows("f5")
+
+    def test_round12_f6_verify_all_is_sole_target(self) -> None:
+        """Exempt make only when verify-all is the sole target, also unparsed."""
+        self.round12_rows("f6")
+
+    def test_round12_f7_length_tool_at_command_position(self) -> None:
+        """Find the length tool at the command position; launchers stay refused."""
+        self.round12_rows("f7")
+
+    def test_round12_f8_interval_spelling_follows_dialect(self) -> None:
+        """Read the brace interval spelling of the effective grep dialect."""
+        self.round12_rows("f8")
+
+    def test_round12_f9_redirect_names_its_descriptor(self) -> None:
+        """Refuse a redirect that replaces stdin whatever its operator spelling."""
+        self.round12_rows("f9")
+
+    def test_round12_f10_git_diff_operands_stay_inside(self) -> None:
+        """Refuse a git diff operand that may leave the worktree."""
+        self.round12_rows("f10")
+
+    def test_round12_f11_every_c_step_must_exist(self) -> None:
+        """Skip a nested repository when any git -C step names no directory."""
+        self.round12_rows("f11")
+
     def test_fix11_g1_scanner_flags(self) -> None:
         """Pin quoted, operator, and joined flags of scanner tokens."""
         rows = (
@@ -1995,7 +2255,7 @@ class LaneBriefTest(unittest.TestCase):
         rows = (
             ("quoted argument text", "printf '%s\\n' 'example; make fate-x'", 0),
             ("quoted pipe and make", "echo 'a | make b'", 0),
-            ("quoted make word", "'make' fate-x", 0),
+            ("quoted command word runs make", "'make' fate-x", 1),
             ("verify-all exception", "make verify-all", 0),
             ("make after and", "cd tests && make fate-x", 1),
             ("make after or", "true || make fate-x", 1),
@@ -2113,6 +2373,7 @@ class LaneBriefTest(unittest.TestCase):
             ("empty first", "git -C '' -C sub/nested rev-parse HEAD", 0),
             ("chain leaves worktree", "git -C sub -C ../../.. rev-parse HEAD", 1),
             ("first value only", "git -C sub rev-parse HEAD", 1),
+            ("missing first", f"git -C missing -C {absolute} rev-parse HEAD", 1),
         )
         for tag, command, want in rows:
             with self.subTest(tag=tag):

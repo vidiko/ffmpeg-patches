@@ -1960,7 +1960,7 @@ class VulkanSweepTest(unittest.TestCase):
         cases = [
             ("plain", "(v = flags, v & 0xffu); ", []),
             ("compound", "(v |= flags, v & 0xffu); ", []),
-            ("shift_assign", "(v >>= 1, v & 0xffu); ", []),
+            ("shift_assign", "(v >>= 1, v & 0xffu); ", [(1, "shift")]),
             ("mask_before_write", "(v & 0xffu, v = flags); ", [(1, "mask")]),
             ("equal", "(v == 3, v & 0xffu); ", [(1, "mask")]),
             ("not_equal", "(v != 3, v & 0xffu); ", [(1, "mask")]),

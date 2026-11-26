@@ -24,7 +24,16 @@ def repo(path: Path, *refs: str) -> Path:
     """Create a committed fixture repository with optional planted references."""
     if len(refs) > lane_isolation.MAX_REFS:
         raise ValueError("fixture ref count exceeds cap")
-    run_git(path.parent, "init", "-q", "-b", "main", str(path), preserve_config=True)
+    run_git(
+        path.parent,
+        "init",
+        "-q",
+        "-b",
+        "main",
+        "--object-format=sha1",
+        str(path),
+        preserve_config=True,
+    )
     run_git(path, "commit", "-q", "--allow-empty", "-m", "init", preserve_config=True)
     for ref in refs[: lane_isolation.MAX_REFS]:
         run_git(path, "update-ref", ref, "HEAD", preserve_config=True)

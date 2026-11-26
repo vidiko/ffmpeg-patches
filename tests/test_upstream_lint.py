@@ -247,6 +247,24 @@ DOC_MUXERS_GLOBAL_SIDX_ONLY = (
     "Write one output file.\n"
     "@end table\n"
 )
+DASHENC_SUBSCRIPT_READ_ASSIGN_SOURCE = (
+    DASHENC_OPTIONS
+    + DASHENC_WRITE_HEAD
+    + "    if ((c->nb_slots[c->ignore_io_errors\n"
+    + "         ? 0 : 1] = 1) && c->global_sidx)\n"
+    + "        ret = 0;\n"
+    + DASHENC_GAP2
+    + DASHENC_WRITE_TAIL
+)
+DASHENC_CONSTANT_INDEX_ASSIGN_SOURCE = (
+    DASHENC_OPTIONS
+    + DASHENC_WRITE_HEAD
+    + "    if ((c->ignore_io_errors[0]\n"
+    + "         += 1) && c->global_sidx)\n"
+    + "        ret = 0;\n"
+    + DASHENC_GAP2
+    + DASHENC_WRITE_TAIL
+)
 DOC_MUXERS_ITEMX_BASE = (
     "@table @option\n"
     "@item ignore_io_errors\n"
@@ -281,60 +299,6 @@ DOC_MUXERS_AFTER_EXAMPLE_NAMES_GLOBAL_SIDX = (
     "Respect @option{global_sidx} when inserting index ranges.\n"
     "@item global_sidx\n"
     "Write a global sidx.\n"
-    "@item single_file\n"
-    "Write one output file.\n"
-    "@end table\n"
-)
-DASHENC_SPLIT_ASSIGN_ADDED = (
-    "    if ((c->ignore_io_errors\n         = 0) && c->global_sidx)\n        ret = 0;\n"
-)
-DASHENC_SPLIT_ASSIGN_SOURCE = (
-    DASHENC_OPTIONS
-    + DASHENC_WRITE_HEAD
-    + DASHENC_SPLIT_ASSIGN_ADDED
-    + DASHENC_GAP2
-    + DASHENC_WRITE_TAIL
-)
-DASHENC_SPLIT_COMPARE_SOURCE = (
-    DASHENC_OPTIONS
-    + DASHENC_WRITE_HEAD
-    + DASHENC_SPLIT_ASSIGN_ADDED.replace("= 0)", "== 0)")
-    + DASHENC_GAP2
-    + DASHENC_WRITE_TAIL
-)
-DOC_MUXERS_VERBATIM_COMMENT_NAMES_GLOBAL_SIDX = (
-    "@table @option\n"
-    "@item ignore_io_errors\n"
-    "Ignore I/O errors.\n"
-    "@verbatim\n"
-    "@c global_sidx\n"
-    "@end verbatim\n"
-    "@item global_sidx\n"
-    "Write a global sidx.\n"
-    "@item single_file\n"
-    "Write one output file.\n"
-    "@end table\n"
-)
-DOC_MUXERS_IGNORE_BLOCK_NAMES_GLOBAL_SIDX = (
-    "@table @option\n"
-    "@item ignore_io_errors\n"
-    "Ignore I/O errors.\n"
-    "@ignore\n"
-    "Respect global_sidx when inserting index ranges.\n"
-    "@end ignore\n"
-    "@item global_sidx\n"
-    "Write a global sidx.\n"
-    "@item single_file\n"
-    "Write one output file.\n"
-    "@end table\n"
-)
-DOC_MUXERS_GLOBAL_SIDX_ONLY = (
-    "@table @option\n"
-    "@item ignore_io_errors\n"
-    "Ignore I/O errors.\n"
-    "@item global_sidx\n"
-    "Write a global sidx.\n"
-    "Write one index box for the whole output.\n"
     "@item single_file\n"
     "Write one output file.\n"
     "@end table\n"
@@ -2917,6 +2881,110 @@ class DocTermTest(unittest.TestCase):
                 self.assertEqual(len(filtered), len(lines))
                 self.assertEqual([len(line) for line in filtered], [len(line) for line in lines])
 
+    def _tested_fields_per_line(self, lines: list[str], fields: frozenset[str]) -> list[list[str]]:
+        """Return the requested fields tested per line after the whole-text filter."""
+        code = upstream_lint._code_lines("\n".join(lines))
+        spans = upstream_lint._condition_spans(code)
+        filtered = upstream_lint._lines_without_assignment_targets(code)
+        return [
+            sorted(upstream_lint._option_fields_tested(line, fields, spans=spans.get(number, ())))
+            for number, line in enumerate(filtered, 1)
+        ]
+
+    def test_assignment_filter_b1_split_subscript_read_is_a_test(self) -> None:
+        """H1 b1: a split subscript read inside an assignment target counts as a test."""
+        fields = frozenset(("foo", "mode", "slots"))
+        lines = ["if ((c->slots[c->foo", "             ? 0 : 1] = 1) && c->mode)"]
+        self.assertEqual(self._tested_fields_per_line(lines, fields), [["foo"], ["mode"]])
+
+    def test_assignment_filter_b2_subscript_read_is_a_test(self) -> None:
+        """H1 b2: a one-line subscript read inside an assignment target counts as a test."""
+        fields = frozenset(("foo", "mode", "slots"))
+        lines = ["if ((c->slots[c->foo ? 0 : 1] = 1) && c->mode)"]
+        self.assertEqual(self._tested_fields_per_line(lines, fields), [["foo", "mode"]])
+
+    def test_assignment_filter_b3_constant_index_target_not_a_test(self) -> None:
+        """H1 b3: a constant-index assignment target stays excluded."""
+        fields = frozenset(("foo", "mode", "slots"))
+        lines = ["if ((c->slots[0] = 1) && c->mode)"]
+        self.assertEqual(self._tested_fields_per_line(lines, fields), [["mode"]])
+
+    def test_assignment_filter_b4_compound_operator_subscript_read_is_a_test(self) -> None:
+        """H1 b4: a subscript read on a compound assignment target counts as a test."""
+        fields = frozenset(("foo", "mode", "slots"))
+        lines = ["if ((c->slots[c->foo] += 1) && c->mode)"]
+        self.assertEqual(self._tested_fields_per_line(lines, fields), [["foo", "mode"]])
+
+    def test_assignment_filter_b5_comparison_subscript_read_stays_a_test(self) -> None:
+        """H1 b5: a comparison with a subscript read keeps all three fields tested."""
+        fields = frozenset(("foo", "mode", "slots"))
+        lines = ["if (c->slots[c->foo] == c->mode)"]
+        self.assertEqual(self._tested_fields_per_line(lines, fields), [["foo", "mode", "slots"]])
+
+    def test_assignment_filter_b6_option_target_indexed_by_option(self) -> None:
+        """H1 b6: an option target indexed by another option tests only the index option."""
+        fields = frozenset(("foo", "mode", "slots"))
+        lines = ["if ((c->foo[c->mode] = 1) && c->x)"]
+        self.assertEqual(self._tested_fields_per_line(lines, fields), [["mode"]])
+
+    def test_assignment_filter_b7_plain_member_target_not_a_test(self) -> None:
+        """H1 b7: a plain member assignment target without a subscript is not a test."""
+        fields = frozenset(("foo", "mode", "slots"))
+        lines = ["if ((c->foo = 1) && c->mode)"]
+        self.assertEqual(self._tested_fields_per_line(lines, fields), [["mode"]])
+
+    def test_assignment_filter_b8_nested_subscript_read_is_a_test(self) -> None:
+        """H1 b8: one nested subscript level excludes the target while keeping inner reads."""
+        fields = frozenset(("foo", "mode", "slots"))
+        lines = ["if ((c->slots[c->idx[c->foo]] = 1) && c->mode)"]
+        self.assertEqual(self._tested_fields_per_line(lines, fields), [["foo", "mode"]])
+
+    def test_assignment_filter_b9_nested_constant_index_target_not_a_test(self) -> None:
+        """H1 b9: one nested constant-index subscript still excludes the assigned target."""
+        fields = frozenset(("foo", "mode", "slots"))
+        lines = ["if ((c->slots[c->idx[0]] = 1) && c->mode)"]
+        self.assertEqual(self._tested_fields_per_line(lines, fields), [["mode"]])
+
+    def test_text_without_assignment_targets_t1_subscript_read(self) -> None:
+        """H2 t1: the single-line filter blanks member and operator while keeping [c->foo]."""
+        self.assertEqual(
+            upstream_lint._text_without_assignment_targets("c->slots[c->foo] = 1"),
+            "c       [c->foo]   1",
+        )
+
+    def test_text_without_assignment_targets_t2_constant_index(self) -> None:
+        """H2 t2: the single-line filter blanks member and operator while keeping [0]."""
+        self.assertEqual(
+            upstream_lint._text_without_assignment_targets("c->slots[0] = 1"),
+            "c       [0]   1",
+        )
+
+    def test_text_without_assignment_targets_t3_comparison_unchanged(self) -> None:
+        """H2 t3: the single-line filter leaves an == comparison unchanged."""
+        self.assertEqual(
+            upstream_lint._text_without_assignment_targets("c->slots[c->foo] == 1"),
+            "c->slots[c->foo] == 1",
+        )
+
+    def test_text_without_assignment_targets_t4_nested_subscript_read(self) -> None:
+        """H2 t4: the single-line filter blanks member and operator around a nested subscript."""
+        self.assertEqual(
+            upstream_lint._text_without_assignment_targets("c->slots[c->idx[c->foo]] = 1"),
+            "c       [c->idx[c->foo]]   1",
+        )
+
+    def test_assignment_filter_subscript_keeps_line_count_and_lengths(self) -> None:
+        """The whole-text filter keeps the line count and every line length on b1, b2, b8."""
+        for lines in (
+            ["if ((c->slots[c->foo", "             ? 0 : 1] = 1) && c->mode)"],
+            ["if ((c->slots[c->foo ? 0 : 1] = 1) && c->mode)"],
+            ["if ((c->slots[c->idx[c->foo]] = 1) && c->mode)"],
+        ):
+            with self.subTest(lines=lines):
+                filtered = upstream_lint._lines_without_assignment_targets(lines)
+                self.assertEqual(len(filtered), len(lines))
+                self.assertEqual([len(line) for line in filtered], [len(line) for line in lines])
+
     def test_avoption_tables_bounded_header_separates_tables(self) -> None:
         """An explicit array bound on the second table keeps foo and bar apart."""
         tables = upstream_lint.avoption_tables(BOUNDED_TWO_TABLES_OPTIONS)
@@ -5128,6 +5196,19 @@ class PipelineTest(FixtureTest):
     def test_doc_terms_option_interplay_window_lines_read_filtered_text(self) -> None:
         """Window lines read the filtered text, so a split assignment pairs nothing."""
         rc, output = self._interplay_check(DASHENC_SPLIT_ASSIGN_SOURCE, DOC_MUXERS_GLOBAL_SIDX_ONLY)
+        self.assertEqual(rc, 0, output)
+        self.assertIn("step: doc-terms rc: 0", output)
+
+    def test_doc_terms_option_interplay_subscript_read_in_target_fails(self) -> None:
+        """An option read inside the subscript of a split assignment target counts as a test."""
+        rc, output = self._interplay_check(DASHENC_SUBSCRIPT_READ_ASSIGN_SOURCE, DOC_MUXERS_T1)
+        self.assertEqual(rc, 1, output)
+        self.assertIn("step: doc-terms rc: 1", output)
+        self.assertIn("added code tests ignore_io_errors near global_sidx", output)
+
+    def test_doc_terms_option_interplay_constant_index_target_passes(self) -> None:
+        """A constant-index option assignment target split across lines is not a test."""
+        rc, output = self._interplay_check(DASHENC_CONSTANT_INDEX_ASSIGN_SOURCE, DOC_MUXERS_T1)
         self.assertEqual(rc, 0, output)
         self.assertIn("step: doc-terms rc: 0", output)
 

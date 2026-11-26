@@ -207,7 +207,8 @@ Texinfo @c and @comment text and @ignore text in an entry do not name a neighbou
 @verbatim and @verb text is literal, so a @c line inside it does name one.
 An explicit array bound in an AVOption table header still starts a new table.
 A structure field on the left of an assignment, in or outside a condition, is not a test,
-even when the assignment operator sits on a later line.
+even when the assignment operator sits on a later line, while a field read inside the
+subscript of an assignment target is still a test.
 Consecutive @item and @itemx headings share one entry, running to the line before the next
 heading of the same table or that table's @end with inner blocks and raw blocks included;
 the full entry text at head is used, not added lines alone. Only structure member access
@@ -2775,7 +2776,9 @@ AVOPTION_FIELD = (
 AVOPTION_ENTRY = re.compile(rf"\{{\s*\"([^\"]+)\"\s*,\s*{AVOPTION_HELP}\s*,\s*{AVOPTION_FIELD}")
 AVOPTION_TABLE_HEAD = re.compile(r"\bAVOption\s+[A-Za-z_]\w*\s*\[\s*[^\]\n]*\s*\]\s*=\s*\{")
 FIELD_ASSIGN_TARGET = re.compile(
-    r"->\s*\w+(?:\[[^\]]*\])?\s*(?:=(?!=)|\+=|-=|\*=|/=|%=|&=|\|=|\^=|<<=|>>=)"
+    r"(?P<member>->\s*\w+)"
+    r"(?P<subscript>\[(?:[^\[\]]|\[[^\[\]]*\])*\])?"
+    r"(?P<operator>\s*(?:=(?!=)|\+=|-=|\*=|/=|%=|&=|\|=|\^=|<<=|>>=))"
 )
 CONDITION_HEAD = re.compile(r"\b(?:if|while)\s*\(")
 TEXI_ITEM_HEAD = re.compile(r"^@itemx?\s+(\S+)")
@@ -2958,18 +2961,24 @@ def texi_strip_comments(text: str) -> str:
     return "\n".join(kept)
 
 
+def _blank_assignment_target(match: re.Match[str]) -> str:
+    """Blank the member and operator of an assignment target, keeping any subscript."""
+    member = re.sub(r"[^\n]", " ", match["member"])
+    subscript = match["subscript"] or ""
+    operator = re.sub(r"[^\n]", " ", match["operator"])
+    return f"{member}{subscript}{operator}"
+
+
 def _text_without_assignment_targets(text: str) -> str:
     """Return text with structure-member assignment targets replaced by blanks."""
-    return FIELD_ASSIGN_TARGET.sub(lambda match: " " * len(match.group(0)), text)
+    return FIELD_ASSIGN_TARGET.sub(_blank_assignment_target, text)
 
 
 def _lines_without_assignment_targets(code_lines: list[str]) -> list[str]:
     """Return the code lines with assignment targets blanked even when the operator is later."""
     if not code_lines:
         return []
-
-    blanked = FIELD_ASSIGN_TARGET.sub(lambda m: re.sub(r"[^\n]", " ", m[0]), "\n".join(code_lines))
-    return blanked.split("\n")
+    return FIELD_ASSIGN_TARGET.sub(_blank_assignment_target, "\n".join(code_lines)).split("\n")
 
 
 def _option_fields_tested(

@@ -248,16 +248,27 @@ builds, are not detected.
 
 The c-rules step runs scripts/semgrep_scan.sh with .semgrep-ffmpeg.yml from
 this repository over added, modified or renamed library and fftools C and
-header sources in base..head, using the FFmpeg checkout at head as the working
-directory, and skips the run when none changed. Results are read through an
+header sources in base..head, reading a blanked scratch copy, and skips the run
+when none changed. Object-like attribute macros discovered in libavutil/attributes.h
+and standalone file-scope invocations of locally defined function-like macros
+are replaced with spaces, preserving byte offsets and newlines. Preprocessor
+directive lines remain unchanged; a missing attributes header is reported.
+Results are read through an
 allow-list: exit status 0 or 1, no semgrep_scan: warning line, and a JSON
 output object whose paths.scanned list contains every requested path, whose
 results name requested paths with non-empty rule ids, and whose errors list
-holds only PartialParsing errors. Matches whose line range
+holds only PartialParsing errors or validated Syntax error entries for requested
+files. Matches whose line range
 meets a file's rename-aware added lines or deletion positions fail with rc 1,
 untouched matches and PartialParsing errors are reported without failing,
-and any other status, warning, error type or JSON failure gives rc 2.
---c-rule-reason TEXT waives rc 1 findings and prints the reason, never rc 2.
+and any other status, warning, error shape or JSON failure gives rc 2.
+A Syntax error for a requested file means the rules could not read it: rc 1
+names the file and requires a check by hand of its touched lines.
+--c-rule-reason TEXT waives findings only, never unread files or rc 2.
+--c-rule-unread-waiver JSON is repeatable, one exact path per dated exception;
+fields: path, rule=c-rules-unread, reason, category, entered (YYYY-MM-DD),
+and expires (required for A, optional for B/C/D). B/C/D expire after 3/10/120
+days; A requires 1-90 days. Expiry day is live; unused waivers fail.
 
 The docstrings step checks diff-scoped doc-comment coverage across base..head
 in --tree by running the pinned Praetor engine via .config/lefthook/engine.sh
@@ -289,16 +300,19 @@ import time
 from collections.abc import Callable, Mapping
 from contextvars import ContextVar
 from dataclasses import dataclass, field
+from datetime import date, timedelta
 from itertools import islice
 from pathlib import Path, PurePosixPath
 
 # Ensure repository root is on sys.path for test/tool imports
+if str(Path(__file__).resolve().parent.parent) not in sys.path:
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from scripts import series
+from scripts.process_group import kill_process_group  # noqa: E402
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 _PROCESS_STREAMS = (("stdout", sys.__stdout__), ("stderr", sys.__stderr__))
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
-
-from scripts.process_group import kill_process_group  # noqa: E402
 
 PRE_COMMIT = "pre-commit"
 ALLOWED_EXECUTABLES = frozenset({"git", "pre-commit", "bash"})
@@ -353,6 +367,10 @@ C_RULES_DIFF = (
     "--dst-prefix=b/",
 )
 MAX_PATHS = 2000
+# 160 displayed characters keep a bad value readable in a terminal diagnostic.
+MAX_WAIVER_ECHO_CHARS = 160
+# Fits 4096 path + 1024 reason characters even at 12 JSON characters each.
+MAX_UNREAD_WAIVER_CHARS = 65536
 MAX_CLAIM_COMMITS = 1000
 # Bound environment iteration with ample headroom above hundreds of entries.
 MAX_ENV_ENTRIES = 16384
@@ -368,6 +386,7 @@ REAP_TIMEOUT = 10
 SEMGREP_SCAN = REPO_ROOT / "scripts" / "semgrep_scan.sh"
 SEMGREP_FFMPEG_RULES = REPO_ROOT / ".semgrep-ffmpeg.yml"
 _DEADLINE: ContextVar[float | None] = ContextVar("deadline", default=None)
+_TODAY: Callable[[], date] = date.today
 CONFIG = ".forgejo/pre-commit/config.yaml"
 ENGINE_SCRIPT = ".config/lefthook/engine.sh"
 HUNK = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
@@ -379,8 +398,8 @@ REFERENCE = re.compile(r"^[^:\n]+?[:-]\d+[:-](.*)$")
 FUNCTION = re.compile(r"^(?:[A-Za-z_]\w*[ *]+)+[A-Za-z_]\w*\([^();{}]*\)\s*\{")
 CONTROL = re.compile(r"(?:}\s*)?(?:(?:else\s+)?(?:if|for|while|switch)\s*\(.*\)|else|do)")
 C_NONCODE = re.compile(
-    r'/\*.*?\*/|//[^\n]*|"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\''
-    r"|^[ \t]*\#[^\n]*(?:\n(?<=\\\n)[^\n]*)*",
+    r'/\*.*?(?:\*/|\Z)|//[^\n]*|"(?:\\.|[^"\\])*(?:"|\\?\Z)'
+    r"|\'(?:\\.|[^\'\\])*(?:\'|\\?\Z)",
     re.DOTALL | re.MULTILINE,
 )
 FIX_MESSAGE = re.compile(
@@ -550,6 +569,17 @@ class RunResult:
 
 
 @dataclass(frozen=True)
+class UnreadWaiver:
+    """One exact-path unread-file exception evaluated against the run's date."""
+
+    path: str
+    reason: str
+    category: str
+    expires: date
+    expired: bool
+
+
+@dataclass(frozen=True)
 class Waivers:
     """Reasons that waive single upstream checks; a blank reason waives nothing."""
 
@@ -560,6 +590,7 @@ class Waivers:
     test_program: str = ""
     c_rule: str = ""
     docstring: str = ""
+    unread: tuple[UnreadWaiver, ...] = ()
     revert_proofs: tuple[Path, ...] = ()
 
 
@@ -895,8 +926,102 @@ def _deleted_lines(patch: str) -> set[int]:
     return deleted
 
 
+def _c_splice_lines(source: str) -> tuple[str, list[int]]:
+    """Remove phase-2 splices and map every logical character to its physical offset."""
+    parts: list[str] = []
+    offsets: list[int] = []
+    start = 0
+    splices = list(re.finditer(r"\\\r?\n", source))
+    for index in range(len(splices)):
+        splice = splices[index]
+        parts.append(source[start : splice.start()])
+        offsets.extend(range(start, splice.start()))
+        start = splice.end()
+    parts.append(source[start:])
+    offsets.extend(range(start, len(source)))
+    return "".join(parts), offsets
+
+
+def _c_mask_noncode(source: str, code_splices: set[int]) -> tuple[list[str], set[int], list[str]]:
+    """Mask logical noncode and exclude splices strictly inside comments and literals."""
+    parts: list[str] = []
+    prefixes: list[str] = []
+    spanning: set[int] = set()
+    offset, line = 0, 0
+    matches = list(C_NONCODE.finditer(source))
+    for index in range(len(matches)):
+        match = matches[index]
+        code_splices.difference_update(range(match.start() + 1, match.end()))
+        prefix = source[offset : match.start()]
+        parts.append(prefix)
+        prefixes.append(prefix)
+        line += prefix.count("\n")
+        last = line + match[0].count("\n")
+        if match[0].startswith("/*"):
+            spanning.update(range(line, last))
+        masked = re.sub(r"[^\n]", " ", match[0])
+        parts.append(masked)
+        prefixes.append(masked if match[0].startswith("/") else match[0])
+        offset, line = match.end(), last
+    parts.append(source[offset:])
+    prefixes.append(source[offset:])
+    return "".join(parts).split("\n"), spanning, "".join(prefixes).split("\n")
+
+
+def _c_code_splices(logical: str, offsets: list[int]) -> set[int]:
+    """Locate removed splice runs between two non-blank logical bytes via the phase-2 map."""
+    blanks = " \t\f\v\r\n"
+    return {
+        index
+        for index in range(1, len(offsets))
+        if offsets[index] > offsets[index - 1] + 1
+        and logical[index - 1] not in blanks
+        and logical[index] not in blanks
+    }
+
+
+def _c_lex_lines(
+    source: str, reject_token_splices: bool = False, positions: bool = False
+) -> tuple[list[str], list[str], list[int]]:
+    """Project phase-2 code masks; third tuple element lists directive lines only when positions."""
+    logical, offsets = _c_splice_lines(source)
+    splices = _c_code_splices(logical, offsets) if reject_token_splices else set()
+    code, spanning, prefixes = _c_mask_noncode(logical, splices)
+    directives: list[str] = []
+    directive_lines: list[int] = []
+    continued = False
+    offset = 0
+    last_counted = 0
+    line_num = 0
+    for index in range(len(code)):
+        end = offset + len(code[index])
+        starts = code[index].lstrip(" \t\r\v\f").startswith("#") and prefixes[index].lstrip(
+            " \t\r\v\f"
+        ).startswith("#")
+        if continued or starts:
+            splices.difference_update(range(offset, end + 1))
+            if not continued:
+                directives.append(code[index])
+                if positions:
+                    phys = offsets[offset]
+                    line_num += source.count("\n", last_counted, phys)
+                    directive_lines.append(line_num)
+                    last_counted = phys
+            continued = index in spanning
+            code[index] = " " * len(code[index])
+        offset = end + 1
+    if splices:
+        raise ValueError("line splice inside code between two non-blank bytes is not supported")
+    masked = "\n".join(code)
+    physical = list(re.sub(r"[^\r\n]", " ", source))
+    for index in range(len(offsets)):
+        physical[offsets[index]] = masked[index]
+    return "".join(physical).split("\n"), directives, directive_lines
+
+
 def _code_lines(source: str) -> list[str]:
-    return C_NONCODE.sub(lambda match: re.sub(r"[^\n]", " ", match[0]), source).split("\n")
+    """Return physical C code lines with comments, literals and logical directives masked."""
+    return _c_lex_lines(source, positions=False)[0]
 
 
 def _line_rules(raw: str, code: str, previous: str) -> list[str]:
@@ -3538,33 +3663,65 @@ def _partial_parsing_path(error: object) -> str | None:
     return None
 
 
+def _syntax_error_path(error: object, requested: frozenset[str] | None) -> str | None:
+    """Allow only known Syntax error fields and types for an explicitly requested file."""
+    fields = {"type", "path", "code", "level", "message"}
+    if not isinstance(error, dict) or not error.keys() <= fields:
+        return None
+    path = error.get("path")
+    code = error.get("code", 3)
+    code_type = type(code)
+    if (
+        error.get("type") != "Syntax error"
+        or not isinstance(path, str)
+        or not path
+        or requested is None
+        or path not in requested
+        or code_type is not int
+        or code != 3
+        or error.get("level", "warn") != "warn"
+        or not isinstance(error.get("message", ""), str)
+    ):
+        return None
+    return path
+
+
 def _read_semgrep_lists(
     raw_results: object,
     raw_errors: object,
     scanned_paths: frozenset[str] | None = None,
+    *,
+    unread_paths: list[str] | None = None,
 ) -> tuple[list[SemgrepMatch], list[str]] | None:
-    """Validate every result and PartialParsing error in Semgrep's JSON lists."""
+    """Validate results and partial errors, collecting unread requested files when supplied."""
     if not (isinstance(raw_results, list) and isinstance(raw_errors, list)):
         return None
     matches: list[SemgrepMatch] = []
-    for raw in raw_results:
-        match = _parse_semgrep_match(raw)
+    for index in range(len(raw_results)):
+        match = _parse_semgrep_match(raw_results[index])
         if match is None or (scanned_paths is not None and match.path not in scanned_paths):
             return None
         matches.append(match)
     partial_paths: list[str] = []
-    for raw in raw_errors:
+    for index in range(len(raw_errors)):
+        raw = raw_errors[index]
         path = _partial_parsing_path(raw)
-        if path is None:
+        if path is not None:
+            partial_paths.append(path)
+        elif unread_paths is not None and (path := _syntax_error_path(raw, scanned_paths)):
+            unread_paths.append(path)
+        else:
             return None
-        partial_paths.append(path)
     return matches, partial_paths
 
 
 def _read_semgrep_json(
-    json_path: Path, scanned_paths: frozenset[str] | None = None
+    json_path: Path,
+    scanned_paths: frozenset[str] | None = None,
+    *,
+    unread_paths: list[str] | None = None,
 ) -> tuple[list[SemgrepMatch], list[str]] | None:
-    """Allow-list Semgrep JSON and require paths.scanned to cover every requested path."""
+    """Require scan coverage and allow-list JSON, collecting unread files when supplied."""
     try:
         payload = json.loads(json_path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError):
@@ -3573,12 +3730,14 @@ def _read_semgrep_json(
         return None
     paths = payload.get("paths")
     scanned = paths.get("scanned") if isinstance(paths, dict) else None
-    if not isinstance(scanned, list) or not all(isinstance(path, str) for path in scanned):
+    if not isinstance(scanned, list) or not all(
+        isinstance(scanned[index], str) for index in range(len(scanned))
+    ):
         return None
     if scanned_paths is not None and not scanned_paths.issubset(scanned):
         return None
     raw_results, raw_errors = payload.get("results"), payload.get("errors")
-    return _read_semgrep_lists(raw_results, raw_errors, scanned_paths)
+    return _read_semgrep_lists(raw_results, raw_errors, scanned_paths, unread_paths=unread_paths)
 
 
 def _c_rules_error(result: RunResult) -> Step:
@@ -3627,63 +3786,700 @@ def _c_rules_touched(tree: Path, base: str, head: str) -> dict[str, set[int]]:
     }
 
 
+def _waiver_text(value: str) -> str:
+    """Escape controls and non-ASCII text without changing exact-path matching."""
+    return json.dumps(value, ensure_ascii=True)[1:-1]
+
+
+def _waiver_echo(value: str) -> str:
+    """Limit escaped diagnostic values to 160 characters, including a cut mark."""
+    escaped = _waiver_text(value)
+    if len(escaped) > MAX_WAIVER_ECHO_CHARS:
+        return escaped[: MAX_WAIVER_ECHO_CHARS - 3] + "..."
+    return escaped
+
+
+def _waiver_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    """Reject repeated JSON fields rather than silently replacing them."""
+    entry: dict[str, object] = {}
+    for index in range(len(pairs)):
+        key, value = pairs[index]
+        if key in entry:
+            raise ValueError(f"duplicate field: {_waiver_echo(key)}")
+        entry[key] = value
+    return entry
+
+
+def _unread_waiver_dates(entry: dict[str, str], today: date) -> tuple[date, date]:
+    """Reuse series date and interval validation, classifying expiration separately."""
+    category = entry["category"]
+    if category not in series.VALID_CATEGORIES:
+        raise ValueError("category: expected A, B, C or D")
+    try:
+        entered = date.fromisoformat(entry["entered"])
+    except ValueError as error:
+        raise ValueError("entered: invalid YYYY-MM-DD date") from error
+    if category == "A" and "expires" not in entry:
+        raise ValueError("missing field: expires (category A)")
+    try:
+        expires = (
+            entry.get("expires")
+            or (entered + timedelta(days=series.CATEGORY_INTERVALS[category])).isoformat()
+        )
+    except OverflowError as error:
+        raise ValueError("expires: date out of range") from error
+    findings = series.Findings()
+    series.check_exception_dates({**entry, "expires": expires}, "waiver", findings, date.min)
+    if findings.errors:
+        raise ValueError("; ".join(findings.errors))
+    if entered > today:
+        raise ValueError("entered: date is in the future")
+    return entered, date.fromisoformat(expires)
+
+
+def _unread_waiver_object(value: str) -> dict[str, str]:
+    """Validate the JSON object against the exact unread-waiver field allow-list."""
+    if len(value) > MAX_UNREAD_WAIVER_CHARS:
+        raise ValueError(f"JSON: waiver exceeds {MAX_UNREAD_WAIVER_CHARS} characters")
+    required = {"path", "rule", "reason", "category", "entered"}
+    try:
+        raw = json.loads(value, object_pairs_hook=_waiver_object)
+    except json.JSONDecodeError as error:
+        raise ValueError("JSON: invalid waiver object") from error
+    except RecursionError as error:
+        raise ValueError("JSON: waiver nesting too deep") from error
+    if not isinstance(raw, dict):
+        raise ValueError("JSON: expected waiver object")
+    unknown = set(raw) - (required | {"expires"})
+    missing = required - set(raw)
+    if unknown:
+        raise ValueError(f"unknown field: {_waiver_echo(sorted(unknown)[0])}")
+    if missing:
+        raise ValueError(f"missing field: {sorted(missing)[0]}")
+    keys = sorted(raw)
+    for index in range(len(keys)):
+        key = keys[index]
+        if not isinstance(raw[key], str) or not raw[key].strip():
+            raise ValueError(f"{key}: expected non-empty string")
+    if raw["rule"] != "c-rules-unread":
+        raise ValueError("rule: expected c-rules-unread")
+    return raw
+
+
+def _parse_unread_waivers(values: list[str], today: date) -> tuple[UnreadWaiver, ...]:
+    """Parse validated dated waivers and reject duplicate paths as usage errors."""
+    entries: dict[str, UnreadWaiver] = {}
+    if len(values) > MAX_PATHS:
+        raise ValueError(f"path: at most {MAX_PATHS} waivers allowed")
+    for index in range(len(values)):
+        raw = _unread_waiver_object(values[index])
+        if raw["path"] in entries:
+            raise ValueError(f"path: duplicate waiver for {_waiver_echo(raw['path'])}")
+        _, expires = _unread_waiver_dates(raw, today)
+        entries[raw["path"]] = UnreadWaiver(
+            raw["path"], raw["reason"].strip(), raw["category"], expires, expires < today
+        )
+    return tuple(entries.values())
+
+
+def _unread_report(unread_paths: list[str], waivers: tuple[UnreadWaiver, ...]) -> Step:
+    """Require one live dated waiver per unread path and reject unused waivers."""
+    unread = set(unread_paths)
+    entries = {waivers[index].path: waivers[index] for index in range(len(waivers))}
+    paths = sorted(unread | entries.keys())
+    lines: list[str] = []
+    failed = False
+    for index in range(len(paths)):
+        path = paths[index]
+        display = _waiver_text(path)
+        if path not in unread:
+            failed = True
+            lines.append(f"unused waiver: {display}")
+            continue
+        lines.append(
+            f"unread: {display}: rules could not read this file; touched lines need a check by hand"
+        )
+        entry = entries.get(path)
+        if entry is None:
+            failed = True
+            lines.append(f"no waiver: {display}: pass --c-rule-unread-waiver")
+        elif entry.expired:
+            failed = True
+            lines.append(f"expired: {display}: category {entry.category}, expired {entry.expires}")
+        else:
+            lines.append(
+                f"waived: {display}: category {entry.category}, "
+                f"expires {entry.expires}: {_waiver_text(entry.reason)}"
+            )
+    return Step("c-rules", int(failed), "\n".join(lines))
+
+
 def _c_rules_report(
     matches: list[SemgrepMatch],
     partial_paths: list[str],
     touched_by_path: dict[str, set[int]],
-    source_count: int,
-    waiver: str,
+    waivers: Waivers,
+    unread_paths: list[str],
 ) -> Step:
-    """Classify allow-listed Semgrep matches against touched lines and apply any waiver."""
+    """Report findings separately from exact-path dated unread-file waivers."""
+    unread = _unread_report(unread_paths, waivers.unread)
     findings: list[str] = []
     notes: list[str] = []
-    for match in matches:
+    for index in range(len(matches)):
+        match = matches[index]
         if match.path not in touched_by_path:
             raise ValueError(f"unscanned result path: {match.path}")
-        touched_lines = touched_by_path[match.path]
-        touched = any(match.start_line <= line <= match.end_line for line in touched_lines)
+        touched_lines = sorted(touched_by_path[match.path])
+        touched = any(
+            match.start_line <= touched_lines[index] <= match.end_line
+            for index in range(len(touched_lines))
+        )
         detail = f"{match.path}:{match.start_line}: {match.check_id}: {match.message_line}"
         if touched:
             findings.append(f"finding: {detail}")
         else:
             notes.append(f"pre-existing (untouched): {detail}")
-    notes.extend(f"informational: {path}: PartialParsing" for path in partial_paths)
-    if not findings:
-        summary = f"0 finding(s) in {source_count} changed C/header source(s)"
-        return Step("c-rules", 0, "\n".join([*notes, summary]))
-    reason = waiver.strip()
-    if reason:
-        return Step("c-rules", 0, "\n".join([f"waived: {reason}", *findings, *notes]))
-    advice = "fix the flagged path, or pass --c-rule-reason"
-    return Step("c-rules", 1, "\n".join([*findings, *notes, advice]))
+    notes.extend(
+        f"informational: {partial_paths[index]}: PartialParsing"
+        for index in range(len(partial_paths))
+    )
+    reason = waivers.c_rule.strip()
+    lines = ([f"waived: {reason}"] if findings and reason else []) + findings + notes
+    if unread.output:
+        lines.append(unread.output)
+    if findings and not reason:
+        lines.append("fix the flagged path, or pass --c-rule-reason")
+    elif not findings and not unread_paths:
+        lines.append(f"0 finding(s) in {len(touched_by_path)} changed C/header source(s)")
+    return Step("c-rules", int(bool(unread.rc or (findings and not reason))), "\n".join(lines))
 
 
-def _c_rules(tree: Path, base: str, head: str, waiver: str) -> Step:
-    """Scan changed C/header sources and fail closed unless every requested path was scanned."""
+def _c_rules_read_source(path: Path) -> bytes:
+    """Read source bytes, rejecting bare CR line endings and unsupported code-token splices."""
+    source = path.read_bytes()
+    if re.search(rb"\r(?!\n)", source):
+        raise ValueError("bare CR line endings are not supported")
+    _c_lex_lines(source.decode("latin-1"), reject_token_splices=True, positions=False)
+    return source
+
+
+def _c_rules_attributes(tree: Path) -> tuple[set[bytes], list[str]]:
+    """Discover contained attributes, rejecting escapes and unsupported source syntax."""
+    header = tree / "libavutil/attributes.h"
+    if not _c_rules_inside(header, tree):
+        return set(), [
+            (
+                "error: libavutil/attributes.h: resolves outside the checked tree; "
+                "attribute blanking skipped"
+            )
+        ]
+    try:
+        source = _c_rules_read_source(header)
+    except IsADirectoryError:
+        return set(), []
+    except FileNotFoundError:
+        return set(), ["informational: missing libavutil/attributes.h; attribute blanking skipped"]
+    except OSError:
+        return set(), [
+            "informational: libavutil/attributes.h: could not be read; attribute blanking skipped"
+        ]
+    except ValueError as error:
+        return set(), [f"informational: libavutil/attributes.h: {error}"]
+    directives = _c_lex_lines(source.decode("latin-1"), positions=False)[1]
+    names = re.findall(
+        r"(?m)^[ \t]*#[ \t]*define[ \t]+((?:av_|attribute_)[A-Za-z0-9_]+)\b(?!\()",
+        "\n".join(directives),
+    )
+    return {name.encode("ascii") for name in names}, []
+
+
+def _c_rules_macro_call(line: str, names: set[str]) -> bool:
+    """Recognize one balanced invocation of a known macro occupying an entire line."""
+    match = re.fullmatch(r"\s*([A-Za-z_]\w*)\s*(\(.*\))\s*", line, re.ASCII)
+    if match is None or match[1] not in names:
+        return False
+    arguments = match[2]
+    depth = 0
+    for index in range(len(arguments)):
+        char = arguments[index]
+        depth += (char == "(") - (char == ")")
+        if depth <= 0 and index != len(arguments) - 1:
+            return False
+    return depth == 0
+
+
+def _c_rules_blank_words(raw: bytes, clean: str, words: re.Pattern[bytes]) -> bytes:
+    """Blank attribute spans found only in lexically masked code without moving bytes."""
+    blanked = bytearray(raw)
+    matches = list(words.finditer(clean.encode("latin-1")))
+    for index in range(len(matches)):
+        match = matches[index]
+        blanked[match.start() : match.end()] = b" " * len(match[0])
+    return bytes(blanked)
+
+
+def _c_rules_directive_words(
+    lines: list[bytes],
+    code: list[str],
+    directives: list[str],
+    directive_lines: list[int],
+) -> list[bytes] | None:
+    """Map each physical line to its directive word, or None when physical and lexed disagree."""
+    per_line: list[bytes] = []
+    physical_pairs: list[tuple[int, bytes]] = []
+    for index in range(len(lines)):
+        clean = code[index]
+        match = re.match(rb"[ \t]*#[ \t]*([A-Za-z_]\w*)", lines[index])
+        word = match.group(1) if not clean.strip() and match is not None else b""
+        per_line.append(word)
+        if word:
+            physical_pairs.append((index, word))
+    lexed_pairs: list[tuple[int, bytes]] = []
+    if len(directive_lines) != len(directives):
+        return None
+    for index in range(len(directives)):
+        match = re.match(r"(?a)[ \t]*#[ \t]*([A-Za-z_]\w*)", directives[index])
+        if match is None:
+            continue
+        lexed_pairs.append((directive_lines[index], match.group(1).encode("ascii")))
+    if physical_pairs != lexed_pairs:
+        return None
+    return per_line
+
+
+def _c_rules_arm_joins(directive_words: list[bytes], limit: int) -> list[int]:
+    """Map each elif or else line to its closing endif index, skipping nested conditionals."""
+    joins = [-1] * len(directive_words)
+    stack: list[list[int]] = []
+    for index in range(min(len(directive_words), limit)):
+        word = directive_words[index]
+        if word in {b"if", b"ifdef", b"ifndef"} and len(stack) < limit:
+            stack.append([])
+        elif word in {b"elif", b"else"} and stack:
+            stack[-1].append(index)
+        elif word == b"endif" and stack:
+            for arm in stack.pop():
+                joins[arm] = index
+    return joins
+
+
+def _c_rules_depths(
+    lines: list[bytes], code: list[str], directive_words: list[bytes] | None
+) -> list[int]:
+    """Track per-line brace depth across preprocessor conditional arms, or -1 on mismatch."""
+    if directive_words is None:
+        return [-1] * len(lines)
+    depths: list[int] = []
+    stack: list[tuple[int, set[int], bool]] = []
+    depth = 0
+    valid = True
+    for index in range(len(lines)):
+        clean = code[index]
+        word = directive_words[index]
+        if word in {b"if", b"ifdef", b"ifndef"} and len(stack) < len(lines):
+            stack.append((depth, set(), False))
+        elif word in {b"elif", b"else"} and stack:
+            entry, ends, has_else = stack[-1]
+            ends.add(depth)
+            stack[-1] = (entry, ends, has_else or word == b"else")
+            depth = entry
+        elif word == b"endif" and stack:
+            entry, ends, has_else = stack.pop()
+            valid = valid and ends <= {depth} and (has_else or entry == depth)
+        elif word in {b"if", b"ifdef", b"ifndef", b"elif", b"else", b"endif"}:
+            return [-1] * len(lines)
+        depths.append(depth if valid else -1)
+        depth += clean.count("{") - clean.count("}")
+    if stack:
+        return [-1] * len(lines)
+    return depths
+
+
+def _c_rules_attr_token(token: str, attr_depth: int) -> tuple[int, bool]:
+    """Advance attribute-group parenthesis depth and plain-rparen flag for one token."""
+    if token in {";", "{", "}"}:
+        return 0, False
+    if attr_depth >= 2:
+        if token == "(":
+            next_depth = attr_depth + 1
+        elif token == ")":
+            next_depth = attr_depth - 1 if attr_depth > 2 else 0
+        else:
+            next_depth = attr_depth
+        return next_depth, False
+    if attr_depth == 1 and token == "(":
+        return 2, False
+    if token in {"__attribute__", "__attribute", "__declspec"}:
+        return 1, False
+    return 0, token == ")"
+
+
+def _c_rules_init_token(
+    token: str, depth: int, attr_depth: int, in_init: bool, paren_depth: int
+) -> tuple[bool, int]:
+    """Advance file-scope initializer flag and plain-parenthesis depth for one token."""
+    if depth != 0:
+        return in_init, 0
+    if token == ";":
+        return False, 0
+    if token in {"{", "}"}:
+        return in_init, 0
+    if token == "(":
+        return in_init, paren_depth + 1
+    if token == ")":
+        return in_init, max(0, paren_depth - 1)
+    return in_init or (token == "=" and attr_depth == 0 and paren_depth == 0), paren_depth
+
+
+def _c_rules_scan_line(
+    clean: str, state: tuple[int, bool, bool, bool, int, bool, int]
+) -> tuple[int, bool, bool, bool, int, bool, int]:
+    """Advance brace depth, boundary state, header and initializer context across a line."""
+    depth, _, in_function, after_rparen, attr_depth, in_init, paren_depth = state
+    tokens = re.findall(r"(?a)\w+|[^ \t\r\f\v]", clean)
+    if not tokens:
+        return state
+    closed_function = False
+    for index in range(len(tokens)):
+        token = tokens[index]
+        closed_function = False
+        if token == "{":
+            if depth == 0:
+                in_function = after_rparen and not in_init
+            depth += 1
+        elif token == "}":
+            depth -= 1
+            closed_function = depth == 0 and in_function
+            in_function = in_function and depth > 0
+        attr_depth, after_rparen = _c_rules_attr_token(token, attr_depth)
+        in_init, paren_depth = _c_rules_init_token(token, depth, attr_depth, in_init, paren_depth)
+    at_boundary = tokens[-1] == ";" or closed_function
+    return depth, at_boundary, in_function, after_rparen, attr_depth, in_init, paren_depth
+
+
+def _c_rules_arm_state(
+    word: bytes,
+    clean: str,
+    state: tuple[int, bool, bool, bool, int, bool, int],
+    stack: list[
+        tuple[
+            tuple[int, bool, bool, bool, int, bool, int],
+            tuple[bool, bool, bool, int, bool, int],
+            bool,
+        ]
+    ],
+    limit: int,
+) -> tuple[tuple[int, bool, bool, bool, int, bool, int], bool]:
+    """Update per-arm boundary, header and initializer state across conditional directives."""
+    if word not in {b"if", b"ifdef", b"ifndef", b"elif", b"else", b"endif"}:
+        return state, True
+    if word in {b"if", b"ifdef", b"ifndef"} and len(stack) < limit:
+        stack.append((state, (True, True, True, 0, False, 0), False))
+        return state, True
+    if word in {b"elif", b"else"} and stack and not stack[-1][2]:
+        entry, flags_ok, _ = stack[-1]
+        combined = (
+            flags_ok[0] and state[1],
+            flags_ok[1] and state[2],
+            flags_ok[2] and state[3],
+            max(flags_ok[3], state[4]),
+            flags_ok[4] or state[5],
+            max(flags_ok[5], state[6]),
+        )
+        stack[-1] = (entry, combined, word == b"else")
+        return entry, True
+    if word == b"endif" and stack:
+        entry, flags_ok, has_else = stack.pop()
+        return (
+            state[0],
+            flags_ok[0] and state[1] and (has_else or entry[1]),
+            flags_ok[1] and state[2] and (has_else or entry[2]),
+            flags_ok[2] and state[3] and (has_else or entry[3]),
+            max(flags_ok[3], state[4], 0 if has_else else entry[4]),
+            flags_ok[4] or state[5] or (not has_else and entry[5]),
+            max(flags_ok[5], state[6], 0 if has_else else entry[6]),
+        ), True
+    return (state[0], False, False, False, 0, False, 0), False
+
+
+def _c_rules_arm_join_next(arm_joins: list[int] | None, index: int) -> int:
+    """Return the first line after a precomputed endif for an elif or else arm, or -1."""
+    if arm_joins is None:
+        return -1
+    join = arm_joins[index]
+    return join + 1 if join >= 0 else -1
+
+
+def _c_rules_blank_call_tail_should_blank(stripped: str) -> bool:
+    """Blank the call when the first remaining code line starts a new declaration."""
+    if not stripped:
+        return False
+    first = stripped[0]
+    return first == "_" or ("a" <= first <= "z") or ("A" <= first <= "Z")
+
+
+def _c_rules_attribute_projection(code: list[str], words: re.Pattern[bytes] | None) -> list[str]:
+    """Return masked code lines with each attribute token replaced by spaces."""
+    if words is None:
+        return code
+    projected: list[str] = []
+    for line in code:
+        raw = line.encode("latin-1")
+        projected.append(_c_rules_blank_words(raw, line, words).decode("latin-1"))
+    return projected
+
+
+def _c_rules_blank_call_tail_skip(
+    word: bytes, nest: int, index: int, arm_joins: list[int] | None
+) -> tuple[int, int, bool]:
+    """Advance one physical line while skipping a preprocessor arm."""
+    if word in {b"if", b"ifdef", b"ifndef"}:
+        return index + 1, nest + 1, True
+    if word in {b"elif", b"else"} and nest == 0:
+        next_line = _c_rules_arm_join_next(arm_joins, index)
+        if next_line >= 0:
+            return next_line, 0, False
+    if word == b"endif":
+        if nest == 0:
+            return index + 1, 0, False
+        return index + 1, nest - 1, True
+    return index + 1, nest, True
+
+
+def _c_rules_blank_call_tail(
+    code: list[str],
+    directive_words: list[bytes],
+    start: int,
+    arm_joins: list[int] | None,
+) -> bool:
+    """Walk the single preprocessor path after a macro call and decide whether to blank it."""
+    skip = False
+    nest = 0
+    index = start
+    limit = len(code)
+    while index < limit:
+        word = directive_words[index]
+        stripped = code[index].lstrip(" \t\r\f\v")
+        if not skip:
+            if word in {b"if", b"ifdef", b"ifndef"}:
+                return False
+            if word in {b"elif", b"else"}:
+                next_line = _c_rules_arm_join_next(arm_joins, index)
+                if next_line >= 0:
+                    index = next_line
+                    continue
+                skip = True
+                index += 1
+                continue
+            if word == b"endif":
+                index += 1
+                continue
+            if word or not stripped:
+                index += 1
+                continue
+            return _c_rules_blank_call_tail_should_blank(stripped)
+        index, nest, skip = _c_rules_blank_call_tail_skip(word, nest, index, arm_joins)
+    return True
+
+
+def _c_rules_blank_call(
+    raw: bytes,
+    clean: str,
+    names: set[str],
+    continuation: tuple[list[str], list[bytes], int, list[int]],
+) -> bool:
+    """Decide whether one boundary line is a standalone macro call not opening a body."""
+    invocation = re.fullmatch(rb"[ \t]*([A-Za-z_]\w*)[ \t]*\(.*\)[ \t\r]*", raw)
+    if (
+        invocation is None
+        or invocation.start(1) != len(clean) - len(clean.lstrip(" \t\r\f\v"))
+        or not _c_rules_macro_call(clean, names)
+        or raw[clean.rfind(")") + 1 :].strip(b" \t\r")
+    ):
+        return False
+    code, directive_words, next_line, arm_joins = continuation
+    return _c_rules_blank_call_tail(code, directive_words, next_line, arm_joins)
+
+
+def _c_rules_blank(source: bytes, attributes: set[bytes]) -> bytes:
+    """Blank code attributes and file-scope macro calls, preserving all noncode bytes."""
+    text = source.decode("latin-1")
+    code, directives, directive_lines = _c_lex_lines(text, positions=True)
+    names = set(
+        re.findall(r"(?m)^[ \t]*#[ \t]*define[ \t]+([A-Za-z_]\w*)\(", "\n".join(directives))
+    )
+    words = re.compile(rb"\b(?:" + b"|".join(sorted(attributes)) + rb")\b") if attributes else None
+    lines = source.split(b"\n")
+    mapped = _c_rules_directive_words(lines, code, directives, directive_lines)
+    arm_joins = _c_rules_arm_joins(mapped if mapped is not None else [b""] * len(lines), len(lines))
+    directive_words = mapped if mapped is not None else [b""] * len(lines)
+    projection = _c_rules_attribute_projection(code, words)
+    depths = _c_rules_depths(lines, code, mapped)
+    state = (0, True, False, False, 0, False, 0)
+    stack: list[
+        tuple[
+            tuple[int, bool, bool, bool, int, bool, int],
+            tuple[bool, bool, bool, int, bool, int],
+            bool,
+        ]
+    ] = []
+    valid = mapped is not None
+    for index in range(len(lines)):
+        raw, clean = lines[index], code[index]
+        state, ok = _c_rules_arm_state(directive_words[index], clean, state, stack, len(lines))
+        valid = valid and ok
+        if (
+            mapped is not None
+            and valid
+            and depths[index] == 0
+            and state[1]
+            and _c_rules_blank_call(
+                raw, clean, names, (projection, directive_words, index + 1, arm_joins)
+            )
+        ):
+            lines[index] = re.sub(rb"[^\r]", b" ", raw)
+            state = (
+                state[0] + clean.count("{") - clean.count("}"),
+                True,
+                False,
+                False,
+                0,
+                False,
+                0,
+            )
+        else:
+            if words is not None:
+                lines[index] = _c_rules_blank_words(raw, clean, words)
+            state = _c_rules_scan_line(clean, state)
+    return b"\n".join(lines)
+
+
+def _c_rules_inside(path: Path, root: Path) -> bool:
+    """Require the resolved path to remain inside its resolved root."""
+    return path.resolve().is_relative_to(root.resolve())
+
+
+def _c_rules_copy_source(source: Path, target: Path, attributes: set[bytes]) -> str:
+    """Copy blanked supported bytes, or return an unread or unsupported-syntax reason."""
+    try:
+        content = _c_rules_read_source(source)
+    except OSError:
+        return "could not be read"
+    except ValueError as error:
+        return str(error)
+    else:
+        target.write_bytes(_c_rules_blank(content, attributes))
+    return ""
+
+
+def _c_rules_scan_root(
+    tree: Path, paths: list[str], directory: str
+) -> tuple[Path, list[str], list[str], list[str]]:
+    """Copy contained supported files, skipping directories, unsupported syntax and escapes."""
+    attributes, notices = _c_rules_attributes(tree)
+    root = Path(directory) / "sources"
+    root.mkdir()
+    escaped: list[str] = []
+    unread: list[str] = []
+    if not _c_rules_inside(tree / "libavutil/attributes.h", tree):
+        escaped.append("libavutil/attributes.h")
+    for index in range(len(paths)):
+        name = paths[index]
+        if name in escaped:
+            continue
+        source, target = tree / name, root / name
+        reason = ""
+        if not _c_rules_inside(source, tree):
+            reason = "resolves outside the checked tree"
+        elif not _c_rules_inside(target, root):
+            reason = "resolves outside the scratch root"
+        if reason:
+            escaped.append(name)
+            notices.append(f"error: {_waiver_text(name)}: {reason}")
+            continue
+        if source.is_dir():
+            unread.append(name)
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        reason = _c_rules_copy_source(source, target, attributes)
+        if reason:
+            unread.append(name)
+            notice = f"informational: {_waiver_text(name)}: {reason}"
+            if notice not in notices:
+                notices.append(notice)
+    return root, notices, escaped, unread
+
+
+def _c_rules_scan(
+    scan_root: Path, paths: list[str], json_path: Path, unread_paths: list[str]
+) -> tuple[RunResult, tuple[list[SemgrepMatch], list[str]] | None]:
+    """Run the unchanged scanner argv and validate coverage for the accepted scratch paths."""
+    argv = [
+        "bash",
+        str(SEMGREP_SCAN),
+        f"--rules={SEMGREP_FFMPEG_RULES}",
+        f"--json-output={json_path}",
+        "--max-target-bytes=0",
+        *paths,
+    ]
+    result = _run(argv, scan_root, timeout=C_RULES_TIMEOUT)
+    lines = result.stdout.splitlines()
+    has_warning = any(lines[index].startswith("semgrep_scan:") for index in range(len(lines)))
+    parsed = (
+        _read_semgrep_json(json_path, frozenset(paths), unread_paths=unread_paths)
+        if result.returncode in (0, 1) and not has_warning
+        else None
+    )
+    return result, parsed
+
+
+def _c_rules(
+    tree: Path, base: str, head: str, waiver: str, unread_waivers: tuple[UnreadWaiver, ...] = ()
+) -> Step:
+    """Scan contained supported sources, report unread files and reject all escapes."""
     touched_by_path = _c_rules_touched(tree, base, head)
     if not touched_by_path:
-        return Step("c-rules", 0, "no added or modified C or header source in the range")
+        unused = _unread_report([], unread_waivers)
+        return Step(
+            "c-rules",
+            unused.rc,
+            unused.output or "no added or modified C or header source in the range",
+        )
     paths = list(touched_by_path)
+    unread_paths: list[str] = []
     with tempfile.TemporaryDirectory(prefix="ffmpeg-c-rules-") as directory:
-        json_path = Path(directory) / "semgrep.json"
-        argv = [
-            "bash",
-            str(SEMGREP_SCAN),
-            f"--rules={SEMGREP_FFMPEG_RULES}",
-            f"--json-output={json_path}",
-            "--max-target-bytes=0",
-            *paths,
-        ]
-        result = _run(argv, tree, timeout=C_RULES_TIMEOUT)
-        has_warning = any(line.startswith("semgrep_scan:") for line in result.stdout.splitlines())
-        parsed = (
-            _read_semgrep_json(json_path, frozenset(paths))
-            if result.returncode in (0, 1) and not has_warning
-            else None
+        scan_root, notices, escaped, unread = _c_rules_scan_root(tree, paths, directory)
+        unread_paths.extend(unread)
+        paths = [path for path in paths if path not in escaped and path not in unread_paths]
+        unread_waivers = tuple(entry for entry in unread_waivers if entry.path not in escaped)
+        if not paths:
+            unused = _unread_report(unread_paths, unread_waivers)
+            return Step(
+                "c-rules",
+                2 if escaped else unused.rc,
+                "\n".join([*notices, unused.output]).rstrip("\n"),
+            )
+        prepared_unread = list(unread_paths)
+        result, parsed = _c_rules_scan(
+            scan_root, paths, Path(directory) / "semgrep.json", unread_paths
         )
     if parsed is None:
-        return _c_rules_error(result)
-    return _c_rules_report(parsed[0], parsed[1], touched_by_path, len(paths), waiver)
+        step = _c_rules_error(result)
+        scan_paths = set(paths)
+        filtered_waivers = tuple(entry for entry in unread_waivers if entry.path not in scan_paths)
+        unused = _unread_report(prepared_unread, filtered_waivers)
+        if unused.output:
+            output = step.output.rstrip("\n")
+            step = Step(step.name, 2, f"{output}\n{unused.output}")
+    else:
+        step = _c_rules_report(
+            parsed[0],
+            parsed[1],
+            touched_by_path,
+            Waivers(c_rule=waiver, unread=unread_waivers),
+            unread_paths,
+        )
+    return Step(step.name, 2 if escaped else step.rc, "\n".join([*notices, step.output]))
 
 
 DOCSTRING_COVERAGE = re.compile(
@@ -3755,7 +4551,7 @@ def _checks(tree: Path, base: str, head: str, waivers: Waivers) -> list[Step]:
             _collect("doc-terms", lambda: _doc_terms(tree, base, head, waivers.doc)),
             _collect("doc-wrap", lambda: _doc_wrap(tree, base, head, waivers.doc)),
             _collect("test-program", lambda: _test_program(tree, base, head, waivers.test_program)),
-            _collect("c-rules", lambda: _c_rules(tree, base, head, waivers.c_rule)),
+            _collect("c-rules", lambda: _c_rules(tree, base, head, waivers.c_rule, waivers.unread)),
             _collect("docstrings", lambda: _docstrings(tree, base, head, waivers.docstring)),
         ]
 
@@ -3821,8 +4617,19 @@ def _parser() -> argparse.ArgumentParser:
         default="",
         help=(
             "why a finding in .semgrep-ffmpeg.yml does not apply to the touched path; "
-            "waives findings of the c-rules step"
+            "waives findings only, never unread files or tool errors"
         ),
+    )
+    parser.add_argument(
+        "--c-rule-unread-waiver",
+        action="append",
+        default=[],
+        metavar="JSON",
+        help='repeat per unread file: {"path":"libavutil/x.c","rule":"c-rules-unread",'
+        '"reason":"manual review","category":"C","entered":"2026-11-19"}; '
+        "exact fields path, rule, reason, category, entered, optional expires (YYYY-MM-DD); "
+        "A requires expires at entered + 1..90 days; B/C/D use 3/10/120 days; "
+        "expiry day is live; unused waivers fail",
     )
     parser.add_argument(
         "--docstring-reason",
@@ -3848,7 +4655,12 @@ def _write_report(report: str, target: Path | None) -> bool:
 
 def main(argv: list[str] | None = None) -> int:
     """Run all upstream checks, print their statuses, and optionally save a report."""
-    args = _parser().parse_args(argv)
+    parser = _parser()
+    args = parser.parse_args(argv)
+    try:
+        unread = _parse_unread_waivers(args.c_rule_unread_waiver, _TODAY())
+    except ValueError as error:
+        return parser.error(f"--c-rule-unread-waiver: {error}")
     tree, base, head = args.tree.resolve(), args.base, args.head
     token = _DEADLINE.set(time.monotonic() + RUN_TIMEOUT)
     try:
@@ -3861,6 +4673,7 @@ def main(argv: list[str] | None = None) -> int:
             test_program=args.test_program_reason,
             c_rule=args.c_rule_reason,
             docstring=args.docstring_reason,
+            unread=unread,
             revert_proofs=tuple(args.revert_proof),
         )
         steps = _checks(tree, base, head, waivers)

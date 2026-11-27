@@ -705,7 +705,6 @@ class VulkanSweepTest(unittest.TestCase):
                 sweep_port_parity.sweep(str(self.repo), self.base, head, deadline),
             )
 
-    @unittest.skipIf(SKIP_VULKAN, SKIP_REASON)
     def test_t1_missing_registry_nonempty_scope(self) -> None:
         """t1: a non-empty scope with missing vk.xml raises the named registry error."""
         missing = Path("/nonexistent/vk-registry-missing/vk.xml")
@@ -1063,7 +1062,6 @@ class VulkanSweepTest(unittest.TestCase):
         ):
             self.vk_report(head)
 
-    @unittest.skipIf(SKIP_VULKAN, SKIP_REASON)
     def test_r6_t7_spirv_scalar_recomputes_timeout(self) -> None:
         """T7: spirv_needs_scalar passes a fresh timeout on each spirv-val invocation."""
         with tempfile.TemporaryDirectory() as scratch:
@@ -1087,7 +1085,10 @@ class VulkanSweepTest(unittest.TestCase):
                 result.returncode = 0 if len(recorded) == 1 else 1
                 return result
 
+            spirv_val = Path(scratch) / "spirv-val"
+            spirv_val.write_bytes(b"")
             with (
+                unittest.mock.patch.object(sweep_vulkan_features, "SPIRV_VAL", spirv_val),
                 unittest.mock.patch(
                     "scripts.sweep_vulkan_features.check_deadline", side_effect=fake_deadline
                 ),

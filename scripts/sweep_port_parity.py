@@ -1562,6 +1562,9 @@ def _shader_mask(
     view, positions, removed = _shader_directive_view(source)
     for match in _GLSL_LITERALS.finditer(view):
         start, end = _shader_physical_span(match.start(), match.end(), positions, removed)
+        if match[0].startswith("//"):
+            # Include splices immediately after the last surviving comment character.
+            end = match.end() + removed[bisect_right(positions, match.end())]
         text = source[cursor:start]
         pieces.append(_glsl_blank(text) if active is False else text)
         if active is None and cursor < start:

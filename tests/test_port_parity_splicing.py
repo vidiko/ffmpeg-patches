@@ -34,6 +34,29 @@ class PortParitySplicingTests(unittest.TestCase):
                         None if overwrite else "fixture.frag:5",
                     )
 
+    def test_trailing_comment_splice_preserves_blank_line(self) -> None:
+        """The blank line ends the comment, leaving the next statement live."""
+        for newline in ("\n", "\r\n", "\r"):
+            for early_return in (True, False):
+                with self.subTest(newline=repr(newline), early_return=early_return):
+                    source = newline.join(
+                        (
+                            "#version 450",
+                            "layout(binding=0,r32ui) readonly uniform uimage2D img;",
+                            "layout(location=0) out uint color;",
+                            "void main() {",
+                            "    // comment " + chr(92),
+                            "",
+                            "    return;" if early_return else "    // return;",
+                            "    color = imageLoad(img, ivec2(0)).r & 0xffu;",
+                            "}",
+                        )
+                    )
+                    self.assertEqual(
+                        shader_site("fixture.frag", source, "mask"),
+                        None if early_return else "fixture.frag:8",
+                    )
+
     def test_spliced_directive_preserves_later_load_anchor(self) -> None:
         """A real continued directive masks the dead load, not the later load."""
         source = "\n".join(

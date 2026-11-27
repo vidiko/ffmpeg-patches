@@ -731,14 +731,14 @@ def _helper_parameter(parameters: str, position: int) -> str | None:
 def _helper_applies(
     masked: str, name: str, position: int, arity: int, pattern: re.Pattern[str]
 ) -> bool:
-    """Return whether every candidate overload of matching arity carries the pattern."""
+    """Credit no name with more definitions than the limit; require matching overloads to agree."""
     definition = re.compile(
         rf"\b[A-Za-z_]\w*\s+{re.escape(name)}\s*\(([^;{{}}]*)\)\s*\{{", re.ASCII
     )
     matched = False
     for count, match in enumerate(definition.finditer(masked)):
         if count >= _HELPER_DEFINITIONS:
-            break
+            return False
         if _parameter_count(match[1]) != arity:
             continue
         parameter = _helper_parameter(match[1], position)

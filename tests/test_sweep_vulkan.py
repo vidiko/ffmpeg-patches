@@ -2243,6 +2243,38 @@ class VulkanSweepTest(unittest.TestCase):
                     sweep_port_parity.shader_site("s.comp.glsl", source, "mask"), expected
                 )
 
+    def test_cr24_helper_scan_limit_fails_closed(self) -> None:
+        """Credit no helper when a name has more definitions than the scan limit."""
+        limit = sweep_port_parity._HELPER_DEFINITIONS
+        overload_types = (
+            "int",
+            "int8_t",
+            "uint8_t",
+            "int16_t",
+            "uint16_t",
+            "int64_t",
+            "uint64_t",
+            "ivec2",
+        )
+        types = [overload_types[i] if i < len(overload_types) else f"Type{i}" for i in range(limit)]
+        at_limit = "".join(f"{t} norm({t} p) {{ return p & 0xff; }}\n" for t in types)
+        unmasked_uint = "uint norm(uint p) { return p; }\n"
+        masked_uint = "uint norm(uint p) { return p & 0xff; }\n"
+        two_param = "uint norm(uint p, uint q) { return p + q; }\n"
+        call = "uint r = norm(imageLoad(img, pos).r);"
+        cases = [
+            ("at_limit_all_mask", at_limit, f"s.comp.glsl:{limit + 3}"),
+            ("ninth_selected_unmasked", at_limit + unmasked_uint, None),
+            ("ninth_masked", at_limit + masked_uint, None),
+            ("ninth_other_arity", at_limit + two_param, None),
+        ]
+        for label, helpers_src, expected in cases:
+            with self.subTest(label=label):
+                source = helpers_src + shader_line_source(call)
+                self.assertEqual(
+                    sweep_port_parity.shader_site("s.comp.glsl", source, "mask"), expected
+                )
+
     def test_cr23_compound_assignment_classified(self) -> None:
         """Classify compound assignments on bound values before ending their bindings."""
         site = "s.comp.glsl:3"

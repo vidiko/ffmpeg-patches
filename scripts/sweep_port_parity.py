@@ -54,7 +54,13 @@ _USE_WINDOW = 32
 _SUFFIX_STEPS = 8
 _HELPER_DEFINITIONS = 8
 _CONTROL_WORDS = frozenset({"if", "for", "while", "switch", "return", "else"})
-_LOAD_SUFFIX = re.compile(r"\s*(?:\.[A-Za-z_]\w*|\[[^\]\[]*\])", re.ASCII)
+_LOAD_SUFFIX = re.compile(r"\s*(?:\.[A-Za-z_]\w*|\[)", re.ASCII)
+_GLSL_DECLARATION = re.compile(
+    r"\s*(?:(?:const|lowp|mediump|highp|precise)\s+)*"
+    r"([A-Za-z_]\w*)\s+([A-Za-z_]\w*)\s*(?=[=;])",
+    re.ASCII,
+)
+_GLSL_VECTOR = re.compile(r"[biud]?vec([2-4])", re.ASCII)
 _LOAD_ASSIGN = re.compile(r"\A\s*(?:[A-Za-z_]\w*\s+)*([A-Za-z_]\w*)\s*=\s*\Z", re.ASCII)
 _VALUE_ASSIGNMENT = re.compile(r"\s*(?:<<=|>>=|[+*/%&|^\-]=|=(?!=))", re.ASCII)
 _IDENTIFIER = re.compile(r"\b[A-Za-z_]\w*", re.ASCII)
@@ -647,14 +653,24 @@ def cpu_sites(source: str) -> list[tuple[int, str]]:
     return sites
 
 
+def _suffix_end(statement: str, start: int) -> int:
+    """Return the end of one member or balanced index suffix, if present."""
+    match = _LOAD_SUFFIX.match(statement, start)
+    if match is None:
+        return start
+    if statement[match.end() - 1] == "[":
+        return _sample_subscript_end(statement, match.end() - 1, start)
+    return match.end()
+
+
 def _load_end(statement: str, call_end: int) -> int:
     """Extend a shader load call through swizzle, member and index suffixes."""
     position = call_end
     for _ in range(_SUFFIX_STEPS):
-        match = _LOAD_SUFFIX.match(statement, position)
-        if match is None:
+        end = _suffix_end(statement, position)
+        if end == position:
             break
-        position = match.end()
+        position = end
     return position
 
 
@@ -822,32 +838,38 @@ def _assigned_name(statement: str, load_start: int, load_end: int) -> str | None
     return None if match is None else match[1]
 
 
-def _vector_access(statement: str, start: int, end: int, width: int) -> int:
-    """Map a vector access back to its original lanes; unknown selectors may touch any lane."""
+def _selector_indices(selector: str) -> list[int]:
+    """Return static selector indices, or an empty list for an unknown selector."""
+    if selector.startswith("."):
+        swizzle = selector[1:]
+        for alphabet in ("xyzw", "rgba", "stpq"):
+            if all(char in alphabet for char in swizzle):
+                return [alphabet.index(char) for char in swizzle]
+        return []
+    literal = selector[1:-1].strip().removesuffix("u").removesuffix("U")
+    if re.fullmatch(r"(?:0[xX]0*[0-3]|0*[0-3])", literal, re.ASCII):
+        return [int(literal[-1])]
+    return []
+
+
+def _vector_access(statement: str, start: int, end: int, width: int) -> tuple[int, int, int]:
+    """Return a grouped access span and the set of lanes it may select."""
     lanes = list(range(width))
-    for _ in range(_SUFFIX_STEPS):
-        match = _LOAD_SUFFIX.match(statement, start, end)
-        if match is None:
+    known = True
+    for _ in range(_SUFFIX_STEPS + 1):
+        left, right = _unwrap_target_parens(statement, start, end, 0, len(statement))
+        # A pair belonging to a call is not grouping around its argument.
+        if left < start and _wrapper_start(statement, left) == left:
+            start, end = left, right
+        suffix_end = _suffix_end(statement, end)
+        if suffix_end == end:
             break
-        selector = match[0].strip()
-        if selector.startswith("."):
-            swizzle = selector[1:]
-            alphabet = next(
-                (a for a in ("xyzw", "rgba", "stpq") if all(c in a for c in swizzle)),
-                "",
-            )
-            indices = [alphabet.index(c) for c in swizzle] if alphabet else []
-        else:
-            literal = selector[1:-1].strip().removesuffix("u").removesuffix("U")
-            if re.fullmatch(r"(?:0[xX]0*[0-3]|0*[0-3])", literal, re.ASCII):
-                indices = [int(literal[-1])]
-            else:
-                indices = []
-        if not indices or max(indices) >= len(lanes):
-            break
-        lanes = [lanes[i] for i in indices]
-        start = match.end()
-    return sum(1 << lane for lane in set(lanes))
+        indices = _selector_indices(statement[end:suffix_end].strip())
+        known = known and bool(indices) and max(indices) < len(lanes)
+        if known:
+            lanes = [lanes[i] for i in indices]
+        end = suffix_end
+    return start, end, sum(1 << lane for lane in set(lanes))
 
 
 def _statement_use_matches(
@@ -863,12 +885,14 @@ def _statement_use_matches(
         if not _whole_word_at(statement, hit, name) or _follows_member_operator(statement, hit, 0):
             continue
         base_end = hit + len(name)
-        use_end = _load_end(statement, base_end)
+        use_start = hit
         if width:
-            lanes = _vector_access(statement, base_end, use_end, width)
-            if lanes & live != lanes:
+            use_start, use_end, lanes = _vector_access(statement, hit, base_end, width)
+            if lanes & live != lanes or _follows_member_operator(statement, use_start, 0):
                 continue
-        use_start, use_end = unwrap_expression(statement, hit, use_end)
+        else:
+            use_end = _load_end(statement, base_end)
+        use_start, use_end = unwrap_expression(statement, use_start, use_end)
         if pattern.search(normalization_focus(statement, use_start, use_end)):
             return True
     return False
@@ -888,8 +912,11 @@ def _statement_assignment(statement: str, name: str, width: int) -> tuple[int, i
         return None
 
     base_end = start + len(name)
-    access_end = _load_end(statement, base_end) if width else base_end
-    target_start, target_end = _unwrap_target_parens(statement, start, access_end, 0, limit)
+    if width:
+        target_start, target_end, lanes = _vector_access(statement, start, base_end, width)
+    else:
+        target_start, target_end = _unwrap_target_parens(statement, start, base_end, 0, limit)
+        lanes = 1
     match = _VALUE_ASSIGNMENT.match(statement, target_end)
     if match is None:
         return None
@@ -902,8 +929,67 @@ def _statement_assignment(statement: str, name: str, width: int) -> tuple[int, i
         tail = _skip_space(statement, close + 1, limit)
         if tail < limit and statement[tail] not in ",;":
             return None
-    lanes = _vector_access(statement, base_end, access_end, width) if width else 1
     return match.end(), lanes
+
+
+def _statement_expressions(statement: str) -> Iterator[str]:
+    """Yield comma operands in evaluation order, including grouped comma expressions."""
+    pending = [(statement, 0)]
+    while pending:
+        expression, depth = pending.pop()
+        expression = expression.strip().removesuffix(";").rstrip()
+        if depth >= _TARGET_PARENS:
+            yield expression
+            continue
+        if (
+            expression.startswith("(")
+            and matching_close_paren(expression, 0) == len(expression) - 1
+        ):
+            pending.append((expression[1:-1], depth + 1))
+            continue
+        commas = list(_top_level_separators(expression, 0, len(expression), ","))
+        if not commas:
+            yield expression
+            continue
+        starts = [0, *(comma + 1 for comma in commas)]
+        ends = [*commas, len(expression)]
+        pending.extend(
+            (expression[start:end], depth + 1)
+            for start, end in reversed(list(zip(starts, ends, strict=True)))
+        )
+
+
+def _expression_use(
+    expression: str, name: str, pattern: re.Pattern[str], width: int, live: int
+) -> tuple[bool, int]:
+    """Check reads before applying the expression's write to the lane state."""
+    assignment = _statement_assignment(expression, name, width)
+    if assignment is None:
+        return _statement_use_matches(expression, name, pattern, width, live), live
+    rhs, lanes = assignment
+    limit = len(expression)
+    end = next(_top_level_separators(expression, rhs, limit, ",;)]}"), limit)
+    if lanes & live == lanes and pattern.search(_compound_assignment_focus(expression, rhs, end)):
+        return True, live
+    matched = _statement_use_matches(expression[rhs:end], name, pattern, width, live)
+    return matched, live & ~lanes
+
+
+def _statement_sequence_use(
+    statement: str, name: str, pattern: re.Pattern[str], width: int, live: int
+) -> tuple[bool, int]:
+    """Check comma operands in order, stopping on a match or when no lanes remain."""
+    for expression in _statement_expressions(statement):
+        matched, live = _expression_use(expression, name, pattern, width, live)
+        if matched or not live:
+            return matched, live
+    return False, live
+
+
+def _declares_binding(statement: str, name: str) -> bool:
+    """Return whether this statement introduces a new binding for name."""
+    declaration = _GLSL_DECLARATION.match(statement)
+    return declaration is not None and declaration[2] == name
 
 
 def _use_normalized(
@@ -915,35 +1001,44 @@ def _use_normalized(
 ) -> bool:
     """Return whether a later use normalizes lanes still derived from the load."""
     masked, spans = source
-    depth = 0
+    incoming = []
     live = (1 << (width or 1)) - 1
     for follow in range(index + 1, min(len(spans), index + 1 + _USE_WINDOW)):
-        statement = masked[spans[follow][0] : spans[follow][1]]
-        assignment = _statement_assignment(statement, name, width)
-        focus = statement
-        if assignment is not None:
-            rhs, lanes = assignment
-            end = next(
-                _top_level_separators(statement, rhs, len(statement), ",;)]}"), len(statement)
-            )
-            if lanes & live == lanes and pattern.search(
-                _compound_assignment_focus(statement, rhs, end)
-            ):
+        start, end = spans[follow]
+        statement = masked[start:end]
+        if _declares_binding(statement, name):
+            live = 0
+        if live:
+            matched, live = _statement_sequence_use(statement, name, pattern, width, live)
+            if matched:
                 return True
-            focus = statement[rhs:end]
-        if _statement_use_matches(focus, name, pattern, width, live):
-            return True
-        if assignment is not None and depth == 0:
-            live &= ~lanes
-            if not live:
-                return False
         if statement.endswith("{"):
-            depth += 1
+            incoming.append(live)
         elif statement.endswith("}"):
-            if depth == 0:
+            if not incoming:
                 return False
-            depth -= 1
+            # The nested block may not execute; its writes only kill lanes within it.
+            live = incoming.pop()
+        if not live and not incoming:
+            return False
     return False
+
+
+def _visible_width(masked: str, spans: list[tuple[int, int]], index: int, name: str) -> int:
+    """Find the nearest visible simple declaration, including an inline initializer."""
+    closed = 0
+    for previous in range(index, -1, -1):
+        start, end = spans[previous]
+        if masked[end - 1] == "}":
+            closed += 1
+        elif masked[end - 1] == "{" and closed:
+            closed -= 1
+        elif not closed:
+            declaration = _GLSL_DECLARATION.match(masked, start, end)
+            if declaration is not None and declaration[2] == name:
+                vector = _GLSL_VECTOR.fullmatch(declaration[1])
+                return int(vector[1]) if vector is not None else 0
+    return 0
 
 
 def _load_normalized(
@@ -968,8 +1063,7 @@ def _load_normalized(
     name = _assigned_name(statement, load_start, load_end)
     if name is None:
         return False
-    vector = re.search(r"\b(?:[biud]?vec)([2-4])\s+\w+\s*=\s*\Z", statement[:load_start], re.ASCII)
-    width = int(vector[1]) if vector is not None else 0
+    width = _visible_width(masked, spans, index, name)
     return _use_normalized((masked, spans), index, name, pattern, width)
 
 

@@ -2196,6 +2196,77 @@ class VulkanSweepTest(unittest.TestCase):
                     sweep_port_parity.shader_site("s.comp.glsl", source, "mask"), expected
                 )
 
+    def test_shader_vector_subscript_write_provenance(self) -> None:
+        """A literal write preserves other lanes; an unknown index may hit any lane."""
+        path = "s.comp.glsl"
+        for index, lane, expected in (
+            ("0", "r", None),
+            ("0", "g", f"{path}:3"),
+            ("lanes[0]", "r", None),
+            ("lanes[0]", "g", None),
+        ):
+            with self.subTest(index=index, lane=lane):
+                source = shader_line_source(
+                    "uvec4 px = imageLoad(img, pos);",
+                    f"px[{index}] = flags;",
+                    f"emit(px.{lane} & 0xffu);",
+                )
+                self.assertEqual(sweep_port_parity.shader_site(path, source, "mask"), expected)
+
+    def test_shader_vector_grouped_write_provenance(self) -> None:
+        """Grouping the receiver or the full target does not change the lane written."""
+        path = "s.comp.glsl"
+        for target in ("(px).r", "(px.r)", "((px).r)"):
+            for lane, expected in (("r", None), ("g", f"{path}:3")):
+                with self.subTest(target=target, lane=lane):
+                    source = shader_line_source(
+                        "uvec4 px = imageLoad(img, pos);",
+                        f"{target} = flags;",
+                        f"emit(px.{lane} & 0xffu);",
+                    )
+                    self.assertEqual(sweep_port_parity.shader_site(path, source, "mask"), expected)
+
+    def test_shader_vector_comma_write_provenance(self) -> None:
+        """Apply each comma-separated write before checking the later mask operand."""
+        path = "s.comp.glsl"
+        for writes, lane, expected in (
+            ("px.r = flags", "g", f"{path}:3"),
+            ("px.r = flags", "r", None),
+            ("px.r = combine(flags, other), px.g = flags", "b", f"{path}:3"),
+            ("px.r = combine(flags, other), px.g = flags", "g", None),
+            ("px.r = combine(flags, other), px.g = flags", "r", None),
+        ):
+            with self.subTest(writes=writes, lane=lane):
+                source = shader_line_source(
+                    "uvec4 px = imageLoad(img, pos);",
+                    f"{writes}, emit(px.{lane} & 0xffu);",
+                )
+                self.assertEqual(sweep_port_parity.shader_site(path, source, "mask"), expected)
+
+    def test_shader_vector_separate_declaration_provenance(self) -> None:
+        """Resolve the binding at the load and ignore masks on a shadowing binding."""
+        path = "s.comp.glsl"
+        declaration = "uvec4 px;"
+        load = "px = imageLoad(img, pos);"
+        for lines, expected in (
+            ((declaration, load, "px.r = flags;", "emit(px.g & 0xffu);"), f"{path}:4"),
+            ((declaration, load, "px.r = flags;", "emit(px.r & 0xffu);"), None),
+            ((declaration, load, "{ uvec4 px = uvec4(flags); emit(px.g & 0xffu); }"), None),
+            (
+                (
+                    declaration,
+                    load,
+                    "px.r = flags;",
+                    "{ uvec4 px = uvec4(flags); px.g = flags; }",
+                    "emit(px.g & 0xffu);",
+                ),
+                f"{path}:4",
+            ),
+        ):
+            with self.subTest(lines=lines):
+                source = shader_line_source(*lines)
+                self.assertEqual(sweep_port_parity.shader_site(path, source, "mask"), expected)
+
     def test_shader_vector_component_provenance(self) -> None:
         """Overwriting vector lanes invalidates aliases but preserves untouched lanes."""
         site = "s.comp.glsl:3"

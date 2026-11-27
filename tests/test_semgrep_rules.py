@@ -582,6 +582,114 @@ def case_ok_if_before_raise(self):
             raise RuntimeError("planted")
 """
 
+TRY_FAIL_HANDLER_FIXTURE = """# SPDX-License-Identifier: EUPL-1.2
+\"\"\"Fixture functions for try-fail-handler-then-read semgrep rule testing.\"\"\"
+
+
+def parse(text):
+    \"\"\"Parse text for the fixture cases.\"\"\"
+    return int(text)
+
+
+def case_flagged_one_name_read_after(self):
+    \"\"\"Flagged: one name bound in the try body is read after the handler.\"\"\"
+    try:
+        value = parse(\"1\")
+    except ValueError as error:
+        self.fail(f\"unexpected ValueError: {error}\")
+    self.assertEqual(value, 1)
+
+
+def case_flagged_two_names_read_after(self):
+    \"\"\"Flagged: two names bound in the try body are both read after the handler.\"\"\"
+    try:
+        first = parse(\"1\")
+        second = parse(\"2\")
+    except ValueError as error:
+        self.fail(f\"unexpected ValueError: {error}\")
+    self.assertEqual(first, 1)
+    self.assertEqual(second, 2)
+
+
+def case_flagged_handler_without_name(self):
+    \"\"\"Flagged: the handler has no as NAME and still ends with self.fail.\"\"\"
+    try:
+        value = parse(\"1\")
+    except ValueError:
+        self.fail(\"unexpected ValueError\")
+    self.assertEqual(value, 1)
+
+
+def case_flagged_multiline_fail(self):
+    \"\"\"Flagged: the self.fail call spans several lines after another statement.\"\"\"
+    try:
+        value = parse(\"1\")
+    except ValueError as error:
+        text = str(error)
+        self.fail(
+            f\"unexpected ValueError: {text}\",
+        )
+    self.assertEqual(value, 1)
+
+
+def case_flagged_subtest_loop(self):
+    \"\"\"Flagged: the shape inside a for loop with a subTest block.\"\"\"
+    for text in (\"1\", \"2\"):
+        with self.subTest(text=text):
+            try:
+                actual = parse(text)
+            except ValueError as error:
+                self.fail(f\"unexpected ValueError: {error}\")
+            self.assertEqual(actual, int(text))
+
+
+def case_clean_reads_in_else(self):
+    \"\"\"Clean: the reads sit in an else clause of the try.\"\"\"
+    try:
+        value = parse(\"1\")
+    except ValueError as error:
+        self.fail(f\"unexpected ValueError: {error}\")
+    else:
+        self.assertEqual(value, 1)
+
+
+def case_clean_handler_raises(self):
+    \"\"\"Clean: the handler ends with a raise statement.\"\"\"
+    try:
+        value = parse(\"1\")
+    except ValueError as error:
+        raise self.failureException(f\"unexpected ValueError: {error}\") from error
+    self.assertEqual(value, 1)
+
+
+def case_clean_handler_returns(self):
+    \"\"\"Clean: the handler ends with a return statement.\"\"\"
+    try:
+        value = parse(\"1\")
+    except ValueError:
+        return
+    self.assertEqual(value, 1)
+
+
+def case_clean_name_not_read_after(self):
+    \"\"\"Clean: the bound name is not read after the try statement.\"\"\"
+    try:
+        value = parse(\"1\")
+        self.assertEqual(value, 1)
+    except ValueError as error:
+        self.fail(f\"unexpected ValueError: {error}\")
+    self.assertTrue(True)
+
+
+def case_clean_other_call(self):
+    \"\"\"Clean: the handler ends with a call other than self.fail.\"\"\"
+    try:
+        value = parse(\"1\")
+    except ValueError as error:
+        self.skipTest(f\"unexpected ValueError: {error}\")
+    self.assertEqual(value, 1)
+"""
+
 NEGATED_STATUS_FIXTURE = (
     "#!/usr/bin/env bash\n"
     "# SPDX-"
@@ -939,6 +1047,13 @@ class SemgrepRulesTest(unittest.TestCase):
         self.assertEqual(
             _flagged_in_fixture(ASSERT_RAISES_BODY_FIXTURE, "assert-raises-body-bare-raise"),
             _expected_flagged(ASSERT_RAISES_BODY_FIXTURE),
+        )
+
+    def test_try_fail_handler_then_read_rule(self) -> None:
+        """Rule try-fail-handler-then-read flags reads after a handler ending in self.fail."""
+        self.assertEqual(
+            _flagged_in_fixture(TRY_FAIL_HANDLER_FIXTURE, "try-fail-handler-then-read"),
+            _expected_flagged(TRY_FAIL_HANDLER_FIXTURE),
         )
 
     def test_os_open_create_mode_wider_than_owner_rule(self) -> None:

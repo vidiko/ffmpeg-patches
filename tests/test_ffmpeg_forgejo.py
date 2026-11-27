@@ -245,12 +245,13 @@ class Stub:
         reviewers: list[list[str]] | None = None,
         **kwargs: object,
     ):
-        """Initialize scripted responses and persistent requested team reviewers."""
+        """Initialize scripted responses, dependency pulls and persistent team reviewers."""
 
         heads = heads or [A]
         polls = polls or {}
         self.heads, self.polls = heads, polls
         self.merge_base = MERGE_BASE
+        self.dependency_pulls: dict[int, tuple[int, dict]] = {}
         self.pull_body = ""
         self.on_pull = None
         self.fail_status = bool(kwargs.get("fail_status", False))
@@ -432,7 +433,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         return False
 
     def _route_pull(self, stub: Stub, url: urllib.parse.SplitResult) -> bool:
-        """Handle pull list and single pull read requests."""
+        """Handle pull lists, the primary pull and configured dependency pull reads."""
 
         if url.path.endswith("/pulls"):
             if stub.fail_pulls:
@@ -448,6 +449,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.reply(200, stub.pull())
             else:
                 self.reply(stub.pull_status, {"message": "pull read failed"})
+            return True
+        number = url.path.rsplit("/pulls/", 1)[-1]
+        if number.isdecimal() and int(number) in stub.dependency_pulls:
+            self.reply(*stub.dependency_pulls[int(number)])
             return True
         return False
 
@@ -1312,6 +1317,47 @@ class EditBodyTest(ForgejoTest):
         self.assertEqual(self.run_helper(stub), 0)
         self.assertEqual(self.patches(stub), [body])
 
+    def test_edit_body_stale_dependency_head_exits_80(self) -> None:
+        """A stale dependency head prevents the body PATCH and all other writes."""
+        body = "Depends on #12: the dependency series ends at bbbbbbb.\n"
+        (self.tmp / "body.md").write_text(body, encoding="utf-8")
+        stub = Stub([A], {A: [[label("success")]]})
+        stub.dependency_pulls[12] = (200, {"head": {"sha": A}})
+        proc = self.run_command(
+            stub, "edit-body", "--no-test-claims", "1", str(self.tmp / "body.md")
+        )
+        self.assertEqual(proc.returncode, 80, proc.stderr)
+        self.assertIn("names head bbbbbbb of #12", proc.stderr)
+        self.assertEqual(self.patches(stub), [])
+        self.assertFalse(any(method in {"POST", "PATCH"} for method, _, _ in stub.requests))
+
+    def test_edit_body_current_dependency_head_is_patched(self) -> None:
+        """A matching dependency head is fetched before the body PATCH proceeds."""
+        body = "This branch is stacked on pull request 12 (head aaaaaaa).\n"
+        (self.tmp / "body.md").write_text(body, encoding="utf-8")
+        stub = Stub([A], {A: [[label("success")]]})
+        stub.dependency_pulls[12] = (200, {"head": {"sha": A}})
+        proc = self.run_command(
+            stub, "edit-body", "--no-test-claims", "1", str(self.tmp / "body.md")
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.patches(stub), [body])
+        self.assertIn(("GET", "/api/v1/repos/FFmpeg/FFmpeg/pulls/12", ""), stub.requests)
+
+    def test_edit_body_missing_dependency_pull_fails_closed(self) -> None:
+        """A dependency pull returning HTTP 404 prevents every write with an input failure."""
+        body = "Depends on #12 head aaaaaaa.\n"
+        (self.tmp / "body.md").write_text(body, encoding="utf-8")
+        stub = Stub([A], {A: [[label("success")]]})
+        stub.dependency_pulls[12] = (404, {"message": "not found"})
+        proc = self.run_command(
+            stub, "edit-body", "--no-test-claims", "1", str(self.tmp / "body.md")
+        )
+        self.assertNotIn(proc.returncode, (0, 80), proc.stderr)
+        self.assertIn("dependency pull #12 (HTTP 404)", proc.stderr)
+        self.assertEqual(self.patches(stub), [])
+        self.assertFalse(any(method in {"POST", "PATCH"} for method, _, _ in stub.requests))
+
     def test_edit_body_patches_the_checked_snapshot(self) -> None:
         """Rewriting the body file during pull reads cannot alter the patched snapshot."""
 
@@ -1327,15 +1373,29 @@ class EditBodyTest(ForgejoTest):
         self.assertEqual(self.patches(stub), [original])
 
     def test_edit_body_base_read_is_the_head_reread(self) -> None:
-        """The Autolabel head re-read performs the base check without a later pull read."""
+        """The base check uses the Autolabel head re-read; a final head read precedes the PATCH."""
 
-        stub = Stub([A, A, B], {A: [[label("success")]]})
+        stub = Stub([A, A, A], {A: [[label("success")]]})
         proc = self.run_command(
             stub, "edit-body", "--no-test-claims", "1", str(self.tmp / "body.md")
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(self.patches(stub), [BODY])
-        self.assertEqual(stub.head_reads, 2)
+        self.assertEqual(stub.head_reads, 3)
+
+    def test_edit_body_no_test_claims_head_change_before_patch_exits_76(self) -> None:
+        """A final head read before PATCH exits 76 when it differs from the loop head."""
+
+        stub = Stub([A, A, B], {A: [[label("success")]]})
+        proc = self.run_command(
+            stub, "edit-body", "--no-test-claims", "1", str(self.tmp / "body.md")
+        )
+        self.assertEqual(proc.returncode, 76, proc.stderr)
+        self.assertIn(A, proc.stderr)
+        self.assertIn(B, proc.stderr)
+        self.assertIn("Autolabel and base checks used", proc.stderr)
+        self.assertEqual(self.patches(stub), [])
+        self.assertEqual(stub.head_reads, 3)
 
     def test_edit_body_head_change_in_base_read_exits_75(self) -> None:
         """A head change seen by the base-check pull read exits 75 without a PATCH."""

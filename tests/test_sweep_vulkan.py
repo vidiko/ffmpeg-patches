@@ -2361,6 +2361,50 @@ class VulkanSweepTest(unittest.TestCase):
                     f"fixture.frag:{line}",
                 )
 
+    def test_port_parity_shader_literal_switch_dispatch(self) -> None:
+        """Prune only proven dispatch edges, without pruning case fallthrough."""
+        preamble = (
+            "#version 450\n"
+            "layout(binding=0,r32ui) readonly uniform uimage2D img;\n"
+            "layout(push_constant) uniform Replay {int mode;};\n"
+            "layout(location=0) out uint color;\n"
+            "void main(){\n"
+            "uint px = imageLoad(img, ivec2(0)).r;\n"
+        )
+        use = "color = px & 0xffu;"
+        overwrite = "px = 0u;"
+        cases = (
+            # Measured regression: dispatch cannot enter case 1 directly.
+            (
+                f"switch (0) {{\ncase 0: ;\n    {overwrite}\ncase 1:\n    {use}\n    break;\n}}",
+                None,
+            ),
+            (f"switch ((1U)) {{ case 0u: {overwrite} case (1u): {use} break; }}", 6),
+            (f"switch (0) {{ case 0: ; case 1: {use} break; }}", 6),
+            (f"switch (2) {{ default: {use} break; case 0: {overwrite} }}", 6),
+            (f"switch (0) {{ default: {use} break; case 0: break; }}", None),
+            (f"switch (2) {{ case 0: return; }} {use}", 6),
+            (f"switch (0) {{ case 0: break; case 1: {use} }}", None),
+            (f"switch (0) {{ case 0: switch (1) {{ case 1: break; }} {use} break; }}", 6),
+            (
+                f"switch (0) {{ case 0: switch (1) {{ case 1: break; }} break; case 1: {use} }}",
+                None,
+            ),
+            (f"switch (mode) {{ case 0: {overwrite} case 1: {use} break; }}", 6),
+            (f"switch (0 + 0) {{ case 0: {overwrite} case 1: {use} break; }}", 6),
+            (f"switch (0) {{ case 0: {overwrite} case 1 + 0: {use} break; }}", 6),
+            (f"switch (0) {{ case 0: {overwrite}\n#ifdef FLAG\ncase 1:\n#endif\n{use} }}", 6),
+            (f"switch (0) {{ case 1: return;\n#ifdef FLAG\ndefault: return;\n#endif\n}} {use}", 6),
+        )
+        for body, line in cases:
+            with self.subTest(body=body):
+                self.assertEqual(
+                    sweep_port_parity.shader_site(
+                        "fixture.frag", preamble + body + "\n}\n", "mask"
+                    ),
+                    None if line is None else f"fixture.frag:{line}",
+                )
+
     def test_port_parity_shader_structured_edges(self) -> None:
         """Check mask sites across loop jumps, case fallthrough, and returns."""
         preamble = (
@@ -2387,6 +2431,48 @@ class VulkanSweepTest(unittest.TestCase):
                         "fixture.frag", preamble + body + "\n}\n", "mask"
                     ),
                     expected,
+                )
+
+    def test_port_parity_shader_preprocessor_arm_edges(self) -> None:
+        """Check both reachable and unreachable loads after conditional transfers."""
+        prefix = (
+            "#version 450\n"
+            "layout(binding=0,r32ui) readonly uniform uimage2D img;\n"
+            "layout(push_constant) uniform Replay {int mode;};\n"
+            "layout(location=0) out uint color;\n"
+            "void main(){\n"
+        )
+        direct = "color = imageLoad(img, ivec2(0)).r & 0xffu;\n"
+        for name, body, line in (
+            (
+                "optional default",
+                (
+                    "switch (mode) {\ncase 0: return;\n#ifdef WITH_DEFAULT\n"
+                    "default:\n#endif\nreturn;\n}\n"
+                ),
+                13,
+            ),
+            (
+                "unconditional default",
+                "switch (mode) {\ncase 0: return;\n#if 1\ndefault:\n#endif\nreturn;\n}\n",
+                None,
+            ),
+            ("exhaustive returns", "#ifdef STOP\nreturn;\n#else\nreturn;\n#endif\n", None),
+            ("implicit empty arm", "#ifdef STOP\nreturn;\n#endif\n", 9),
+            ("elif with implicit empty arm", "#if A\nreturn;\n#elif B\nreturn;\n#endif\n", 11),
+            ("elif with guaranteed last arm", "#if A\nreturn;\n#elif 1\nreturn;\n#endif\n", None),
+            (
+                "nested exhaustive returns",
+                "#if A\n#if B\nreturn;\n#else\nreturn;\n#endif\n#else\nreturn;\n#endif\n",
+                None,
+            ),
+        ):
+            with self.subTest(name=name):
+                self.assertEqual(
+                    sweep_port_parity.shader_site(
+                        "fixture.frag", prefix + body + direct + "}\n", "mask"
+                    ),
+                    None if line is None else f"fixture.frag:{line}",
                 )
 
     def test_port_parity_shader_for_literal_conditions(self) -> None:

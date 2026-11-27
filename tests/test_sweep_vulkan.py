@@ -2391,8 +2391,8 @@ class VulkanSweepTest(unittest.TestCase):
 
     def test_port_parity_shader_spliced_overload_declines_counted_proof(self) -> None:
         """Retain the reachable update and both test edges without splicing source spans."""
-        for newline in ("\n", "\r\n"):
-            with self.subTest(newline=repr(newline)):
+        for newline, splice in (("\n", "\n"), ("\r\n", "\r\n"), ("\n", "\r")):
+            with self.subTest(newline=repr(newline), splice=repr(splice)):
                 source = newline.join(
                     (
                         "#version 450",
@@ -2415,9 +2415,12 @@ class VulkanSweepTest(unittest.TestCase):
                         "",
                     )
                 )
+                source = source.replace(chr(92) + newline, chr(92) + splice, 1)
                 flow = sweep_port_parity._ShaderFlow.from_source(source)
                 reachable = flow.reachable()
+                (repeat,) = (i for i, (kind, _, _) in enumerate(flow.events) if kind == "repeat")
                 (test,) = (i for i, (kind, _, _) in enumerate(flow.events) if kind == "test")
+                self.assertEqual(flow.edges[repeat], (test - 2,))
                 (update,) = (i for i, (kind, _, _) in enumerate(flow.events) if kind == "update")
                 (join,) = (i for i, (kind, _, _) in enumerate(flow.events) if kind == "join")
                 self.assertIn(test, reachable)
@@ -2425,7 +2428,7 @@ class VulkanSweepTest(unittest.TestCase):
                 self.assertIn(update, reachable)
                 _, start, end = flow.events[update]
                 self.assertEqual(source[start:end].strip(), "x = imageLoad(img, ivec2(0))")
-                self.assertEqual(source.count("\n", 0, start) + 1, 12)
+                self.assertEqual(source.count("\n", 0, start) + 1, 11 if splice == "\r" else 12)
 
     def test_port_parity_shader_array_return_overload_declines_counted_proof(self) -> None:
         """Retain the back edge for the overload, but expand an unrelated loop."""

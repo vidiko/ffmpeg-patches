@@ -1290,7 +1290,7 @@ def _shader_proof_safe(source: str) -> bool:
     """Reject raw source whose preprocessing could change loop proof tokens."""
     # GLSL splices lines before tokenization, including inside comments.
     # Check raw source before masking and leave all offsets untouched.
-    if "\\\n" in source or "\\\r\n" in source:
+    if "\\\n" in source or "\\\r" in source:
         return False
     # Support desktop GLSL 450, optionally with core or compatibility, on a
     # single line without inline comments. Whitespace and comments may precede it.

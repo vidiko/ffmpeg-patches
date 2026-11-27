@@ -7,8 +7,10 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess  # nosec B404 - fixed git/installed lefthook argv in temporary fixture repos.
+import sys
 import tempfile
 import unittest
 from collections.abc import Iterator
@@ -21,9 +23,14 @@ import yaml
 from scripts.check_dev_deps import development_pins as _development_pins
 from scripts.check_dev_deps import normalize_package_name as _normalize_package_name
 from scripts.lint_mutable_defaults import PYLINT_VERSION
+from tests.test_signoff import GitFixture
 
 ROOT = Path(__file__).resolve().parents[1]
 SERIES_INSTALL_COMMAND = "python3 -m pip install --require-hashes -r requirements-dev.txt"
+COMMIT_MSG_SIGNOFF_RUN = (
+    "exec sh .config/lefthook/python.sh scripts/signoff.py --message-path-stdin "
+    "<<'SIGNOFF_HOOK_PATH'\n{1}\nSIGNOFF_HOOK_PATH\n"
+)
 
 
 def _series_steps(root: Path) -> list[dict]:
@@ -176,6 +183,21 @@ class LefthookPushGuardTest(unittest.TestCase):
     See v2.2.2 internal/run/controller/command/build_command.go; the guard
     must be a script job so empty file lists cannot bypass it.
     """
+
+    def test_commit_message_signoff_job(self) -> None:
+        """Require one unfiltered commit-msg job with the shared sign-off implementation."""
+        config = yaml.safe_load((ROOT / "lefthook.yml").read_text(encoding="utf-8"))
+        self.assertEqual(
+            config.get("commit-msg"),
+            {
+                "jobs": [
+                    {
+                        "name": "signoff",
+                        "run": COMMIT_MSG_SIGNOFF_RUN,
+                    }
+                ]
+            },
+        )
 
     def test_push_guard_is_first_unfiltered_script_job(self) -> None:
         """Keep the unfiltered guard first and stop later jobs on its failure."""
@@ -649,12 +671,15 @@ class LefthookPushGuardTest(unittest.TestCase):
                 self.assertFalse(result.errors)
 
     def test_hook_jobs_never_interpolate_git_arguments(self) -> None:
-        """No lefthook run/args field contains a {N} positional git-argument placeholder."""
+        """Allow only the commit-msg file argument in the fixed sign-off job command."""
 
         for hook, index, job in iter_hook_jobs(ROOT):
             for field in ("run", "args"):
                 with self.subTest(hook=hook, job=index, field=field):
-                    self.assertNotRegex(str(job.get(field, "")), r"\{\d+\}")
+                    if hook == "commit-msg" and field == "run":
+                        self.assertEqual(job.get(field), COMMIT_MSG_SIGNOFF_RUN)
+                    else:
+                        self.assertNotRegex(str(job.get(field, "")), r"\{\d+\}")
 
     def test_contributing_python_minimum_supports_installed_pins(self) -> None:
         """The documented Python minimum supports all pinned development tools."""
@@ -753,3 +778,324 @@ class LefthookPushGuardTest(unittest.TestCase):
                     r"(?m)(?:^|[;&|])\s*(?:exec\s+)?(?:python3?|py\s+-3)(?=\s|$)",
                     "start Python through .config/lefthook/python.sh",
                 )
+
+
+def write_python_wrapper(wrapper: Path, executable: str = sys.executable) -> None:
+    """Write the python selector fixture that execs the given interpreter as one literal word."""
+    wrapper.parent.mkdir(parents=True, exist_ok=True)
+    wrapper.write_text("#!/bin/sh\nexec " + shlex.quote(executable) + ' "$@"\n', encoding="utf-8")
+    wrapper.chmod(0o755)
+
+
+class PythonWrapperTest(unittest.TestCase):
+    """Check the generated python selector wrapper outside any Git repository."""
+
+    def test_wrapper_runs_executable_with_dollar_in_its_path(self) -> None:
+        """Run an interpreter whose directory name holds a literal dollar and a variable name."""
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary) / "py $HOME dir"
+            directory.mkdir()
+            link = directory / "python"
+            link.symlink_to(sys.executable)
+            wrapper = Path(temporary) / ".config/lefthook/python.sh"
+            write_python_wrapper(wrapper, str(link))
+            done = subprocess.run(  # nosec B603 B607 - fixture wrapper argv, no shell string.
+                ["sh", str(wrapper), "-c", "print(41 + 1)"],
+                capture_output=True,
+                encoding="utf-8",
+                check=False,
+                timeout=30,
+            )
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(done.stdout, "42\n")
+
+
+class CommitMsgRunTextTest(GitFixture):
+    """Run the production commit-msg shell text outside lefthook."""
+
+    def _install_signoff_fixture(self) -> None:
+        """Copy signoff and the python selector into the isolated fixture repository."""
+        (self.root / "scripts").mkdir()
+        shutil.copyfile(ROOT / "scripts/signoff.py", self.root / "scripts/signoff.py")
+        write_python_wrapper(self.root / ".config/lefthook/python.sh")
+
+    def _run_commit_msg_job_text(
+        self, run_text: str, message: Path, *, append_space: bool
+    ) -> subprocess.CompletedProcess[str]:
+        """Execute the commit-msg job run string through sh -c with one message path line."""
+        command = run_text.replace("{1}", str(message))
+        if append_space:
+            command += " "
+        return subprocess.run(  # nosec B603 - fixture sh -c text from production lefthook.yml.
+            ["sh", "-c", command],
+            cwd=self.root,
+            env=self.env,
+            capture_output=True,
+            encoding="utf-8",
+            check=False,
+            timeout=30,
+        )
+
+    def test_commit_msg_run_text_tolerates_trailing_shell_space(self) -> None:
+        """Match signed and unsigned results with and without lefthook's trailing shell space."""
+        config = yaml.safe_load((ROOT / "lefthook.yml").read_text(encoding="utf-8"))
+        run_text = config["commit-msg"]["jobs"][0]["run"]
+        self._install_signoff_fixture()
+        message = self.root / self.git("rev-parse", "--git-path", "COMMIT_EDITMSG")
+        message.write_text(
+            "Subject\n\nSigned-off-by: Signoff Fixture <signoff@example.invalid>\n",
+            encoding="utf-8",
+        )
+        for append_space in (False, True):
+            with self.subTest(append_space=append_space):
+                signed = self._run_commit_msg_job_text(run_text, message, append_space=append_space)
+                self.assertEqual(signed.returncode, 0, signed.stderr)
+                self.assertNotIn("here-document", signed.stderr.casefold())
+        unsigned_path = message
+        unsigned_path.write_text("Subject without trailer\n", encoding="utf-8")
+        for append_space in (False, True):
+            with self.subTest(unsigned=True, append_space=append_space):
+                refused = self._run_commit_msg_job_text(
+                    run_text, unsigned_path, append_space=append_space
+                )
+                self.assertEqual(refused.returncode, 1, refused.stderr)
+                self.assertNotIn("here-document", refused.stderr.casefold())
+
+    def test_commit_msg_run_text_stops_after_early_delimiter(self) -> None:
+        """Stop the job after the reader when a path line closes the here-document early."""
+        config = yaml.safe_load((ROOT / "lefthook.yml").read_text(encoding="utf-8"))
+        run_text = config["commit-msg"]["jobs"][0]["run"]
+        self._install_signoff_fixture()
+        directory = self.root / "pre\nSIGNOFF_HOOK_PATH\ntouch shell-ran-marker\npost"
+        directory.mkdir()
+        message = directory / "message.txt"
+        message.write_text(
+            "Subject\n\nSigned-off-by: Signoff Fixture <signoff@example.invalid>\n",
+            encoding="utf-8",
+        )
+        marker = self.root / "shell-ran-marker"
+        for append_space in (False, True):
+            marker.unlink(missing_ok=True)
+            with self.subTest(append_space=append_space):
+                result = self._run_commit_msg_job_text(run_text, message, append_space=append_space)
+                marker_existed = marker.exists()
+                marker.unlink(missing_ok=True)
+                self.assertFalse(marker_existed, "shell ran path lines after early delimiter")
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn("cannot decide", result.stderr)
+
+    def test_commit_msg_run_text_refuses_signed_path_prefix(self) -> None:
+        """Refuse a truncated path prefix that names a signed file instead of the real message."""
+        config = yaml.safe_load((ROOT / "lefthook.yml").read_text(encoding="utf-8"))
+        run_text = config["commit-msg"]["jobs"][0]["run"]
+        self._install_signoff_fixture()
+        (self.root / "pre").write_text(
+            "Subject\n\nSigned-off-by: Signoff Fixture <signoff@example.invalid>\n",
+            encoding="utf-8",
+        )
+        directory = self.root / "pre\nSIGNOFF_HOOK_PATH\npost"
+        directory.mkdir()
+        message = directory / "message.txt"
+        message.write_text("Subject without trailer\n", encoding="utf-8")
+        for append_space in (False, True):
+            with self.subTest(append_space=append_space):
+                result = self._run_commit_msg_job_text(run_text, message, append_space=append_space)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn("cannot decide", result.stderr)
+
+
+class LefthookSignoffTest(GitFixture):
+    """Exercise an installed lefthook commit-msg hook with actual two-parent merges."""
+
+    def test_merge_hook_requires_signoff_with_space(self) -> None:
+        """Preserve a message-file argument containing spaces through the installed hook."""
+        lefthook = shutil.which("lefthook")
+        if lefthook is None:
+            self.skipTest("lefthook binary is not on PATH")
+        self._reinit_with_spaced_git_dir()
+        merge_msg = self.git("rev-parse", "--git-path", "MERGE_MSG")
+        self.assertIn(" ", merge_msg, msg="fixture must hand the hook an absolute spaced git path")
+        self._run_merge_hook_signoff_checks(lefthook)
+
+    def test_merge_hook_requires_signoff(self) -> None:
+        """Refuse a merge without sign-off and accept it with the sign-off option."""
+        lefthook = shutil.which("lefthook")
+        if lefthook is None:
+            self.skipTest("lefthook binary is not on PATH")
+        self._run_merge_hook_signoff_checks(lefthook)
+
+    def test_merge_hook_apostrophe_and_space_in_git_dir(self) -> None:
+        """Pass and refuse merges when the message file path holds an apostrophe and a space."""
+        lefthook = shutil.which("lefthook")
+        if lefthook is None:
+            self.skipTest("lefthook binary is not on PATH")
+        git_dir = self._reinit_with_git_dir_named("git dir's space")
+        self.assertIn("'", git_dir)
+        self.assertIn(" ", git_dir)
+        merge_msg = self.git("rev-parse", "--git-path", "MERGE_MSG")
+        self.assertIn("'", merge_msg)
+        self.assertIn(" ", merge_msg)
+        self._run_merge_hook_signoff_checks(lefthook)
+
+    def test_merge_hook_command_substitution_in_git_dir_is_literal(self) -> None:
+        """Never run shell metacharacters embedded in the Git directory path."""
+        lefthook = shutil.which("lefthook")
+        if lefthook is None:
+            self.skipTest("lefthook binary is not on PATH")
+        marker = self.root / "shell-ran-marker"
+        name = f"git $(touch {marker})"
+        self._reinit_with_git_dir_named(name)
+        self._run_merge_hook_signoff_checks(lefthook)
+        self.assertFalse(marker.exists(), "shell interpreted the git directory path")
+
+    def test_merge_hook_early_delimiter_in_git_dir_stops_after_reader(self) -> None:
+        """Refuse a signed merge without running path lines after an early delimiter."""
+        lefthook = shutil.which("lefthook")
+        if lefthook is None:
+            self.skipTest("lefthook binary is not on PATH")
+        marker = self.root / "shell-ran-marker"
+        self._reinit_with_git_dir_named("pre\nSIGNOFF_HOOK_PATH\ntouch shell-ran-marker\npost")
+        self.commit("base")
+        self.git("checkout", "-qb", "topic")
+        self.commit("topic")
+        self.git("checkout", "-q", "main")
+        self.commit("main")
+        self.install_message_hook(lefthook)
+        refused = subprocess.run(  # nosec B603 - fixture merge argv, no shell, bounded timeout.
+            ["git", "merge", "--no-ff", "--signoff", "-m", "merge fixture", "topic"],
+            cwd=self.root,
+            env=self.env,
+            capture_output=True,
+            encoding="utf-8",
+            check=False,
+            timeout=30,
+        )
+        self.assertNotEqual(refused.returncode, 0, refused.stdout + refused.stderr)
+        self.assertIn("signoff: cannot decide", refused.stdout + refused.stderr)
+        self.assertFalse(marker.exists(), "shell ran path lines after early delimiter")
+
+    def test_merge_hook_refuses_signed_path_prefix_in_git_dir(self) -> None:
+        """Refuse an unsigned merge when a signed file sits where the path prefix points."""
+        lefthook = shutil.which("lefthook")
+        if lefthook is None:
+            self.skipTest("lefthook binary is not on PATH")
+        git_dir = self._reinit_with_git_dir_named("pre\nSIGNOFF_HOOK_PATH\npost")
+        (Path(git_dir).parent / "pre").write_text(
+            "Subject\n\nSigned-off-by: Signoff Fixture <signoff@example.invalid>\n",
+            encoding="utf-8",
+        )
+        self.commit("base")
+        self.git("checkout", "-qb", "topic")
+        self.commit("topic")
+        self.git("checkout", "-q", "main")
+        self.commit("main")
+        self.install_message_hook(lefthook)
+        refused = subprocess.run(  # nosec B603 - fixture merge argv, no shell, bounded timeout.
+            ["git", "merge", "--no-ff", "-m", "merge fixture", "topic"],
+            cwd=self.root,
+            env=self.env,
+            capture_output=True,
+            encoding="utf-8",
+            check=False,
+            timeout=30,
+        )
+        self.assertNotEqual(refused.returncode, 0, refused.stdout + refused.stderr)
+        # Lefthook splits the git directory at the newline and fails on the signed file before
+        # it starts the job, so the merge must stay uncommitted whatever stops it.
+        self.assertEqual(len(self.git("show", "-s", "--format=%P", "HEAD").split()), 1)
+
+    def _reinit_with_git_dir_named(self, directory_name: str) -> str:
+        """Point the fixture at a separate git directory with the given directory name."""
+        dot_git = self.root / ".git"
+        if dot_git.is_dir():
+            shutil.rmtree(dot_git)
+        elif dot_git.is_file():
+            dot_git.unlink()
+        spaced_owner = tempfile.TemporaryDirectory()
+        self.addCleanup(spaced_owner.cleanup)
+        git_dir = Path(spaced_owner.name) / directory_name
+        git_dir.mkdir(parents=True)
+        _run_fixture_command(
+            self.root,
+            self.env,
+            ["git", "init", "--separate-git-dir", str(git_dir), "-q", "-b", "main"],
+        )
+        self.git("config", "user.name", "Signoff Fixture")
+        self.git("config", "user.email", "signoff@example.invalid")
+        self.git("config", "commit.gpgsign", "false")
+        self.git("config", "core.hooksPath", str(self.root / "empty-hooks"))
+        return str(git_dir)
+
+    def _reinit_with_spaced_git_dir(self) -> None:
+        """Point the fixture at a separate git directory whose path contains a space."""
+        dot_git = self.root / ".git"
+        if dot_git.is_dir():
+            shutil.rmtree(dot_git)
+        elif dot_git.is_file():
+            dot_git.unlink()
+        spaced_owner = tempfile.TemporaryDirectory()
+        self.addCleanup(spaced_owner.cleanup)
+        git_dir = Path(spaced_owner.name) / "git dir with space"
+        git_dir.mkdir()
+        _run_fixture_command(
+            self.root,
+            self.env,
+            ["git", "init", "--separate-git-dir", str(git_dir), "-q", "-b", "main"],
+        )
+        self.git("config", "user.name", "Signoff Fixture")
+        self.git("config", "user.email", "signoff@example.invalid")
+        self.git("config", "commit.gpgsign", "false")
+        self.git("config", "core.hooksPath", str(self.root / "empty-hooks"))
+
+    def _run_merge_hook_signoff_checks(self, lefthook: str) -> None:
+        """Refuse an unsigned merge and accept the same merge with --signoff."""
+        self.commit("base")
+        self.git("checkout", "-qb", "topic")
+        self.commit("topic")
+        self.git("checkout", "-q", "main")
+        self.commit("main")
+        self.install_message_hook(lefthook)
+        command = ["git", "merge", "--no-ff", "-m", "merge fixture", "topic"]
+        refused = subprocess.run(  # nosec B603 - fixture merge argv, no shell, bounded timeout.
+            command,
+            cwd=self.root,
+            env=self.env,
+            capture_output=True,
+            encoding="utf-8",
+            check=False,
+            timeout=30,
+        )
+        self.assertNotEqual(refused.returncode, 0, refused.stdout + refused.stderr)
+        self.assertIn("no Signed-off-by", refused.stdout + refused.stderr)
+        self.git("merge", "--abort")
+        self.git("merge", "--no-ff", "--signoff", "-m", "merge fixture", "topic")
+        self.assertEqual(len(self.git("show", "-s", "--format=%P", "HEAD").split()), 2)
+        self.assertEqual(
+            self.git("show", "-s", "--format=%(trailers:key=Signed-off-by,valueonly)", "HEAD"),
+            "Signoff Fixture <signoff@example.invalid>",
+        )
+
+    def install_message_hook(self, lefthook: str) -> None:
+        """Install only the production commit-msg job in a disposable fixture repository."""
+        root_config = yaml.safe_load((ROOT / "lefthook.yml").read_text(encoding="utf-8"))
+        commit_msg = {"commit-msg": root_config["commit-msg"]}
+        dumped = yaml.safe_dump(commit_msg, default_flow_style=False)
+        roundtrip = yaml.safe_load(dumped)
+        self.assertEqual(
+            roundtrip["commit-msg"]["jobs"][0]["run"],
+            root_config["commit-msg"]["jobs"][0]["run"],
+        )
+        (self.root / "lefthook.yml").write_text(dumped, encoding="utf-8")
+        (self.root / "scripts").mkdir()
+        shutil.copyfile(ROOT / "scripts/signoff.py", self.root / "scripts/signoff.py")
+        # Test the job wiring; interpreter selection is outside this unit.
+        write_python_wrapper(self.root / ".config/lefthook/python.sh")
+        hooks = self.root / "fixture-hooks"
+        hooks.mkdir()
+        self.git("config", "core.hooksPath", str(hooks))
+        hook = hooks / "commit-msg"
+        hook.write_text(
+            "#!/bin/sh\nexec " + shlex.quote(lefthook) + ' run commit-msg -- "$@"\n',
+            encoding="utf-8",
+        )
+        hook.chmod(0o755)

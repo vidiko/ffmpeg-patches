@@ -49,6 +49,17 @@ pre-commit:
         sh .config/lefthook/python.sh scripts/series.py contributions --write
         && git add README.md
 
+commit-msg:
+  jobs:
+    # Lefthook 2.2.2 does not escape {N} arguments: a quoted here-document keeps the path
+    # literal, | keeps the final newline so a trailing space cannot break the delimiter, and
+    # exec stops the job after the reader so no line after an early delimiter runs.
+    - name: signoff
+      run: |
+        exec sh .config/lefthook/python.sh scripts/signoff.py --message-path-stdin <<'SIGNOFF_HOOK_PATH'
+        {1}
+        SIGNOFF_HOOK_PATH
+
 post-commit:
   commands:
     state-sync:

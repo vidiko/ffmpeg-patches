@@ -5,10 +5,13 @@
 from __future__ import annotations
 
 import datetime
+import functools
 import io
 import json
 import os
+import re
 import subprocess  # nosec B404 - mocked queries and local temporary Git repositories.
+import sys
 import tempfile
 import threading
 import time
@@ -19,6 +22,7 @@ from collections.abc import Callable
 from scripts import push_guard
 from tests.helpers import GIT_ENVIRONMENT_NAMES, capture_main
 from tests.helpers import isolated_git_environment as without_repository_variables
+from tests.test_signoff import FakeClock, GitFixture, empty_run
 
 REPOSITORY = "vidiko/ffmpeg-patches"
 REMOTE = f"https://github.com/{REPOSITORY}.git"
@@ -124,6 +128,12 @@ def config_guard(
 
 
 class ConfigModeTest(unittest.TestCase):
+    def setUp(self) -> None:
+        """Isolate PR policy unit tests from the separately tested local sign-off reader."""
+        checker = unittest.mock.patch.object(push_guard.signoff, "check_commits", return_value=None)
+        checker.start()
+        self.addCleanup(checker.stop)
+
     def _assert_count_boundary(
         self,
         limit: int,
@@ -202,9 +212,10 @@ class ConfigModeTest(unittest.TestCase):
         )
 
     def test_only_non_github_remotes_skip(self) -> None:
+        """Skip PR lookups for non-GitHub remotes with no branch updates."""
         reader = unittest.mock.Mock()
         config = {"origin": ["https://gitlab.com/o/r"], "local": ["/local/repo"]}
-        status, _, err = config_guard(reader, lambda: config, "invalid updates")
+        status, _, err = config_guard(reader, lambda: config, "")
         self.assertEqual(status, 0)
         self.assertIn("non-GitHub remote; skipping", err)
         reader.assert_not_called()
@@ -316,8 +327,9 @@ class ConfigModeTest(unittest.TestCase):
         )
 
     def test_no_remotes_skip(self) -> None:
+        """Allow an empty push when no configured remote supplies a GitHub repository."""
         reader = unittest.mock.Mock()
-        self.assertEqual(config_guard(reader, lambda: {}, "invalid updates")[0], 0)
+        self.assertEqual(config_guard(reader, lambda: {}, "")[0], 0)
         reader.assert_not_called()
 
     def test_expanded_rewritten_url_checks_merged_head(self) -> None:
@@ -405,6 +417,10 @@ class ConfigDeadlineTest(unittest.TestCase):
 
 class ConfigReaderTest(unittest.TestCase):
     def setUp(self) -> None:
+        """Isolate remote configuration fixtures and mock the independent sign-off check."""
+        checker = unittest.mock.patch.object(push_guard.signoff, "check_commits", return_value=None)
+        checker.start()
+        self.addCleanup(checker.stop)
         # Hooks export GIT_DIR and friends; without this, fixtures would write to the caller's
         # repository, and personal or system rewrite rules would change expanded URLs.
         isolation = unittest.mock.patch.dict(os.environ, isolated_git_environment(), clear=True)
@@ -614,6 +630,17 @@ def raw_config_reader(cwd: str) -> dict[str, list[str]]:
 
 
 class PushGuardTest(unittest.TestCase):
+    def setUp(self) -> None:
+        """Isolate PR policy unit tests from the separately tested local sign-off reader."""
+        checker = unittest.mock.patch.object(push_guard.signoff, "check_commits", return_value=None)
+        checker.start()
+        self.addCleanup(checker.stop)
+        remotes = unittest.mock.patch.object(
+            push_guard.signoff, "configured_remotes", return_value=["origin"]
+        )
+        remotes.start()
+        self.addCleanup(remotes.stop)
+
     def test_merged_pr_absent_or_unchanged_remote_is_refused(self) -> None:
         for remote_sha in (ZERO, HEAD):
             with self.subTest(remote_sha=remote_sha):
@@ -753,6 +780,17 @@ class PushGuardTest(unittest.TestCase):
 
 class BotReviewBodyTest(unittest.TestCase):
     """An open pull request refuses pushes while a bot review body has no human answer."""
+
+    def setUp(self) -> None:
+        """Isolate PR policy unit tests from the separately tested local sign-off reader."""
+        checker = unittest.mock.patch.object(push_guard.signoff, "check_commits", return_value=None)
+        checker.start()
+        self.addCleanup(checker.stop)
+        remotes = unittest.mock.patch.object(
+            push_guard.signoff, "configured_remotes", return_value=["origin"]
+        )
+        remotes.start()
+        self.addCleanup(remotes.stop)
 
     def open_guard(self, reviews: list, comments: list) -> tuple[int, str, unittest.mock.Mock]:
         """Push a branch whose open pull request has the given activity."""
@@ -1074,6 +1112,17 @@ class ReviewActivityReaderTest(unittest.TestCase):
 
 
 class StdinTest(unittest.TestCase):
+    def setUp(self) -> None:
+        """Isolate PR policy unit tests from the separately tested local sign-off reader."""
+        checker = unittest.mock.patch.object(push_guard.signoff, "check_commits", return_value=None)
+        checker.start()
+        self.addCleanup(checker.stop)
+        remotes = unittest.mock.patch.object(
+            push_guard.signoff, "configured_remotes", return_value=["origin"]
+        )
+        remotes.start()
+        self.addCleanup(remotes.stop)
+
     def test_stdin_deadline_fails_closed(self) -> None:
         release = threading.Event()
         finished = threading.Event()
@@ -1152,6 +1201,17 @@ class StdinTest(unittest.TestCase):
 
 
 class RemoteTest(unittest.TestCase):
+    def setUp(self) -> None:
+        """Isolate PR policy unit tests from the separately tested local sign-off reader."""
+        checker = unittest.mock.patch.object(push_guard.signoff, "check_commits", return_value=None)
+        checker.start()
+        self.addCleanup(checker.stop)
+        remotes = unittest.mock.patch.object(
+            push_guard.signoff, "configured_remotes", return_value=["origin"]
+        )
+        remotes.start()
+        self.addCleanup(remotes.stop)
+
     def test_github_urls(self) -> None:
         for remote in (
             f"https://github.com/{REPOSITORY}",
@@ -1254,6 +1314,17 @@ class RemoteTest(unittest.TestCase):
 
 
 class APIReaderTest(unittest.TestCase):
+    def setUp(self) -> None:
+        """Keep mocked gh subprocess results separate from the local sign-off reader."""
+        checker = unittest.mock.patch.object(push_guard.signoff, "check_commits", return_value=None)
+        checker.start()
+        self.addCleanup(checker.stop)
+        remotes = unittest.mock.patch.object(
+            push_guard.signoff, "configured_remotes", return_value=["origin"]
+        )
+        remotes.start()
+        self.addCleanup(remotes.stop)
+
     def test_newest_head_query_hostname_and_timeout(self) -> None:
         """The API reader queries repository metadata and newest head pull requests."""
         meta = subprocess.CompletedProcess([], 0, stdout='{"fork": false}', stderr="")
@@ -1500,6 +1571,522 @@ class APIReaderTest(unittest.TestCase):
             self.assertEqual(timeouts[2], 5.0)
             for t in timeouts:
                 self.assertLessEqual(t, 20)
+
+
+class RemoteReadFailClosedTest(unittest.TestCase):
+    """Refuse before sign-off checks when configured remotes cannot be read."""
+
+    def test_configured_remotes_error_refuses_before_signoff(self) -> None:
+        """Return exit two and skip sign-off when git remote fails in named-remote mode."""
+        with (
+            unittest.mock.patch.object(
+                push_guard.signoff,
+                "configured_remotes",
+                side_effect=ValueError("git remote failed: TimeoutExpired"),
+            ),
+            unittest.mock.patch.object(
+                push_guard.signoff, "check_commits", side_effect=AssertionError("unexpected")
+            ) as checker,
+            unittest.mock.patch("sys.stdin", io.StringIO(update())),
+        ):
+            status, _, err = guard(unittest.mock.Mock(return_value="[]"), update())
+        self.assertEqual(status, 2)
+        self.assertIn("push_guard: cannot read configured remotes:", err)
+        self.assertIn("refusing (fail closed)", err)
+        checker.assert_not_called()
+
+    def test_configured_remotes_over_cap_refuses_before_signoff(self) -> None:
+        """Return exit two and skip sign-off when configured remotes exceed the cap."""
+        cap = push_guard.signoff.MAX_REMOTES
+        with (
+            unittest.mock.patch.object(
+                push_guard.signoff,
+                "configured_remotes",
+                side_effect=ValueError(f"more than {cap} remotes"),
+            ),
+            unittest.mock.patch.object(
+                push_guard.signoff, "check_commits", side_effect=AssertionError("unexpected")
+            ) as checker,
+            unittest.mock.patch("sys.stdin", io.StringIO(update())),
+        ):
+            status, _, err = guard(unittest.mock.Mock(return_value="[]"), update())
+        self.assertEqual(status, 2)
+        self.assertIn("push_guard: cannot read configured remotes:", err)
+        self.assertIn("refusing (fail closed)", err)
+        checker.assert_not_called()
+
+
+class SignoffConsideredRemotesTest(unittest.TestCase):
+    """Record which remote scope push_guard passes to the sign-off reader."""
+
+    def test_named_remote_passes_destination_only(self) -> None:
+        """Pass only the push destination when it is a configured remote name."""
+        with (
+            unittest.mock.patch.object(
+                push_guard.signoff, "check_commits", return_value=None
+            ) as checker,
+            unittest.mock.patch.object(
+                push_guard.signoff, "configured_remotes", return_value=["origin", "fork"]
+            ),
+            unittest.mock.patch.object(
+                push_guard.signoff, "has_default_fetch_refspecs", return_value=True
+            ),
+            unittest.mock.patch.object(push_guard.signoff, "remote_fetch_url", return_value=REMOTE),
+        ):
+            status, _, _ = guard(unittest.mock.Mock(return_value="[]"), update())
+        self.assertEqual(status, 0)
+        self.assertEqual(
+            checker.call_args.kwargs.get("considered_remotes"),
+            ["origin"],
+        )
+
+    def test_bare_url_passes_empty_considered_remote_list(self) -> None:
+        """Pass an empty considered-remote list for a bare URL not named in git remote."""
+        bare = "https://github.com/vidiko/ffmpeg-patches.git"
+        with (
+            unittest.mock.patch.object(
+                push_guard.signoff, "check_commits", return_value=None
+            ) as checker,
+            unittest.mock.patch.object(
+                push_guard.signoff, "configured_remotes", return_value=["origin"]
+            ),
+            unittest.mock.patch("sys.stdin", io.StringIO(update())),
+        ):
+            status, _, _ = capture_main(
+                lambda argv: push_guard.main(argv, unittest.mock.Mock(return_value="[]")),
+                bare,
+                bare,
+            )
+        self.assertEqual(status, 0)
+        self.assertEqual(checker.call_args.kwargs.get("considered_remotes"), [])
+
+    def test_from_config_passes_no_considered_remote_list(self) -> None:
+        """Pass None as considered_remotes in --from-config mode."""
+        with unittest.mock.patch.object(
+            push_guard.signoff, "check_commits", return_value=None
+        ) as checker:
+            status, _, _ = config_guard(
+                unittest.mock.Mock(return_value="[]"), lambda: {"origin": [REMOTE]}, update()
+            )
+        self.assertEqual(status, 0)
+        self.assertIsNone(checker.call_args.kwargs.get("considered_remotes"))
+
+
+class PrePushRecordTest(unittest.TestCase):
+    """Parse pre-push records on Git's ASCII space fields only."""
+
+    def setUp(self) -> None:
+        """Stub remote discovery so the record tests need no Git checkout."""
+        for attr, value in (
+            ("configured_remotes", ["origin"]),
+            ("has_default_fetch_refspecs", True),
+            ("remote_fetch_url", REMOTE),
+            ("checked_out_head", "x"),
+        ):
+            patcher = unittest.mock.patch.object(push_guard.signoff, attr, return_value=value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def test_ref_name_with_no_break_space_stays_one_field(self) -> None:
+        """Keep a U+00A0 ref record as one four-field update whose name reaches the refusal text."""
+        name = "a\u00a0b"
+        with unittest.mock.patch.object(
+            push_guard.signoff, "check_commits", return_value="commit x: no Signed-off-by trailer"
+        ) as checker:
+            status, _, err = guard(unittest.mock.Mock(return_value="[]"), update(ref=name))
+        self.assertEqual(status, 1, err)
+        checker.assert_called_once_with(LOCAL, ZERO, considered_remotes=["origin"])
+        self.assertIn(f"refusing branch {name}:", err)
+
+    def test_wrong_field_count_fails_closed(self) -> None:
+        """Refuse records with three or five ASCII-space fields before any check."""
+        base = f"refs/heads/local {LOCAL} refs/heads/{BRANCH}"
+        for line in (f"{base}\n", f"{base} {ZERO} extra\n"):
+            with (
+                self.subTest(line=line),
+                unittest.mock.patch.object(
+                    push_guard.signoff, "check_commits", side_effect=AssertionError("unexpected")
+                ),
+            ):
+                status, _, err = guard(unittest.mock.Mock(return_value="[]"), line)
+            self.assertEqual(status, 2, err)
+            self.assertIn("refusing (fail closed)", err)
+
+    def test_repair_text_per_reason_in_push_refusal(self) -> None:
+        """Give each push refusal its own repair text through the shared mapping."""
+        missing = push_guard.signoff.judge([], "N <e@x>")
+        many = push_guard.signoff.judge(["N <e@x>", "N <e@x>"], "N <e@x>")
+        other = push_guard.signoff.judge(["M <m@x>"], "N <e@x>")
+        for reason, present in (
+            (f"commit x: {missing}", "amend with the sign-off option"),
+            (f"commit x: {many}", "exactly one"),
+            (f"commit x: {other}", "exactly one"),
+        ):
+            with (
+                self.subTest(reason=reason),
+                unittest.mock.patch.object(
+                    push_guard.signoff, "check_commits", return_value=reason
+                ),
+            ):
+                status, _, err = capture_main(lambda _: push_guard.check_signoff_update(update()))
+            self.assertEqual(status, 1)
+            self.assertIn(present, err)
+            self.assertNotIn("git merge", err)
+            self.assertEqual(err.count("exactly one"), int(present == "exactly one"))
+
+
+class SignoffPushTest(GitFixture):
+    """Refuse invalid introduced merges before reading remote pull requests."""
+
+    def run_guard(self, lines: str, remote: str = REMOTE) -> tuple[int, str, str]:
+        """Run the real local sign-off reader from the isolated fixture repository."""
+        previous = os.getcwd()
+        os.chdir(self.root)
+        self.addCleanup(os.chdir, previous)
+        with unittest.mock.patch("sys.stdin", io.StringIO(lines)):
+            return capture_main(
+                lambda argv: push_guard.main(argv, self.reader, activity_reader=no_activity),
+                "origin",
+                remote,
+            )
+
+    def test_planted_merge_refused_before_reader(self) -> None:
+        """A merge without sign-off fails with its SHA before any PR reader call."""
+        sha = self.merge(False)
+        self.reader = unittest.mock.Mock(side_effect=AssertionError("unexpected PR read"))
+        status, _, err = self.run_guard(update(local_sha=sha))
+        self.assertEqual(status, 1, err)
+        self.assertIn(sha, err)
+        self.assertIn("no Signed-off-by trailer", err)
+        self.reader.assert_not_called()
+
+    def test_signed_merge_reaches_pull_request_checks(self) -> None:
+        """The same merge with sign-off reaches the existing closed-PR refusal."""
+        sha = self.merge(True)
+        self.reader = unittest.mock.Mock(return_value=pull_request())
+        status, _, err = self.run_guard(update(local_sha=sha))
+        self.assertEqual(status, 1, err)
+        self.assertIn("PR #42 is closed", err)
+        self.reader.assert_called_once_with(REPOSITORY, BRANCH)
+
+    def test_non_github_still_refuses_merge(self) -> None:
+        """Apply the sign-off defence to a non-GitHub push without querying a PR reader."""
+        sha = self.merge(False)
+        self.reader = unittest.mock.Mock(side_effect=AssertionError("unexpected PR read"))
+        status, _, err = self.run_guard(update(local_sha=sha), "https://example.invalid/o/r")
+        self.assertEqual(status, 1, err)
+        self.assertIn(sha, err)
+        self.reader.assert_not_called()
+
+    def test_deletion_and_tag_skip_signoff_reader(self) -> None:
+        """Deletion lines and tag refs bypass both sign-off and PR checks."""
+        self.reader = unittest.mock.Mock(side_effect=AssertionError("unexpected PR read"))
+        lines = update(local_sha=ZERO) + f"refs/tags/v1 {LOCAL} refs/tags/v1 {ZERO}\n"
+        with unittest.mock.patch.object(push_guard.signoff, "check_commits") as checker:
+            self.assertEqual(self.run_guard(lines)[0], 0)
+        checker.assert_not_called()
+        self.reader.assert_not_called()
+
+    def test_cannot_decide_refuses_before_api(self) -> None:
+        """Return two for local Git failures instead of falling through to a PR reader."""
+        sha = self.commit()
+        self.git("config", "--unset", "user.email")
+        self.reader = unittest.mock.Mock(side_effect=AssertionError("unexpected PR read"))
+        status, _, err = self.run_guard(update(local_sha=sha))
+        self.assertEqual(status, 2, err)
+        self.assertIn("identity unset or empty", err)
+        self.reader.assert_not_called()
+
+    def test_checked_once_per_update_across_repositories(self) -> None:
+        """Check each update once even when several configured GitHub repositories match."""
+        sha = self.commit()
+        self.reader = unittest.mock.Mock(return_value="[]")
+        config = unittest.mock.Mock(
+            return_value={"origin": [REMOTE, "https://github.com/other/repo"]}
+        )
+        with unittest.mock.patch.object(
+            push_guard.signoff, "check_commits", return_value=None
+        ) as checker:
+            self.assertEqual(config_guard(self.reader, config, update(local_sha=sha) * 2)[0], 0)
+        self.assertEqual(
+            checker.call_args_list,
+            [unittest.mock.call(sha, ZERO, considered_remotes=None)] * 2,
+        )
+        self.assertEqual(self.reader.call_count, 4)
+
+    def test_non_github_invalid_input_fails_closed(self) -> None:
+        """Validate pre-push input even when the remote has no GitHub repository."""
+        self.reader = unittest.mock.Mock(side_effect=AssertionError("unexpected PR read"))
+        self.assertEqual(self.run_guard("invalid updates", "https://example.invalid/o/r")[0], 2)
+        self.reader.assert_not_called()
+
+    def test_named_remote_requires_matching_fetch_url(self) -> None:
+        """Refuse tracking-ref exclusions when REMOTE_URL differs from the remote fetch URL."""
+        fetch_url = "https://example.invalid/fetch.git"
+        push_url = "https://example.invalid/push.git"
+        other_url = "https://example.invalid/other.git"
+        self.git("remote", "add", "origin", fetch_url)
+        unsigned = self.commit("unsigned on origin", signed=False)
+        self.git("update-ref", "refs/remotes/origin/main", unsigned)
+        tip = self.commit("signed tip", signed=True)
+        self.reader = unittest.mock.Mock(return_value="[]")
+        self.git("remote", "set-url", "--push", "origin", push_url)
+        status, _, err = self.run_guard(update(local_sha=tip), push_url)
+        self.assertEqual(status, 1, err)
+        self.assertIn(unsigned, err)
+        self.git("config", "--unset-all", "remote.origin.pushurl")
+        self.git("remote", "set-url", "--add", "--push", "origin", fetch_url)
+        self.git("remote", "set-url", "--add", "--push", "origin", other_url)
+        status, _, err = self.run_guard(update(local_sha=tip), other_url)
+        self.assertEqual(status, 1, err)
+        self.assertIn(unsigned, err)
+        self.git("config", "--unset-all", "remote.origin.pushurl")
+        self.git("config", f"url.{push_url}.pushInsteadOf", fetch_url)
+        status, _, err = self.run_guard(update(local_sha=tip), push_url)
+        self.assertEqual(status, 1, err)
+        self.assertIn(unsigned, err)
+        self.git("config", "--unset", f"url.{push_url}.pushInsteadOf")
+        status, _, err = self.run_guard(update(local_sha=tip), fetch_url)
+        self.assertEqual(status, 0, err)
+
+    def test_from_config_requires_matching_single_push_url(self) -> None:
+        """Refuse tracking-ref exclusions in --from-config when push URL differs from fetch URL."""
+        fetch_url = "https://example.invalid/fetch.git"
+        push_url = "https://example.invalid/push.git"
+        self.git("remote", "add", "origin", fetch_url)
+        unsigned = self.commit("unsigned on origin", signed=False)
+        self.git("update-ref", "refs/remotes/origin/main", unsigned)
+        tip = self.commit("signed tip", signed=True)
+        self.reader = unittest.mock.Mock(return_value="[]")
+        previous = os.getcwd()
+        os.chdir(self.root)
+        self.addCleanup(os.chdir, previous)
+        self.git("remote", "set-url", "--push", "origin", push_url)
+        with unittest.mock.patch("sys.stdin", io.StringIO(update(local_sha=tip))):
+            status, _, err = capture_main(
+                lambda argv: push_guard.main(argv, self.reader, activity_reader=no_activity),
+                "--from-config",
+            )
+        self.assertEqual(status, 1, err)
+        self.assertIn(unsigned, err)
+        self.git("config", "--unset", "remote.origin.pushurl")
+        with unittest.mock.patch("sys.stdin", io.StringIO(update(local_sha=tip))):
+            status, _, err = capture_main(
+                lambda argv: push_guard.main(argv, self.reader, activity_reader=no_activity),
+                "--from-config",
+            )
+        self.assertEqual(status, 0, err)
+
+    def test_non_default_fetch_refspec_disables_remote_exclusion(self) -> None:
+        """Refuse against origin when another remote fetches into origin's tracking namespace."""
+        origin_url = "https://example.invalid/origin.git"
+        second_url = "https://example.invalid/second.git"
+        self.git("remote", "add", "origin", origin_url)
+        self.git("remote", "add", "second", second_url)
+        self.git("config", "remote.second.fetch", "+refs/heads/*:refs/remotes/origin/*")
+        unsigned = self.commit("unsigned from second", signed=False)
+        self.git("update-ref", "refs/remotes/origin/main", unsigned)
+        tip = self.commit("signed tip", signed=True)
+        self.reader = unittest.mock.Mock(return_value="[]")
+        status, _, err = self.run_guard(update(local_sha=tip), origin_url)
+        self.assertEqual(status, 1, err)
+        self.assertIn(unsigned, err)
+
+    def test_nested_remote_refs_excluded_and_nested_destination_unattributed(self) -> None:
+        """Exclude nested remote refs from origin and check a nested remote against remote_sha."""
+        origin_url = "https://example.invalid/origin.git"
+        mirror_url = "https://example.invalid/mirror.git"
+        self.git("remote", "add", "origin", origin_url)
+        self.git("config", "remote.origin/mirror.url", mirror_url)
+        self.git(
+            "config",
+            "remote.origin/mirror.fetch",
+            "+refs/heads/*:refs/remotes/origin/mirror/*",
+        )
+        base = self.commit("signed base", signed=True)
+        self.git("update-ref", "refs/remotes/origin/main", base)
+        unsigned = self.commit("unsigned on nested remote", signed=False)
+        tip = self.commit("signed tip", signed=True)
+        self.reader = unittest.mock.Mock(return_value="[]")
+        for ref in ("refs/remotes/origin/mirror/main", "refs/remotes/origin/mirror/a/b"):
+            self.git("update-ref", ref, unsigned)
+            status, _, err = self.run_guard(update(local_sha=tip), origin_url)
+            self.assertEqual(status, 1, err)
+            self.assertIn(unsigned, err)
+            self.git("update-ref", "-d", ref)
+        self.git("update-ref", "refs/remotes/origin/mirror/main", unsigned)
+        previous = os.getcwd()
+        os.chdir(self.root)
+        self.addCleanup(os.chdir, previous)
+        with unittest.mock.patch("sys.stdin", io.StringIO(update(local_sha=tip))):
+            status, _, err = capture_main(
+                lambda argv: push_guard.main(argv, self.reader, activity_reader=no_activity),
+                "origin/mirror",
+                mirror_url,
+            )
+        self.assertEqual(status, 1, err)
+        self.assertIn(unsigned, err)
+        with unittest.mock.patch("sys.stdin", io.StringIO(update(unsigned, local_sha=tip))):
+            status, _, err = capture_main(
+                lambda argv: push_guard.main(argv, self.reader, activity_reader=no_activity),
+                "origin/mirror",
+                mirror_url,
+            )
+        self.assertEqual(status, 0, err)
+
+    def test_pre_push_non_head_refusal_prints_history_repair(self) -> None:
+        """Print history rewrite advice when the rejected commit is not checked-out HEAD."""
+        ancestor = self.commit("unsigned ancestor", signed=False)
+        tip = self.commit("signed tip", signed=True)
+        self.reader = unittest.mock.Mock(side_effect=AssertionError("unexpected PR read"))
+        status, _, err = self.run_guard(update(local_sha=tip, ref=BRANCH))
+        self.assertEqual(status, 1, err)
+        self.assertIn(f"commit {ancestor} is not the checked-out HEAD", err)
+        self.assertIn(f"rewrite it in the history of branch {BRANCH}", err)
+        self.assertNotIn("--amend", err)
+        head_unsigned = self.commit("unsigned head", signed=False)
+        status, _, err = self.run_guard(update(local_sha=head_unsigned, remote_sha=tip, ref=BRANCH))
+        self.assertEqual(status, 1, err)
+        self.assertIn("amend with the sign-off option (git commit --amend --signoff)", err)
+        self.assertNotIn("is not the checked-out HEAD", err)
+
+
+class SignoffDeadlinePhaseTest(unittest.TestCase):
+    """Local sign-off reads run under their own deadline, before the pull request clock starts."""
+
+    def run_updates(
+        self, count: int, delay: float, signoff_results: list[int] | None = None
+    ) -> tuple[int, list[float], unittest.mock.Mock]:
+        """Run count updates whose sign-off check takes delay seconds on the injected clock."""
+        now = [0.0]
+        budgets: list[float] = []
+
+        def checker(line: str, considered: list[str] | None = None) -> int:
+            """Spend delay seconds, then answer like the next scripted result."""
+            now[0] += delay
+            return signoff_results.pop(0) if signoff_results else 0
+
+        def activity(repository: str, number: int, budget: float) -> tuple[list, list]:
+            """Record the budget given to a review read."""
+            budgets.append(budget)
+            return [], []
+
+        reader = unittest.mock.Mock(return_value=pull_request("open", False))
+        lines = "".join(update(ref=f"branch{index}") for index in range(count))
+        with (
+            unittest.mock.patch.object(push_guard, "check_signoff_update", checker),
+            unittest.mock.patch("sys.stdin", io.StringIO(lines)),
+        ):
+            status = push_guard.check_updates([REPOSITORY], reader, lambda: now[0], activity)
+        return status, budgets, reader
+
+    def test_signoff_reads_do_not_use_the_pull_request_budget(self) -> None:
+        """Two updates with 100 s of sign-off reads each still reach both pull request reads."""
+        _, undelayed, _ = self.run_updates(2, 0)
+        status, budgets, reader = self.run_updates(2, 100)
+        self.assertEqual(status, 0)
+        self.assertEqual(reader.call_count, 2)
+        self.assertEqual(budgets[0], undelayed[0])
+
+    def test_first_refused_signoff_precedes_every_pull_request_read(self) -> None:
+        """A refused sign-off of the first update ends the check before any pull request read."""
+        status, budgets, reader = self.run_updates(2, 0, [1])
+        self.assertEqual(status, 1)
+        reader.assert_not_called()
+        self.assertEqual(budgets, [])
+
+    def test_later_refused_signoff_precedes_pull_request_reads_of_earlier_updates(self) -> None:
+        """Every update's sign-off check runs before the first update's pull request read."""
+        status, budgets, reader = self.run_updates(2, 0, [0, 1])
+        self.assertEqual(status, 1)
+        reader.assert_not_called()
+        self.assertEqual(budgets, [])
+
+    def test_passed_signoff_deadline_refuses_with_its_own_text(self) -> None:
+        """Refuse with status 2 naming the sign-off deadline, before any pull request read."""
+        clock = FakeClock()
+        run = empty_run(clock, 121)
+        reader = unittest.mock.Mock(side_effect=AssertionError("unexpected PR read"))
+        scope = functools.partial(push_guard.signoff.deadline_scope, clock=clock)
+        with (
+            unittest.mock.patch("scripts.signoff.subprocess.run", run),
+            unittest.mock.patch.object(push_guard.signoff, "deadline_scope", scope),
+            unittest.mock.patch("sys.stdin", io.StringIO(update())),
+        ):
+            status, _, err = capture_main(
+                lambda argv: push_guard.check_updates(
+                    [REPOSITORY], reader, time.monotonic, no_activity
+                )
+            )
+        self.assertEqual(status, 2, err)
+        self.assertIn("invalid ref updates: sign-off check deadline of 120 s passed", err)
+        self.assertIsNone(re.search(r"(?<!sign-off )check deadline of 120 s passed", err))
+        self.assertEqual(run.call_count, 1)
+        reader.assert_not_called()
+
+    def test_stdin_read_charged_to_signoff_deadline(self) -> None:
+        """Refuse with status 2 and run no Git or PR call once stdin uses the sign-off deadline."""
+        clock = FakeClock()
+        chunks = [update(), ""]
+
+        def slow_read(_size: int = -1) -> str:
+            """Advance the sign-off clock to its limit while serving stdin."""
+            clock.now = push_guard.signoff.SIGNOFF_DEADLINE
+            return chunks.pop(0)
+
+        run = empty_run()
+        reader = unittest.mock.Mock(return_value="[]")
+        scope = functools.partial(push_guard.signoff.deadline_scope, clock=clock)
+        with (
+            unittest.mock.patch("scripts.signoff.subprocess.run", run),
+            unittest.mock.patch.object(push_guard.signoff, "deadline_scope", scope),
+            unittest.mock.patch("sys.stdin", unittest.mock.Mock(read=slow_read)),
+        ):
+            status, _, err = capture_main(
+                lambda argv: push_guard.check_updates(
+                    [REPOSITORY], reader, time.monotonic, no_activity
+                )
+            )
+        self.assertEqual(status, 2, err)
+        self.assertIn("sign-off check deadline of 120 s passed", err)
+        run.assert_not_called()
+        reader.assert_not_called()
+
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def run_python(*args: str) -> subprocess.CompletedProcess[str]:
+    """Run the current interpreter at the repository root with a deadline and no shell."""
+    return subprocess.run(  # nosec B603 - fixed argv with the running interpreter, no shell.
+        [sys.executable, "-B", *args],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+        stdin=subprocess.DEVNULL,
+        timeout=push_guard.CONFIG_DEADLINE,
+        env=isolated_git_environment(),
+    )
+
+
+class OneSignoffModuleTest(unittest.TestCase):
+    def test_package_import_binds_the_package_signoff_with_scripts_on_sys_path(self) -> None:
+        """Bind scripts.signoff in scripts.push_guard even with the scripts directory first."""
+        code = (
+            "import sys\n"
+            "sys.path.insert(0, sys.argv[1])\n"
+            "from scripts import push_guard, signoff\n"
+            "print(push_guard.signoff is signoff)\n"
+        )
+        done = run_python("-c", code, os.path.join(ROOT, "scripts"))
+        self.assertEqual((done.returncode, done.stdout.strip()), (0, "True"), done.stderr)
+
+    def test_script_run_imports_the_sibling_signoff_as_the_hook_does(self) -> None:
+        """Run scripts/push_guard.py as a script, where only the sibling signoff imports."""
+        done = run_python("scripts/push_guard.py", "origin", "https://example.com/x.git")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn("non-GitHub remote", done.stderr)
 
 
 if __name__ == "__main__":

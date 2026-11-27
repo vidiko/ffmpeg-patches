@@ -1014,7 +1014,7 @@ def _shader_schedule_body(
 
 
 def _shader_schedule_control(
-    masked: str,
+    scan: tuple[str, bool],
     control: tuple[str, int, int],
     depth: int,
     events: list[_ShaderEvent],
@@ -1023,7 +1023,7 @@ def _shader_schedule_control(
     """Emit the header and schedule the body followed by its continuations."""
     kind, first, close = control
     if kind in {"for", "while"}:
-        return _shader_schedule_loop(masked, control, depth, events, pending)
+        return _shader_schedule_loop(scan, control, depth, events, pending)
     pending.append(("join", 0, 0))
     if kind == "if":
         pending.append(("else", depth, 0))
@@ -1033,13 +1033,14 @@ def _shader_schedule_control(
 
 
 def _shader_schedule_loop(
-    masked: str,
+    scan: tuple[str, bool],
     control: tuple[str, int, int],
     depth: int,
     events: list[_ShaderEvent],
     pending: list[_ShaderEvent],
 ) -> bool:
     """Place the initializer outside the back edge and scope each condition evaluation."""
+    masked, proof_safe = scan
     kind, first, close = control
     test_end = close
     update = ("update", close, close)
@@ -1053,13 +1054,13 @@ def _shader_schedule_loop(
         first = init_end + 1
         update = ("update", test_end + 1, close)
     events.extend((("loop", 0, 0), ("enter", 0, 0), ("expr", first, test_end)))
-    condition = masked[first:test_end].strip()
-    if condition in {"", "true"}:
-        test = "always"
-    elif condition == "false":
-        test = "never"
-    else:
-        test = "test"
+    test = "test"
+    if proof_safe:
+        condition = masked[first:test_end].strip()
+        if condition in {"", "true"}:
+            test = "always"
+        elif condition == "false":
+            test = "never"
     events.append((test, 0, 0))
     pending.extend((("join", 0, 0), ("repeat", 0, 0), ("exit", 0, 0), update))
     _shader_schedule_body(events, pending, depth)
@@ -1067,20 +1068,21 @@ def _shader_schedule_loop(
 
 
 def _shader_schedule_statement(
-    masked: str,
+    scan: tuple[str, bool],
     span: tuple[int, int],
     depth: int,
     events: list[_ShaderEvent],
     pending: list[_ShaderEvent],
 ) -> int:
     """Consume a statement prefix and schedule any nested statements."""
+    masked, _ = scan
     start, boundary = span
     if masked[start] == "{":
         events.append(("enter", start, start + 1))
         pending.append(("block", depth + 1, 0))
         return start + 1
     control = _shader_control(masked, start, boundary)
-    if control is not None and _shader_schedule_control(masked, control, depth, events, pending):
+    if control is not None and _shader_schedule_control(scan, control, depth, events, pending):
         return control[2] + 1
     if masked[boundary - 1] == "{":
         # A function or interface header is not a local declaration.
@@ -1092,8 +1094,9 @@ def _shader_schedule_statement(
     return boundary
 
 
-def _shader_events(masked: str, *, expand_counted: bool = False) -> list[_ShaderEvent]:
+def _shader_events(masked: str, *, proof_safe: bool = False) -> list[_ShaderEvent]:
     """Split shader statements into expression, lexical-scope and control events."""
+    scan = (masked, proof_safe)
     spans = statement_spans(masked)
     complete = len(spans) <= _MAX_STATEMENTS
     spans = spans[:_MAX_STATEMENTS]
@@ -1131,8 +1134,8 @@ def _shader_events(masked: str, *, expand_counted: bool = False) -> list[_Shader
             pending.append((kind, first, end))
         while boundary <= cursor:
             boundary = next(boundaries)
-        cursor = _shader_schedule_statement(masked, (cursor, boundary), first, events, pending)
-    return _counted_events(masked, events) if complete and expand_counted else events
+        cursor = _shader_schedule_statement(scan, (cursor, boundary), first, events, pending)
+    return _counted_events(masked, events) if complete and proof_safe else events
 
 
 def _shader_schedule_else(
@@ -1253,8 +1256,12 @@ _COUNTED_VERSION = re.compile(
 )
 
 
-def _counted_directives_ok(source: str) -> bool:
-    """Allow no directives or one leading directive in the supported version subset."""
+def _shader_proof_safe(source: str) -> bool:
+    """Reject raw source whose preprocessing could change loop proof tokens."""
+    # GLSL splices lines before tokenization, including inside comments.
+    # Check raw source before masking and leave all offsets untouched.
+    if "\\\n" in source or "\\\r\n" in source:
+        return False
     # Support desktop GLSL 450, optionally with core or compatibility, on a
     # single line without inline comments. Whitespace and comments may precede it.
     leading = True
@@ -1390,12 +1397,12 @@ class _ShaderFlow:
 
     @classmethod
     def from_source(cls, source: str) -> _ShaderFlow:
-        expand_counted = _counted_directives_ok(source)
-        return cls(mask_literals(source), expand_counted=expand_counted)
+        proof_safe = _shader_proof_safe(source)
+        return cls(mask_literals(source), proof_safe=proof_safe)
 
-    def __init__(self, masked: str, *, expand_counted: bool = False) -> None:
+    def __init__(self, masked: str, *, proof_safe: bool = False) -> None:
         self.masked = masked
-        self.events = _shader_events(masked, expand_counted=expand_counted)
+        self.events = _shader_events(masked, proof_safe=proof_safe)
         self.edges: list[tuple[int, ...]] = [(i + 1,) for i in range(len(self.events))]
         self.depths: list[int] = []
         frames: list[_ShaderFrame] = []

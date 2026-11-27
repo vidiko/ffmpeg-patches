@@ -2357,6 +2357,76 @@ class VulkanSweepTest(unittest.TestCase):
                     sweep_port_parity.shader_site("test.frag", source, "clamp"), expected
                 )
 
+    def test_port_parity_shader_preprocessed_loop_conditions(self) -> None:
+        """Keep the body and exit reachable when raw loop tests are not authoritative."""
+        load = "x = imageLoad(img, ivec2(0));"
+        for condition, body, before, expected in (
+            ("\n#if 0\n    false\n#endif\n  ", f"{load} break;", "", "test.frag:12"),
+            (
+                "\n#if 0\n    true\n#else\n    enabled != 0\n#endif\n  ",
+                "return;",
+                load + "\n",
+                "test.frag:7",
+            ),
+            ("\n#if 0\n#endif\n  ", "return;", load + "\n", "test.frag:7"),
+        ):
+            with self.subTest(condition=condition):
+                source = (
+                    "#version 450\n"
+                    "layout(binding = 0, rgba32f) readonly uniform image2D img;\n"
+                    "layout(location = 0) out vec4 color;\n"
+                    "layout(location = 1) flat in int enabled;\n"
+                    "void main() {\n"
+                    "  vec4 x = vec4(0.0);\n"
+                    f"{before}"
+                    f"  for (;{condition};) {{\n"
+                    f"    {body}\n"
+                    "  }\n"
+                    "  color = clamp(x, 0.0, 1.0);\n"
+                    "}\n"
+                )
+                self.assertEqual(
+                    sweep_port_parity.shader_site("test.frag", source, "clamp"), expected
+                )
+
+    def test_port_parity_shader_spliced_overload_declines_counted_proof(self) -> None:
+        """Retain the reachable update and both test edges without splicing source spans."""
+        for newline in ("\n", "\r\n"):
+            with self.subTest(newline=repr(newline)):
+                source = newline.join(
+                    (
+                        "#version 450",
+                        "layout(binding = 0, rgba32f) readonly uniform image2D img;",
+                        "layout(location = 0) out vec4 color;",
+                        "uniform bool flag;",
+                        "vec4 cla" + chr(92),
+                        "mp(bool value, float lo, float hi) {",
+                        "  discard;",
+                        "  return vec4(0.0);",
+                        "}",
+                        "void main() {",
+                        "  vec4 x = vec4(0.0);",
+                        "  for (int i = 0; i < 1; x = imageLoad(img, ivec2(0))) {",
+                        "    x = clamp(flag, 0.0, 1.0);",
+                        "    ++i;",
+                        "  }",
+                        "  color = x;",
+                        "}",
+                        "",
+                    )
+                )
+                flow = sweep_port_parity._ShaderFlow.from_source(source)
+                reachable = flow.reachable()
+                (test,) = (i for i, (kind, _, _) in enumerate(flow.events) if kind == "test")
+                (update,) = (i for i, (kind, _, _) in enumerate(flow.events) if kind == "update")
+                (join,) = (i for i, (kind, _, _) in enumerate(flow.events) if kind == "join")
+                self.assertIn(test, reachable)
+                self.assertEqual(flow.edges[test], (test + 1, join))
+                self.assertIn(update, reachable)
+                _, start, end = flow.events[update]
+                self.assertEqual(source[start:end].strip(), "x = imageLoad(img, ivec2(0))")
+                self.assertEqual(source.count("\n", 0, start) + 1, 12)
+
     def test_port_parity_shader_counted_for(self) -> None:
         """Match update loads at their source line, including uses on the second iteration."""
         for bound, after, expected in (

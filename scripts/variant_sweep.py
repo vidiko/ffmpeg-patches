@@ -859,10 +859,14 @@ def sweep_all(directory: str, base: str, head: str) -> str:
                 raise
             section = name.replace("_", "-")
             table = REPORT_TABLES["vulkan-features"]
+            separator = "| " + " | ".join(["---"] * (table.count("|") - 1)) + " |"
+            diagnostic = "".join(
+                char if char.isprintable() else ascii(char)[1:-1] for char in str(error)
+            ).replace("|", "&#124;")
             report += (
                 f"\nclass: {section}\nhead: {head}\n\n"
-                f"{table}\n| --- | --- | --- | --- | --- |\n"
-                f"prerequisite: {error}\n"
+                f"{table}\n{separator}\n"
+                f"| - | - | prerequisite: {diagnostic} | unanalyzed | TODO |\n"
             )
         check_limit("report size", len(report.encode("utf-8")), MAX_REPORT_BYTES)
     report += "\n" + render_review_classes(head)

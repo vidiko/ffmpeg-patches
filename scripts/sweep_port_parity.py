@@ -279,32 +279,83 @@ def _extend_mask_tail(text: str, position: int, limit: int) -> int:
     return position
 
 
-def _operand_scan_end(statement: str, read_end: int, depth: int) -> int:
-    """Return the end offset after attached mask or shift operators following read_end."""
+def _operand_scan_end(
+    statement: str,
+    read_end: int,
+    depth: int,
+    *,
+    shift_rhs_spans: list[tuple[int, int]] | None = None,
+    result_parens: int = 0,
+) -> int:
+    """Return the attached operator tail's end, optionally recording shift counts."""
     limit = len(statement)
     position = read_end
+    saw_shift = False
     for _ in range(_OPERAND_OPS):
         position = _skip_space(statement, position, limit)
-        if position >= limit or (statement[position] == "," and depth == 0):
+        op = position
+        # A mask after a group around the shifted value is not part of its count.
+        while saw_shift and result_parens and op < limit and statement[op] == ")":
+            result_parens -= 1
+            depth -= 1
+            op = _skip_space(statement, op + 1, limit)
+        if op >= limit or (statement[op] == "," and depth == 0):
             break
-        if statement.startswith(">>", position):
-            after = _skip_space(statement, position + 2, limit)
+        if statement.startswith(">>", op):
+            after = _skip_space(statement, op + 2, limit)
             position = _extend_shift_tail(statement, after, limit)
+            if shift_rhs_spans is not None:
+                shift_rhs_spans.append((after, position))
+            saw_shift = True
             continue
-        if statement[position] == "&" and position + 1 < limit and statement[position + 1] != "&":
-            position = _extend_mask_tail(
-                statement, _skip_space(statement, position + 1, limit), limit
-            )
+        if statement[op] == "&" and op + 1 < limit and statement[op + 1] != "&":
+            position = _extend_mask_tail(statement, _skip_space(statement, op + 1, limit), limit)
             continue
         break
     return position
 
 
+def _attached_result_parens(statement: str, read_start: int) -> int:
+    """Count grouping opens immediately before the operand that the tail can cross."""
+    count = 0
+    start = read_start
+    for _ in range(_TARGET_PARENS):
+        opening = _non_space_index(statement, start - 1, 0)
+        if opening is None or statement[opening] != "(":
+            return count
+        previous = _non_space_index(statement, opening - 1, 0)
+        # Do not cross a call boundary or a group used as another shift's count.
+        if (
+            previous is not None
+            and statement[previous] not in "=(,;?:{|^"
+            and re.search(r"\breturn$", statement[: previous + 1]) is None
+        ):
+            return count
+        count += 1
+        start = opening
+    return count
+
+
 def attached_operator_text(statement: str, read_start: int, read_end: int) -> str:
-    """Return operators attached after one sample read without its argument or macro text."""
+    """Return attached operator text with shift-count masks excluded."""
     depth = statement[:read_start].count("(") - statement[:read_start].count(")")
-    end = _operand_scan_end(statement, read_end, depth)
-    return statement[read_end:end]
+    shift_rhs_spans: list[tuple[int, int]] = []
+    end = _operand_scan_end(
+        statement,
+        read_end,
+        depth,
+        shift_rhs_spans=shift_rhs_spans,
+        result_parens=_attached_result_parens(statement, read_start),
+    )
+    pieces: list[str] = []
+    start = read_end
+    for rhs_start, rhs_end in shift_rhs_spans:
+        pieces.append(statement[start:rhs_start])
+        # Keep offsets stable for callers that clip the focus to a header boundary.
+        pieces.append(statement[rhs_start:rhs_end].replace("&", " "))
+        start = rhs_end
+    pieces.append(statement[start:end])
+    return "".join(pieces)
 
 
 def header_inner_call_depth(statement: str, read_start: int, bounds: tuple[int, int]) -> int:
@@ -477,9 +528,15 @@ def _header_assignment_rhs(
 
 def _compound_assignment_focus(statement: str, rhs: int, end: int) -> str:
     """Return attached-operator text when the assignment ending at rhs is compound."""
-    if statement.endswith(("<<=", ">>="), 0, rhs):
-        prefix = statement[rhs - 3 : rhs - 1]
-    elif rhs >= 2 and statement[rhs - 2] in "+-*/%&|^":
+    if statement.endswith(">>=", 0, rhs):
+        # The whole RHS is the shift count, so a mask in it never applies to the value.
+        synthetic = f">> {statement[rhs:end]}"
+        after = _skip_space(synthetic, 2, len(synthetic))
+        shift_end = _extend_shift_tail(synthetic, after, len(synthetic))
+        return synthetic[:shift_end].replace("&", " ")
+    if statement.endswith("<<=", 0, rhs):
+        return ""
+    if rhs >= 2 and statement[rhs - 2] in "+-*/%&|^":
         prefix = statement[rhs - 2 : rhs - 1]
     else:
         return ""
@@ -524,7 +581,7 @@ def normalization_focus(statement: str, read_start: int, read_end: int) -> str:
     if bounds is not None and bounds[0] <= read_start <= bounds[1]:
         header_end = bounds[1] + 1
         tail_end = min(read_end + len(tail), header_end)
-        tail_slice = statement[read_end:tail_end]
+        tail_slice = tail[: tail_end - read_end]
         if header_inner_call_depth(statement, read_start, bounds) > 1:
             return tail_slice
         if normalization_kind(tail_slice) is not None:
@@ -784,11 +841,34 @@ def _statement_use_matches(statement: str, name: str, pattern: re.Pattern[str]) 
 
 def _statement_assignment_rhs(statement: str, name: str) -> int | None:
     """Return the RHS start when a statement assigns directly to the bound name."""
-    start = _skip_space(statement, 0, len(statement))
+    limit = len(statement)
+    start = _skip_space(statement, 0, limit)
+    openings = []
+    for _ in range(_TARGET_PARENS):
+        if start >= limit or statement[start] != "(":
+            break
+        openings.append(start)
+        start = _skip_space(statement, start + 1, limit)
     if not _whole_word_at(statement, start, name):
         return None
-    match = _VALUE_ASSIGNMENT.match(statement, start + len(name))
-    return match.end() if match is not None else None
+
+    target_start, target_end = _unwrap_target_parens(statement, start, start + len(name), 0, limit)
+    match = _VALUE_ASSIGNMENT.match(statement, target_end)
+    if match is None:
+        return None
+
+    if openings and openings[0] < target_start:
+        # Parentheses not consumed by the target must wrap the whole assignment.
+        close = _non_space_index(statement, limit - 1, 0)
+        if close is not None and statement[close] == ";":
+            close = _non_space_index(statement, close - 1, 0)
+        for opening in openings:
+            if opening >= target_start:
+                break
+            if close is None or matching_close_paren(statement, opening) != close:
+                return None
+            close = _non_space_index(statement, close - 1, 0)
+    return match.end()
 
 
 def _use_normalized(

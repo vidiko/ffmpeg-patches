@@ -121,18 +121,44 @@ def feature_allowlist_from_xml(root: ET.Element) -> frozenset[str]:
     return frozenset(allow)
 
 
+def _resolve_struct_alias(aliases: dict[str, str], name: str) -> str | None:
+    """Follow alias links to a canonical name; bounded and cycle-safe (None on cycle)."""
+    seen = {name}
+    current = name
+    for _ in range(len(aliases)):
+        target = aliases.get(current)
+        if target is None:
+            return current
+        if target in seen:
+            return None
+        seen.add(target)
+        current = target
+    return None if current in aliases else current
+
+
 def feature_struct_names_from_xml(root: ET.Element) -> frozenset[str]:
-    """Collect Vk feature struct names that may hold VkPhysicalDeviceFeatures gates."""
+    """Collect Vk feature struct names (and aliases of them) that may hold feature gates."""
     names: set[str] = {"VkPhysicalDeviceFeatures"}
+    aliases: dict[str, str] = {}
     for struct in root.iter("type"):
         if struct.get("category") != "struct":
             continue
         name = struct.get("name", "")
+        alias = struct.get("alias")
+        if alias:
+            if name:
+                aliases[name] = alias
+            continue
         extends = struct.get("structextends", "")
         if name == "VkPhysicalDeviceFeatures":
             continue
         if "VkPhysicalDeviceFeatures2" in extends:
             names.add(name)
+    canonical = frozenset(names)
+    for alias_name in aliases:
+        target = _resolve_struct_alias(aliases, alias_name)
+        if target is not None and target in canonical:
+            names.add(alias_name)
     return frozenset(names)
 
 
@@ -517,7 +543,7 @@ STRUCT_TAG_DECL = re.compile(
     re.ASCII,
 )
 GENERIC_DECL = re.compile(
-    r"\b(?!VkPhysicalDevice|struct|if|for|while|return|sizeof|switch)"
+    r"\b(?!VkPhysicalDevice|struct|if|for|while|return|sizeof|switch|goto\b)"
     r"([A-Za-z_]\w*)\s+(\*+\s*)?(\w+)\s*(?=[,;=)])",
     re.ASCII,
 )

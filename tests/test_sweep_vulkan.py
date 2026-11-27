@@ -10,6 +10,7 @@ import tempfile
 import time
 import unittest
 import unittest.mock
+import xml.etree.ElementTree
 from collections.abc import Callable
 from pathlib import Path
 from types import ModuleType
@@ -2026,6 +2027,10 @@ class VulkanSweepTest(unittest.TestCase):
             ("nested_assignment", ("if (c) {", "px = flags;", "}", output), site),
             ("other_rhs", ("px = flags & 0xffu;",), None),
             ("compound_mask", ("px &= 0xffu;",), site),
+            ("parenthesized_target", ("((px)) = flags;", output), None),
+            ("parenthesized_assignment", ("((px = flags));", output), None),
+            ("indexed_sub_write", ("px[0] = flags;", output), site),
+            ("member_sub_write", ("px.r = flags;", output), site),
         ]
         for label, tail, expected in cases:
             with self.subTest(label=label):
@@ -2090,6 +2095,35 @@ class VulkanSweepTest(unittest.TestCase):
             start = time.monotonic()
             self.assertEqual(list(pattern.finditer(source)), [])
             self.assertLess(time.monotonic() - start, 2.0)
+
+    def test_feature_struct_names_from_xml_resolves_forward_alias_chain(self) -> None:
+        """Include forward feature aliases, but exclude unrelated aliases and cycles."""
+        root = xml.etree.ElementTree.Element("registry")
+        types = xml.etree.ElementTree.SubElement(root, "types")
+        features = "VkPhysicalDeviceExampleFeatures"
+        properties = "VkPhysicalDeviceExampleProperties"
+        for name, attrs in (
+            (f"{features}EXT", {"alias": f"{features}KHR"}),
+            (f"{features}KHR", {"alias": features}),
+            (features, {"structextends": "VkPhysicalDeviceFeatures2"}),
+            (properties, {"structextends": "VkPhysicalDeviceProperties2"}),
+            (f"{properties}EXT", {"alias": properties}),
+            ("VkCycleA", {"alias": "VkCycleB"}),
+            ("VkCycleB", {"alias": "VkCycleA"}),
+        ):
+            xml.etree.ElementTree.SubElement(types, "type", category="struct", name=name, **attrs)
+
+        self.assertEqual(
+            sweep_vulkan_features.feature_struct_names_from_xml(root),
+            frozenset(
+                {
+                    "VkPhysicalDeviceFeatures",
+                    "VkPhysicalDeviceExampleFeatures",
+                    "VkPhysicalDeviceExampleFeaturesKHR",
+                    "VkPhysicalDeviceExampleFeaturesEXT",
+                }
+            ),
+        )
 
     def test_cr22_parenthesized_feature_receiver(self) -> None:
         """Redundant parentheses preserve the feature receiver's root type."""
@@ -2284,6 +2318,30 @@ class VulkanSweepTest(unittest.TestCase):
             ("shader_compound_or_stops", ("px |= flags;", "uint o = px & 0xffu;"), "mask", None),
             ("shader_plain_other_rhs", ("px = flags & 0xffu;",), "mask", None),
             ("shader_plain_self_rhs", ("px = px & 0xffu;",), "mask", site),
+            (
+                "shader_shift_masked_rhs_not_mask",
+                ("uint o = px >> (flags & 0xffu);",),
+                "mask",
+                None,
+            ),
+            (
+                "shader_shift_masked_rhs_is_shift",
+                ("uint o = px >> (flags & 0xffu);",),
+                "shift",
+                site,
+            ),
+            (
+                "shader_compound_shift_masked_rhs_not_mask",
+                ("px >>= (flags & 0xffu);",),
+                "mask",
+                None,
+            ),
+            (
+                "shader_compound_shift_masked_rhs_is_shift",
+                ("px >>= (flags & 0xffu);",),
+                "shift",
+                site,
+            ),
         ]
         for label, tail, kind, expected in shader_cases:
             with self.subTest(label=label):
@@ -2842,6 +2900,26 @@ class VulkanSweepTest(unittest.TestCase):
         )
         pairs = [(s.feature, s.line) for s in sweep_vulkan_features.c_feature_reads(source)]
         self.assertEqual(pairs, [("shaderInt64", 4)])
+
+    def test_goto_label_does_not_shadow_feature_parameter(self) -> None:
+        """A label leaves the parameter visible, but a local declaration hides it."""
+        bind_g3_maps_fixture(self)
+        source = (
+            "struct Other { int shaderInt64; };\n"
+            "int gate(VkPhysicalDeviceFeatures *feats) {\n"
+            "    goto feats;\n"
+            "feats:\n"
+            "    if (feats->shaderInt64) return 1;\n"
+            "    {\n"
+            "        struct Other *feats;\n"
+            "        if (feats->shaderInt64) return 2;\n"
+            "    }\n"
+            "    if (feats->shaderInt64) return 3;\n"
+            "    return 0;\n"
+            "}\n"
+        )
+        pairs = [(s.feature, s.line) for s in sweep_vulkan_features.c_feature_reads(source)]
+        self.assertEqual(pairs, [("shaderInt64", 5), ("shaderInt64", 10)])
 
     def test_cr17_f3_reverse_inner_features_shadow_expires(self) -> None:
         """CR17 F3: inner Features param shadow does not hide outer Properties after the block."""

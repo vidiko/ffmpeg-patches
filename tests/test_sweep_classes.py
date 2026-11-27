@@ -134,8 +134,29 @@ class SweepClassesTest(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         report = output.read_text(encoding="utf-8")
-        self.assertIn("prerequisite:", section(report, "vulkan-features"))
+        self._assert_vulkan_prerequisite_section(report, head)
         self.assertIn("class: port-parity", report)
+
+    def _assert_vulkan_prerequisite_section(self, report: str, head: str) -> None:
+        vulkan_section = section(report, "vulkan-features")
+        lines = vulkan_section.removeprefix("class: vulkan-features\n").splitlines()
+        self.assertIn("prerequisite:", vulkan_section)
+        self.assertNotIn("no hits", lines)
+        rows = [line for line in lines if line.endswith(" | unanalyzed | TODO |")]
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertEqual(row.count("|"), 6)
+        self.assertIn("| prerequisite: ", row)
+        self.assertFalse(variant_sweep.validate_section(lines, "vulkan-features", head))
+        reviewed = lines.copy()
+        reviewed[reviewed.index(row)] = row.removesuffix("TODO |") + (
+            "follow-up: inspected vf_gate_vulkan.c; the SPIR-V extern does not establish "
+            "required Vulkan features; rerun with vk.xml available |"
+        )
+        self.assertTrue(variant_sweep.validate_section(reviewed, "vulkan-features", head))
+        self.assertFalse(
+            variant_sweep.validate_section([*reviewed, "no hits"], "vulkan-features", head)
+        )
 
     def test_state_after_error(self) -> None:
         """An increment after an earlier error return produces one state row."""
@@ -598,7 +619,9 @@ class SweepRegressionTest(unittest.TestCase):
             """Record sibling order or raise for the Vulkan features sweep."""
             if name == "vulkan_features":
                 order.append(name)
-                raise sweep_vulkan_features.VulkanFeatureSweepError("missing tool: /no/glslang")
+                raise sweep_vulkan_features.VulkanFeatureSweepError(
+                    "missing tool: /no/glslang|debug\n\tbin\x1b\u2028/glslang"
+                )
             order.append(name)
             return f"class: {name.replace('_', '-')}\nhead: {head}\nno hits\n"
 
@@ -607,7 +630,11 @@ class SweepRegressionTest(unittest.TestCase):
             unittest.mock.patch.object(variant_sweep, "sweep_class", side_effect=extra),
         ):
             report = variant_sweep.sweep_all("unused", sha, sha)
-        self.assertIn("prerequisite: missing tool: /no/glslang", report)
+        self.assertIn(
+            r"| - | - | prerequisite: missing tool: /no/glslang&#124;debug\n\tbin\x1b\u2028/glslang"
+            " | unanalyzed | TODO |",
+            section(report, "vulkan-features").splitlines(),
+        )
         self.assertIn("class: port-parity", report)
         self.assertEqual(
             order,

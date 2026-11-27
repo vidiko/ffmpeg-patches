@@ -57,7 +57,7 @@ _CONTROL_WORDS = frozenset({"if", "for", "while", "switch", "return", "else"})
 _LOAD_SUFFIX = re.compile(r"\s*(?:\.[A-Za-z_]\w*|\[)", re.ASCII)
 _GLSL_DECLARATION = re.compile(
     r"\s*(?:(?:const|lowp|mediump|highp|precise)\s+)*"
-    r"([A-Za-z_]\w*)\s+([A-Za-z_]\w*)\s*(?=[=;])",
+    r"([A-Za-z_]\w*)\s+([A-Za-z_]\w*)\s*(?=[=;]|$)",
     re.ASCII,
 )
 _GLSL_VECTOR = re.compile(r"[biud]?vec([2-4])", re.ASCII)
@@ -986,71 +986,368 @@ def _statement_sequence_use(
     return False, live
 
 
-def _declares_binding(statement: str, name: str) -> bool:
-    """Return whether this statement introduces a new binding for name."""
-    declaration = _GLSL_DECLARATION.match(statement)
-    return declaration is not None and declaration[2] == name
+_ShaderEvent = tuple[str, int, int]
 
 
-def _use_normalized(
-    source: tuple[str, list[tuple[int, int]]],
-    index: int,
-    name: str,
-    pattern: re.Pattern[str],
-    width: int = 0,
+def _shader_control(masked: str, start: int, boundary: int) -> tuple[str, int, int] | None:
+    """Locate a leading control header within the current statement span."""
+    word = _IDENTIFIER.match(masked, start, boundary)
+    if word is None or word[0] not in {"if", "for", "while", "switch"}:
+        return None
+    opening = _skip_space(masked, word.end(), boundary)
+    if opening == boundary or masked[opening] != "(":
+        return None
+    close = matching_close_paren(masked, opening)
+    if close is None or close >= boundary:
+        return None
+    return word[0], opening + 1, close
+
+
+def _shader_schedule_body(
+    events: list[_ShaderEvent], pending: list[_ShaderEvent], depth: int
+) -> None:
+    """Give one controlled statement its own scope, even without braces."""
+    events.append(("enter", 0, 0))
+    pending.extend((("exit", 0, 0), ("statement", depth + 1, 0)))
+
+
+def _shader_schedule_control(
+    masked: str,
+    control: tuple[str, int, int],
+    depth: int,
+    events: list[_ShaderEvent],
+    pending: list[_ShaderEvent],
 ) -> bool:
-    """Return whether a later use normalizes lanes still derived from the load."""
-    masked, spans = source
-    incoming = []
-    live = (1 << (width or 1)) - 1
-    for follow in range(index + 1, min(len(spans), index + 1 + _USE_WINDOW)):
-        start, end = spans[follow]
-        statement = masked[start:end]
-        if _declares_binding(statement, name):
-            live = 0
-        if live:
-            matched, live = _statement_sequence_use(statement, name, pattern, width, live)
-            if matched:
-                return True
-        if statement.endswith("{"):
-            incoming.append(live)
-        elif statement.endswith("}"):
-            if not incoming:
-                return False
-            # The nested block may not execute; its writes only kill lanes within it.
-            live = incoming.pop()
-        if not live and not incoming:
+    """Emit the header and schedule the body followed by its continuations."""
+    kind, first, close = control
+    if kind in {"for", "while"}:
+        return _shader_schedule_loop(masked, control, depth, events, pending)
+    pending.append(("join", 0, 0))
+    if kind == "if":
+        pending.append(("else", depth, 0))
+    events.extend((("expr", first, close), (kind, 0, 0)))
+    _shader_schedule_body(events, pending, depth)
+    return True
+
+
+def _shader_schedule_loop(
+    masked: str,
+    control: tuple[str, int, int],
+    depth: int,
+    events: list[_ShaderEvent],
+    pending: list[_ShaderEvent],
+) -> bool:
+    """Place the initializer outside the back edge and scope each condition evaluation."""
+    kind, first, close = control
+    test_end = close
+    update = ("update", close, close)
+    if kind == "for":
+        clauses = list(_top_level_separators(masked, first, close, ";"))
+        if len(clauses) != 2:
             return False
+        init_end, test_end = clauses
+        events.extend((("enter", 0, 0), ("expr", first, init_end)))
+        pending.append(("exit", 0, 0))
+        first = init_end + 1
+        update = ("update", test_end + 1, close)
+    events.extend((("loop", 0, 0), ("enter", 0, 0), ("expr", first, test_end)))
+    test = "test" if _skip_space(masked, first, test_end) < test_end else "always"
+    events.append((test, 0, 0))
+    pending.extend((("join", 0, 0), ("repeat", 0, 0), ("exit", 0, 0), update))
+    _shader_schedule_body(events, pending, depth)
+    return True
+
+
+def _shader_schedule_statement(
+    masked: str,
+    span: tuple[int, int],
+    depth: int,
+    events: list[_ShaderEvent],
+    pending: list[_ShaderEvent],
+) -> int:
+    """Consume a statement prefix and schedule any nested statements."""
+    start, boundary = span
+    if masked[start] == "{":
+        events.append(("enter", 0, 0))
+        pending.append(("block", depth + 1, 0))
+        return start + 1
+    control = _shader_control(masked, start, boundary)
+    if control is not None and _shader_schedule_control(masked, control, depth, events, pending):
+        return control[2] + 1
+    if masked[boundary - 1] == "{":
+        # A function or interface header is not a local declaration.
+        events.append(("header", start, boundary - 1))
+        pending.append(("statement", depth + 1, 0))
+        return boundary - 1
+    if masked[boundary - 1] != "}":
+        events.append(("expr", start, boundary))
+    return boundary
+
+
+def _shader_events(masked: str) -> list[_ShaderEvent]:
+    """Split shader statements into expression, lexical-scope and control events."""
+    spans = statement_spans(masked)[:_MAX_STATEMENTS]
+    if not spans:
+        return []
+    limit = spans[-1][1]
+    boundaries = iter(end for _, end in spans)
+    boundary = next(boundaries)
+    events: list[_ShaderEvent] = []
+    # Private continuations share the tuple shape but are never emitted.
+    pending: list[_ShaderEvent] = [("root", 0, 0)]
+    cursor = 0
+    while pending:
+        kind, first, end = pending.pop()
+        if kind not in {"root", "block", "statement", "else"}:
+            events.append((kind, first, end))
+            continue
+        cursor = _skip_space(masked, cursor, limit)
+        if kind == "else":
+            cursor = _shader_schedule_else(masked, cursor, first, events, pending)
+            continue
+        if kind == "block" and (cursor == limit or masked[cursor] == "}"):
+            cursor = min(cursor + 1, limit)
+            events.append(("exit", 0, 0))
+            continue
+        if cursor == limit:
+            continue
+        if first >= _SUBSCRIPT_DEPTH:
+            events.append(("stop", 0, 0))
+            break
+        if kind != "statement":
+            pending.append((kind, first, end))
+        while boundary <= cursor:
+            boundary = next(boundaries)
+        cursor = _shader_schedule_statement(masked, (cursor, boundary), first, events, pending)
+    return events
+
+
+def _shader_schedule_else(
+    masked: str, cursor: int, depth: int, events: list[_ShaderEvent], pending: list[_ShaderEvent]
+) -> int:
+    """Consume an optional else arm and give it its own lexical scope."""
+    if not _whole_word_at(masked, cursor, "else"):
+        return cursor
+    events.append(("alternate", 0, 0))
+    _shader_schedule_body(events, pending, depth)
+    return cursor + len("else")
+
+
+class _ShaderFrame:
+    """Collect edges whose destination is not known until a control construct ends."""
+
+    def __init__(self, kind: str, opening: int) -> None:
+        self.kind = kind
+        self.opening = opening
+        self.branch = opening
+        self.alternate: int | None = None
+        self.breaks: list[int] = []
+        self.continues: list[int] = []
+
+    def finish(self, edges: list[tuple[int, ...]], end: int) -> None:
+        """Connect the optional arm and all breaks to their destinations."""
+        alternate = self.alternate
+        edges[self.branch] = (self.branch + 1, end if alternate is None else alternate + 1)
+        if alternate is not None:
+            edges[alternate] = (end,)
+        for origin in self.breaks:
+            edges[origin] = (end,)
+
+
+def _shader_jump(
+    word: str, index: int, frames: list[_ShaderFrame], edges: list[tuple[int, ...]]
+) -> None:
+    """Terminate an abrupt path and, if applicable, record its structured target."""
+    if word not in {"return", "discard", "break", "continue"}:
+        return
+    edges[index] = ()
+    if word == "break":
+        for frame in reversed(frames):
+            if frame.kind in {"loop", "switch"}:
+                frame.breaks.append(index)
+                return
+    if word == "continue":
+        for frame in reversed(frames):
+            if frame.kind == "loop":
+                frame.continues.append(index)
+                return
+
+
+def _shader_finish_frame(frame: _ShaderFrame, edges: list[tuple[int, ...]], index: int) -> None:
+    """Resolve a join, with only break edges exiting a loop without a test."""
+    if frame.kind == "loop" and frame.branch == frame.opening:
+        for origin in frame.breaks:
+            edges[origin] = (index,)
+    else:
+        frame.finish(edges, index)
+
+
+def _shader_control_edge(
+    kind: str, index: int, frames: list[_ShaderFrame], edges: list[tuple[int, ...]]
+) -> None:
+    """Resolve branches, loop back edges and pending abrupt transfers."""
+    if kind in {"if", "switch", "loop"}:
+        frames.append(_ShaderFrame(kind, index))
+    elif kind in {"test", "always"}:
+        # An omitted condition has no false edge; retain the ordinary back edge.
+        if kind == "test":
+            frames[-1].branch = index
+    elif kind == "alternate":
+        frames[-1].alternate = index
+    elif kind == "update":
+        for origin in frames[-1].continues:
+            edges[origin] = (index,)
+    elif kind == "repeat":
+        edges[index] = (frames[-1].opening + 1,)
+    elif kind == "join":
+        _shader_finish_frame(frames.pop(), edges, index)
+
+
+class _ShaderFlow:
+    """Store shader events, successor edges and lexical depths before each event."""
+
+    def __init__(self, masked: str) -> None:
+        self.events = _shader_events(masked)
+        self.edges: list[tuple[int, ...]] = [(i + 1,) for i in range(len(self.events))]
+        self.depths: list[int] = []
+        frames: list[_ShaderFrame] = []
+        depth = 0
+        for index, (kind, start, end) in enumerate(self.events):
+            self.depths.append(depth)
+            depth += int(kind == "enter") - int(kind == "exit")
+            _shader_control_edge(kind, index, frames, self.edges)
+            if kind == "expr":
+                word = _IDENTIFIER.match(masked, start, end)
+                if word is not None:
+                    _shader_jump(word[0], index, frames, self.edges)
+            if kind in {"stop", "header"}:
+                self.edges[index] = ()
+
+
+def _shader_declaration(statement: str) -> re.Match[str] | None:
+    """Recognize a simple declaration of a supported GLSL value type."""
+    declaration = _GLSL_DECLARATION.match(statement)
+    if declaration is not None and declaration[1] in _GLSL_CONSTRUCTORS:
+        return declaration
+    return None
+
+
+def _visible_binding(
+    masked: str, events: list[_ShaderEvent], index: int, name: str
+) -> tuple[int, int]:
+    """Return the binding width and the number of enclosing exits it survives."""
+    closed = distance = 0
+    for previous in range(index, -1, -1):
+        kind, start, end = events[previous]
+        if kind == "exit":
+            closed += 1
+        elif kind == "enter":
+            if closed:
+                closed -= 1
+            else:
+                distance += 1
+        elif kind == "expr" and not closed:
+            declaration = _shader_declaration(masked[start:end])
+            if declaration is not None and declaration[2] == name:
+                vector = _GLSL_VECTOR.fullmatch(declaration[1])
+                return (int(vector[1]) if vector is not None else 0), distance
+    # An unresolved name must not be followed into another top-level block.
+    return 0, max(0, distance - 1)
+
+
+_LaneState = tuple[int, int, int]
+
+
+class _ShaderUse:
+    """Transfer one load's provenance without merging lanes from different paths."""
+
+    def __init__(self, name: str, pattern: re.Pattern[str], width: int, floor: int) -> None:
+        self.name = name
+        self.pattern = pattern
+        self.width = width
+        self.floor = floor
+
+    def expression(self, text: str, depth: int, live: int) -> tuple[bool, int, int]:
+        """Read the initializer in the old scope before installing a shadow."""
+        shadow = -1
+        declaration = _shader_declaration(text)
+        if declaration is not None and declaration[2] == self.name:
+            shadow = depth
+            initializer = text[declaration.end() :].lstrip()
+            text = initializer[1:] if initializer.startswith("=") else ""
+        matched, live = _statement_sequence_use(text, self.name, self.pattern, self.width, live)
+        return matched, live, shadow
+
+    def successor(
+        self, flow: _ShaderFlow, target: int, live: int, shadow: int
+    ) -> _LaneState | None:
+        """Unwind any scopes skipped by the edge before visiting its destination."""
+        if target >= len(flow.events) or flow.depths[target] < self.floor:
+            return None
+        return target, live, shadow if shadow <= flow.depths[target] else -1
+
+
+def _shader_enqueue_successors(
+    flow: _ShaderFlow, use: _ShaderUse, state: _LaneState, queue: list[_LaneState]
+) -> None:
+    """Queue successors that remain within the load's scope."""
+    index, live, shadow = state
+    for target in flow.edges[index]:
+        successor = use.successor(flow, target, live, shadow)
+        if successor is not None:
+            queue.append(successor)
+
+
+def _shader_use_paths(masked: str, flow: _ShaderFlow, origin: int, use: _ShaderUse) -> bool:
+    """Visit finite lane states in expression-distance order, up to the use window."""
+    live = (1 << (use.width or 1)) - 1
+    pending = [(target, live, -1) for target in flow.edges[origin]]
+    seen: set[_LaneState] = set()
+    for distance in range(_USE_WINDOW + 1):
+        later: list[_LaneState] = []
+        while pending:
+            state = pending.pop()
+            index, live, shadow = state
+            if state in seen or index >= len(flow.events) or flow.depths[index] < use.floor:
+                continue
+            kind, start, end = flow.events[index]
+            step = kind in {"expr", "update"} and start < end
+            if step and distance == _USE_WINDOW:
+                continue
+            seen.add(state)
+            if step and shadow < 0:
+                matched, live, shadow = use.expression(masked[start:end], flow.depths[index], live)
+                if matched:
+                    return True
+            if live:
+                queue = later if step else pending
+                _shader_enqueue_successors(flow, use, (index, live, shadow), queue)
+        if not later:
+            break
+        pending = later
     return False
 
 
-def _visible_width(masked: str, spans: list[tuple[int, int]], index: int, name: str) -> int:
-    """Find the nearest visible simple declaration, including an inline initializer."""
-    closed = 0
-    for previous in range(index, -1, -1):
-        start, end = spans[previous]
-        if masked[end - 1] == "}":
-            closed += 1
-        elif masked[end - 1] == "{" and closed:
-            closed -= 1
-        elif not closed:
-            declaration = _GLSL_DECLARATION.match(masked, start, end)
-            if declaration is not None and declaration[2] == name:
-                vector = _GLSL_VECTOR.fullmatch(declaration[1])
-                return int(vector[1]) if vector is not None else 0
-    return 0
+def _use_normalized(
+    masked: str, flow: _ShaderFlow, index: int, name: str, pattern: re.Pattern[str]
+) -> bool:
+    """Track the load's binding and surviving lanes on reachable control-flow edges."""
+    width, lifetime = _visible_binding(masked, flow.events, index, name)
+    use = _ShaderUse(name, pattern, width, flow.depths[index] - lifetime)
+    return _shader_use_paths(masked, flow, index, use)
 
 
 def _load_normalized(
     masked: str,
-    spans: list[tuple[int, int]],
+    flow: _ShaderFlow,
     load: tuple[int, int, int],
     pattern: re.Pattern[str],
     helpers: dict[tuple[str, int, int], bool],
 ) -> bool:
-    """Return whether the pattern acts on a (statement index, start, end) load result."""
+    """Return whether the pattern acts on a (event index, start, end) load result."""
     index, load_start, load_end = load
-    statement = masked[spans[index][0] : spans[index][1]]
+    kind, start, end = flow.events[index]
+    statement = masked[start:end]
     load_start, load_end = unwrap_expression(statement, load_start, load_end)
     if pattern.search(normalization_focus(statement, load_start, load_end)):
         return True
@@ -1061,10 +1358,9 @@ def _load_normalized(
         if helpers[caller]:
             return True
     name = _assigned_name(statement, load_start, load_end)
-    if name is None:
+    if kind not in {"expr", "update"} or name is None:
         return False
-    width = _visible_width(masked, spans, index, name)
-    return _use_normalized((masked, spans), index, name, pattern, width)
+    return _use_normalized(masked, flow, index, name, pattern)
 
 
 def shader_site(shader_path: str, source: str, kind: str) -> str | None:
@@ -1079,14 +1375,21 @@ def shader_site(shader_path: str, source: str, kind: str) -> str | None:
     if pattern is None:
         return None
     masked = mask_literals(source)
-    spans = statement_spans(masked)
+    flow = _ShaderFlow(masked)
     helpers: dict[tuple[str, int, int], bool] = {}
-    for index, (start, end) in enumerate(spans[:_MAX_STATEMENTS]):
+    first_offset: int | None = None
+    for index, (event, start, end) in enumerate(flow.events):
+        if event not in {"expr", "header", "update"}:
+            continue
+        if first_offset is not None and start >= first_offset:
+            continue
         for load_start, load_end in shader_loads(masked[start:end]):
-            if _load_normalized(masked, spans, (index, load_start, load_end), pattern, helpers):
-                line_number = masked.count("\n", 0, start + load_start) + 1
-                return f"{shader_path}:{line_number}"
-    return None
+            if _load_normalized(masked, flow, (index, load_start, load_end), pattern, helpers):
+                first_offset = start + load_start
+                break
+    if first_offset is None:
+        return None
+    return f"{shader_path}:{masked.count(chr(10), 0, first_offset) + 1}"
 
 
 def first_shader_match(

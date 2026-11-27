@@ -2267,6 +2267,146 @@ class VulkanSweepTest(unittest.TestCase):
                 source = shader_line_source(*lines)
                 self.assertEqual(sweep_port_parity.shader_site(path, source, "mask"), expected)
 
+    def test_port_parity_shader_scopes_and_branches(self) -> None:
+        """Track loaded lanes through branch joins and lexical scopes."""
+        load = "uvec4 px = imageLoad(img, pos);"
+        cases = [
+            (
+                "else-reads-live-lane",
+                f"{load} px.g = 0u; if (gate) px.r = 0u; else px.r &= 0xffu;",
+                True,
+            ),
+            (
+                "else-reads-dead-lane",
+                f"{load} px.r = 0u; if (gate) px.g = 0u; else px.r &= 0xffu;",
+                False,
+            ),
+            (
+                "conditional-overwrite",
+                f"{load} if (gate) px.r = 0u; else px.g = 0u; out_px = px.r & 0xffu;",
+                True,
+            ),
+            (
+                "nested-unconditional-overwrite",
+                f"{load} {{ {{ px.r = 0u; }} }} out_px = px.r & 0xffu;",
+                False,
+            ),
+            (
+                "nested-unaffected-lane",
+                f"{load} {{ {{ px.r = 0u; }} }} out_px = px.g & 0xffu;",
+                True,
+            ),
+            (
+                "initializer-reads-outer-live-lane",
+                f"{load} px.r = 0u; {{ uint px = px.g & 0xffu; out_px = px; }}",
+                True,
+            ),
+            (
+                "initializer-reads-outer-dead-lane",
+                f"{load} px.r = 0u; {{ uint px = px.r & 0xffu; out_px = px; }}",
+                False,
+            ),
+            (
+                "load-binding-ends-at-block-exit",
+                f"uvec4 px = uvec4(0u); {{ {load} out_px = px.r; }} out_px = px.r & 0xffu;",
+                False,
+            ),
+            (
+                "outer-binding-survives-block-exit",
+                f"{load} {{ uint px = 0u; out_px = px; }} out_px = px.r & 0xffu;",
+                True,
+            ),
+            (
+                "returning-arm-does-not-reach-join",
+                f"{load} if (gate) {{ return; }} else {{ px.r = 0u; }} out_px = px.r & 0xffu;",
+                False,
+            ),
+        ]
+        for label, body, found in cases:
+            self._assert_port_parity_shader_mask(label, body, found)
+
+    def test_port_parity_shader_loop_edges(self) -> None:
+        """Track loaded lanes through loop edges and loop-local bindings."""
+        load = "uvec4 px = imageLoad(img, pos);"
+        cases = [
+            (
+                "while-condition-shadow-ends-at-loop-exit",
+                f"{load} while (bool px = false) {{}} out_px = px.r & 0xffu;",
+                True,
+            ),
+            (
+                "break-skips-for-increment",
+                f"{load} for (int i = 0; i < 1; out_px = px.r & 0xffu, ++i) {{ break; }}",
+                False,
+            ),
+            (
+                "fallthrough-runs-for-increment",
+                f"{load} for (int i = 0; i < 1; out_px = px.r & 0xffu, ++i) {{}}",
+                True,
+            ),
+            (
+                "load-reaches-next-iteration",
+                (
+                    "uvec4 px = uvec4(0u); for (int i = 0; i < 2; ++i) "
+                    "{ out_px = px.r & 0xffu; px = imageLoad(img, pos); }"
+                ),
+                True,
+            ),
+        ]
+        for body in ("out_px = px & 0xffu;", "{ out_px = px & 0xffu; }"):
+            loop = f"for (uint px = 0u; px < 2u; ++px) {body}"
+            cases.extend(
+                (
+                    ("loop-body-shadow", f"{load} {loop}", False),
+                    ("loop-binding-ends", f"{load} {loop} out_px = px.r & 0xffu;", True),
+                )
+            )
+        for label, body, found in cases:
+            self._assert_port_parity_shader_mask(label, body, found)
+
+    def _assert_port_parity_shader_mask(self, label: str, body: str, found: bool) -> None:
+        cpu = "libavfilter/vf_scope.c"
+        vk = "libavfilter/vf_scope_vulkan.c"
+        shader = "libavfilter/vulkan/scope.comp.glsl"
+        header = (
+            "#version 450\n"
+            "layout(local_size_x = 1) in;\n"
+            "layout(binding = 0, rgba32ui) uniform readonly uimage2D img;\n"
+            "layout(binding = 1, r32ui) uniform writeonly uimage2D dst;\n"
+            "void main() {\n"
+            "    ivec2 pos = ivec2(gl_GlobalInvocationID.xy);\n"
+            "    bool gate = pos.x > 0;\n"
+            "    uint out_px = 0u;\n"
+        )
+        site = f"{shader}:{header.count(chr(10)) + 1}"
+
+        def read_pair(_directory, _head, _paths, sources, _deadline):
+            sources.update({cpu: "out = src[0] & 0xffu;\n", vk: ""})
+
+        with self.subTest(case=label, body=body):
+            source = header + f"    {body}\n    imageStore(dst, pos, uvec4(out_px));\n}}\n"
+            with (
+                unittest.mock.patch.object(sweep_port_parity, "diff_names", return_value={cpu}),
+                unittest.mock.patch.object(
+                    sweep_port_parity, "pair_paths_at_head", return_value={cpu, vk}
+                ),
+                unittest.mock.patch.object(
+                    sweep_port_parity, "read_sources", side_effect=read_pair
+                ),
+                unittest.mock.patch.object(
+                    sweep_port_parity, "linked_shaders", return_value=[shader]
+                ),
+                unittest.mock.patch.object(
+                    sweep_port_parity, "git", return_value=source
+                ) as read_shader,
+            ):
+                report = sweep_port_parity.sweep("unused", "base", "head", time.monotonic() + 5)
+            read_shader.assert_called_once()
+            self.assertEqual(
+                [line for line in report.splitlines() if line.startswith(f"| {cpu}:")],
+                [f"| {cpu}:1 | mask | {site if found else 'none'} | TODO |"],
+            )
+
     def test_shader_vector_component_provenance(self) -> None:
         """Overwriting vector lanes invalidates aliases but preserves untouched lanes."""
         site = "s.comp.glsl:3"

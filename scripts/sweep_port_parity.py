@@ -1170,7 +1170,24 @@ _COUNTED_VALUE = re.compile(
 _COUNTED_ASSIGN = re.compile(
     rf"(?:(?:{_COUNTED_TYPE})\s+)?{_COUNTED_NAME}\s*=\s*(.+)", re.ASCII | re.DOTALL
 )
-_COUNTED_OVERLOAD = re.compile(r"\b[A-Za-z_]\w*\s+(?:clamp|imageLoad)\s*\(", re.ASCII)
+_COUNTED_CALL = re.compile(r"\b(clamp|imageLoad)\s*\(", re.ASCII)
+_COUNTED_GLOBAL_TOKEN = re.compile(r"[{}]|\b(clamp|imageLoad)\s*(?=\()", re.ASCII)
+
+
+def _counted_ambiguous_calls(masked: str) -> set[str]:
+    """Treat file-scope call-shaped names as possible function declarations."""
+    names: set[str] = set()
+    depth = 0
+    for token in _COUNTED_GLOBAL_TOKEN.finditer(masked):
+        if token[0] == "{":
+            depth += 1
+        elif token[0] == "}":
+            depth -= 1
+        elif depth == 0:
+            # GLSL declares functions at file scope. Do not parse the return type
+            # or try to distinguish prototypes from global initializer calls.
+            names.add(token[1])
+    return names
 
 
 def _counted_assignment(text: str, counter: str) -> bool:
@@ -1238,8 +1255,14 @@ def _counted_steps(body: list[str], update: str, counter: str) -> bool:
     return all(_counted_assignment(text, counter) for text in statements[:-1])
 
 
-def _counted_proof(masked: str, events: list[_ShaderEvent], opening: int, close: int) -> int | None:
-    """Return the exact small count, or decline without inspecting body values."""
+def _counted_proof(
+    masked: str,
+    events: list[_ShaderEvent],
+    opening: int,
+    close: int,
+    ambiguous_calls: set[str],
+) -> int | None:
+    """Return the exact small count only for whitelisted, unambiguous steps."""
     _, start, end = events[opening + 2]
     init = _counted_initializer(masked, events, opening)
     proof = _counted_distance(init, masked[start:end].strip())
@@ -1248,7 +1271,14 @@ def _counted_proof(masked: str, events: list[_ShaderEvent], opening: int, close:
     counter, count = proof
     body = [masked[start:end].strip() for _, start, end in events[opening + 6 : close]]
     _, start, end = events[close + 2]
-    return count if _counted_steps(body, masked[start:end].strip(), counter) else None
+    update = masked[start:end].strip()
+    if ambiguous_calls and any(
+        call[1] in ambiguous_calls
+        for text in (*body, update)
+        for call in _COUNTED_CALL.finditer(text)
+    ):
+        return None
+    return count if _counted_steps(body, update, counter) else None
 
 
 _COUNTED_VERSION = re.compile(
@@ -1282,8 +1312,7 @@ def _shader_proof_safe(source: str) -> bool:
 
 def _counted_events(masked: str, events: list[_ShaderEvent]) -> list[_ShaderEvent]:
     """Expand proven loops within the event budget, retaining spans for load matching."""
-    if _COUNTED_OVERLOAD.search(masked):
-        return events
+    ambiguous_calls = _counted_ambiguous_calls(masked)
     expanded: list[_ShaderEvent] = []
     cursor = growth = 0
     for opening, (kind, _, _) in enumerate(events):
@@ -1292,7 +1321,7 @@ def _counted_events(masked: str, events: list[_ShaderEvent]) -> list[_ShaderEven
         close = _counted_body(events, opening)
         if close is None:
             continue
-        count = _counted_proof(masked, events, opening, close)
+        count = _counted_proof(masked, events, opening, close, ambiguous_calls)
         if count is None:
             continue
         # Charge every copied event beyond the first iteration, without credit

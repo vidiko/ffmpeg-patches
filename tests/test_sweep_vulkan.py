@@ -2427,6 +2427,34 @@ class VulkanSweepTest(unittest.TestCase):
                 self.assertEqual(source[start:end].strip(), "x = imageLoad(img, ivec2(0))")
                 self.assertEqual(source.count("\n", 0, start) + 1, 12)
 
+    def test_port_parity_shader_array_return_overload_declines_counted_proof(self) -> None:
+        """Retain the back edge for the overload, but expand an unrelated loop."""
+        source = (
+            "#version 450\n"
+            "layout(location = 0) out vec4 color;\n"
+            "vec4[1] clamp(bool v, float lo, float hi) {\n"
+            "    discard;\n"
+            "    return vec4[1](vec4(0.0));\n"
+            "}\n"
+            "void main() {\n"
+            "    vec4 tmp[1];\n"
+            "    vec4 x = vec4(0.0);\n"
+            "    for (int i = 0; i < 2; x = vec4(1.0)) {\n"
+            "        tmp = clamp(true, 0.0, 1.0);\n"
+            "        ++i;\n"
+            "    }\n"
+            "    color = x;\n"
+            "}\n"
+        )
+        kinds = [kind for kind, _, _ in self._counted_for_events(source)]
+        self.assertEqual(kinds.count("repeat"), 1)
+
+        unrelated = source.replace(
+            "    color = x;", "    for (int j = 0; j < 2; ++j) { x = vec4(0.0); }\n    color = x;"
+        )
+        kinds = [kind for kind, _, _ in self._counted_for_events(unrelated)]
+        self.assertEqual(kinds.count("repeat"), 1)
+
     def test_port_parity_shader_counted_for(self) -> None:
         """Match update loads at their source line, including uses on the second iteration."""
         for bound, after, expected in (

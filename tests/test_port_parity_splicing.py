@@ -9,7 +9,7 @@ class PortParitySplicingTests(unittest.TestCase):
     """Check reachable normalization and physical load anchors after line splicing."""
 
     def test_clamp_requires_load_in_value_argument(self) -> None:
-        """Nested commas do not split clamp arguments, and bounds do not count."""
+        """Grouped and conditional-middle commas do not split clamp arguments."""
         for newline in ("\n", "\r\n", "\r"):
             for spliced in (False, True):
                 read = "imageLoad(img, ivec2(0)).r"
@@ -21,6 +21,12 @@ class PortParitySplicingTests(unittest.TestCase):
                     (f"clamp(0u, {read}, 0xffffffffu)", None),
                     (f"clamp(0u, 0u, {read})", None),
                     (f"clamp(0u, 0u, (pick(({read}), 0u)))", None),
+                    (f"clamp(gl_FragCoord.x > 0.0 ? 0u, {read} : 0u, 0u, 7u)", "fixture.frag:7"),
+                    (f"clamp(gl_FragCoord.x > 0.0 ? (0u, {read}) : 0u, 0u, 7u)", "fixture.frag:7"),
+                    (f"clamp(0u, gl_FragCoord.x > 0.0 ? 0u, {read} : 0u, 7u)", None),
+                    (f"clamp(0u, gl_FragCoord.x > 0.0 ? (0u, {read}) : 0u, 7u)", None),
+                    (f"clamp(0u, 0u, gl_FragCoord.x > 0.0 ? 0u, {read} : 7u)", None),
+                    (f"clamp(0u, 0u, gl_FragCoord.x > 0.0 ? (0u, {read}) : 7u)", None),
                 ):
                     with self.subTest(newline=repr(newline), spliced=spliced, expr=expr):
                         source = newline.join(

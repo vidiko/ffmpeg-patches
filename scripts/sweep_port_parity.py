@@ -244,7 +244,7 @@ def enclosing_clip_focus(statement: str, read_start: int, read_end: int) -> str 
                 continue
             if pattern is CLAMP:
                 value_end = next(
-                    iter(_top_level_separators(statement, open_index + 1, close_index, ",")),
+                    _call_argument_separators(statement, open_index + 1, close_index),
                     close_index,
                 )
                 if read_end > value_end:
@@ -747,6 +747,20 @@ def _call_name_before(statement: str, open_index: int) -> str | None:
     return statement[span[0] : span[1] + 1]
 
 
+def _call_argument_separators(text: str, start: int, end: int) -> Iterator[int]:
+    """Yield call-separating commas, skipping conditional middle operands."""
+    pending = 0
+    for index in _top_level_separators(text, start, end, "?,:"):
+        ch = text[index]
+        if ch == "?":
+            pending += 1
+        elif ch == ":":
+            if pending:
+                pending -= 1
+        elif pending == 0:
+            yield index
+
+
 def _call_argument_slot(
     statement: str, open_index: int, load_start: int, load_end: int
 ) -> tuple[int, int] | None:
@@ -754,7 +768,7 @@ def _call_argument_slot(
     close_index = matching_close_paren(statement, open_index)
     if close_index is None or load_end > close_index:
         return None
-    ends = [*_top_level_separators(statement, open_index + 1, close_index, ","), close_index]
+    ends = [*_call_argument_separators(statement, open_index + 1, close_index), close_index]
     arity = len(ends)
     arg_start = open_index + 1
     for position, arg_end in enumerate(ends):

@@ -40,6 +40,8 @@ REPORT_TABLES = {
     "unchecked-return": TABLE,
     "state-advance": "| file:line | expression | first earlier error return line | disposition |",
     "doc-claims": "| file:line | claim text | library | oldest | newest | disposition |",
+    "vulkan-features": "| file:line | feature | shader evidence | direction | disposition |",
+    "port-parity": "| file:line | normalization | shader site | disposition |",
 }
 REVIEW_TABLE = "| class | question | disposition |"
 REVIEW_SEPARATOR = "| --- | --- | --- |"
@@ -57,6 +59,12 @@ MAX_SOURCE_COUNT = 4096
 MAX_TARGET_COUNT = 512
 MAX_SWEEP_SECONDS = 120
 MAX_GIT_BYTES = 32 * 1024 * 1024
+
+
+class SweepPrerequisiteError(RuntimeError):
+    """Raised when a sweep class cannot run because a required tool or input is missing."""
+
+
 GIT_LOCATION_NAMES = frozenset(
     {
         "GIT_ALTERNATE_OBJECT_DIRECTORIES",
@@ -778,7 +786,7 @@ def validate_review_classes(lines: list[str], sha: str, classes: list[dict]) -> 
 
 
 def validate_full_report(path: Path, sha: str, class_file: Path = CLASS_FILE) -> bool:
-    """Require the three reviewed sweep tables plus all recurring review class answers."""
+    """Require every REPORT_TABLES sweep section plus all recurring review class answers."""
     with path.open("rb") as stream:
         data = stream.read(MAX_REPORT_BYTES + 1)
     check_limit("report size", len(data), MAX_REPORT_BYTES)
@@ -807,8 +815,21 @@ def validate_full_report(path: Path, sha: str, class_file: Path = CLASS_FILE) ->
     return validate_review_classes(sections["review-classes"], sha, classes)
 
 
+def _register_running_validator() -> None:
+    """Register the executing validator under scripts.variant_sweep when run as __main__."""
+    if "scripts.variant_sweep" in sys.modules:
+        return
+    target = Path(__file__).resolve()
+    for module in sys.modules.values():
+        path = getattr(module, "__file__", None)
+        if path is not None and Path(path).resolve() == target:
+            sys.modules["scripts.variant_sweep"] = module
+            return
+
+
 def sibling_module(name: str):
     """Load a helper only from the resolved directory containing this validator."""
+    _register_running_validator()
     path = Path(__file__).resolve().with_name(f"{name}.py")
     spec = importlib.util.spec_from_file_location(f"_ffmpeg_sweep_{name}", path)
     if spec is None or spec.loader is None:
@@ -830,8 +851,23 @@ def sweep_all(directory: str, base: str, head: str) -> str:
     metadata = report.splitlines()
     base = metadata[1].removeprefix("base: ")
     head = metadata[2].removeprefix("head: ")
-    for name in ("state_advance", "doc_claims"):
-        report += "\n" + sweep_class(name, directory, base, head, deadline)
+    for name in ("state_advance", "doc_claims", "vulkan_features", "port_parity"):
+        try:
+            report += "\n" + sweep_class(name, directory, base, head, deadline)
+        except SweepPrerequisiteError as error:
+            if name != "vulkan_features":
+                raise
+            section = name.replace("_", "-")
+            table = REPORT_TABLES["vulkan-features"]
+            separator = "| " + " | ".join(["---"] * (table.count("|") - 1)) + " |"
+            diagnostic = "".join(
+                char if char.isprintable() else ascii(char)[1:-1] for char in str(error)
+            ).replace("|", "&#124;")
+            report += (
+                f"\nclass: {section}\nhead: {head}\n\n"
+                f"{table}\n{separator}\n"
+                f"| - | - | prerequisite: {diagnostic} | unanalyzed | TODO |\n"
+            )
         check_limit("report size", len(report.encode("utf-8")), MAX_REPORT_BYTES)
     report += "\n" + render_review_classes(head)
     check_deadline(deadline)

@@ -2325,6 +2325,70 @@ class VulkanSweepTest(unittest.TestCase):
         for label, body, found in cases:
             self._assert_port_parity_shader_mask(label, body, found)
 
+    def test_port_parity_shader_public_regressions(self) -> None:
+        """Check mask-site lines for structured syntax and mixed line endings."""
+        preamble = (
+            "#version 450\n"
+            "layout(set = 0, binding = 0, r32ui) readonly uniform uimage2D img;\n"
+            "layout(location = 0) out uint color;\n"
+        )
+        load = "    uint px = imageLoad(img, ivec2(0)).r;\n"
+        mask = "    color = px & 0xffu;\n"
+        direct = "    color = imageLoad(img, ivec2(0)).r & 0xffu;\n"
+        main = "void main() {\n"
+        cases = (
+            ("do", preamble + main + load + "    do {} while (false);\n" + mask, 5),
+            ("initializer", preamble + main + load + "    uint lut[2] = {0u, 1u};\n" + mask, 5),
+            (
+                "switch",
+                preamble
+                + "layout(location = 1) flat in int mode;\n"
+                + main
+                + "    switch (mode) {\n"
+                + "        case 0: color = 0u; break;\n"
+                + "        case 1: color = imageLoad(img, ivec2(0)).r & 0xffu; break;\n"
+                + "    }\n",
+                8,
+            ),
+            ("bare CR comment", preamble + main + "    // comment\r" + direct, 6),
+            ("inactive return", preamble + main + load + "#if 0\n    return;\n#endif\n" + mask, 5),
+            ("mixed endings", preamble.replace("img;\n", "img;\r") + main + direct, 5),
+        )
+        for name, body, line in cases:
+            with self.subTest(name=name):
+                self.assertEqual(
+                    sweep_port_parity.shader_site("fixture.frag", body + "}\n", "mask"),
+                    f"fixture.frag:{line}",
+                )
+
+    def test_port_parity_shader_structured_edges(self) -> None:
+        """Check mask sites across loop jumps, case fallthrough, and returns."""
+        preamble = (
+            "#version 450\r\n"
+            "layout(set = 0, binding = 0, r32ui) readonly uniform uimage2D img;\r\n"
+            "layout(location = 0) out uint color;\n"
+            "layout(location = 1) flat in int mode;\n"
+            "void main() {\n"
+            "    uint px = 0u;\n"
+        )
+        load = "px = imageLoad(img, ivec2(0)).r;"
+        mask = "color = px & 0xffu;"
+        for body, expected in (
+            (f"do {{ {load} continue; }} while (false);\n{mask}", "fixture.frag:7"),
+            (f"do {{ {load} break; }} while (true);\n{mask}", "fixture.frag:7"),
+            (f"do {{ return; }} while (false);\n{load} {mask}", None),
+            (f"switch (mode) {{ case 0: {load} case 1: {mask} break; }}", "fixture.frag:7"),
+            (f"{load}\n#ifdef STOP\nreturn;\n#endif\n{mask}", "fixture.frag:7"),
+            (f"{load}\nreturn;\n{mask}", None),
+        ):
+            with self.subTest(body=body):
+                self.assertEqual(
+                    sweep_port_parity.shader_site(
+                        "fixture.frag", preamble + body + "\n}\n", "mask"
+                    ),
+                    expected,
+                )
+
     def test_port_parity_shader_for_literal_conditions(self) -> None:
         """Check load reachability and loop exits for literal and omitted tests."""
         load = "x = imageLoad(img, ivec2(0))"

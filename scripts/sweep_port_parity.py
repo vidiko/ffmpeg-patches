@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import re
 import sys
+from bisect import bisect_right
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -21,7 +22,6 @@ from scripts.sweep_vulkan_features import (  # noqa: E402
     owners_for_shaders,
 )
 from scripts.variant_sweep import (  # noqa: E402
-    LITERALS,
     MAX_REPORT_BYTES,
     REPORT_TABLES,
     check_deadline,
@@ -148,11 +148,11 @@ def collect_pairs(
     return pairs
 
 
-def statement_spans(masked: str) -> list[tuple[int, int]]:
-    """Return statement spans ending at ;, { or } at parenthesis depth 0, without a blank tail."""
+def statement_spans(masked: str, *, shader: bool = False) -> list[tuple[int, int]]:
+    """Split at top-level statement delimiters; keep GLSL initializer lists intact."""
     spans: list[tuple[int, int]] = []
     start = 0
-    paren_depth = 0
+    paren_depth = initializer_depth = 0
     index = 0
     limit = len(masked)
     while index < limit:
@@ -162,7 +162,16 @@ def statement_spans(masked: str) -> list[tuple[int, int]]:
         elif ch == ")":
             if paren_depth > 0:
                 paren_depth -= 1
-        elif paren_depth == 0 and ch in ";{}":
+        elif (
+            shader
+            and paren_depth == 0
+            and ch == "{"
+            and (initializer_depth or masked[start:index].rstrip().endswith("="))
+        ):
+            initializer_depth += 1
+        elif initializer_depth and paren_depth == 0 and ch == "}":
+            initializer_depth -= 1
+        elif paren_depth == initializer_depth == 0 and ch in ";{}":
             end = index + 1
             spans.append((start, end))
             start = end
@@ -1081,6 +1090,16 @@ def _shader_schedule_statement(
         events.append(("enter", start, start + 1))
         pending.append(("block", depth + 1, 0))
         return start + 1
+    if _whole_word_at(masked, start, "do"):
+        events.append(("do", 0, 0))
+        pending.extend((("join", 0, 0), ("do_tail", 0, 0)))
+        _shader_schedule_body(events, pending, depth)
+        return start + 2
+    label = _shader_label(masked, start, boundary)
+    if label is not None:
+        events.append(label)
+        pending.append(("statement", depth, 0))
+        return label[2]
     control = _shader_control(masked, start, boundary)
     if control is not None and _shader_schedule_control(scan, control, depth, events, pending):
         return control[2] + 1
@@ -1094,29 +1113,74 @@ def _shader_schedule_statement(
     return boundary
 
 
+def _shader_label(masked: str, start: int, boundary: int) -> _ShaderEvent | None:
+    word = _IDENTIFIER.match(masked, start, boundary)
+    if word is None or word[0] not in {"case", "default"}:
+        return None
+    ternaries = 0
+    for position in _top_level_separators(masked, word.end(), boundary, "?:"):
+        if masked[position] == "?":
+            ternaries += 1
+        elif ternaries:
+            ternaries -= 1
+        else:
+            return word[0], start, position + 1
+    return None
+
+
+def _shader_do_tail(
+    scan: tuple[str, bool], cursor: int, boundary: int, events: list[_ShaderEvent]
+) -> int:
+    masked, proof_safe = scan
+    control = _shader_control(masked, cursor, boundary)
+    if control is None or control[0] != "while":
+        return cursor
+    _, first, close = control
+    semicolon = _skip_space(masked, close + 1, boundary)
+    if semicolon == boundary or masked[semicolon] != ";":
+        return cursor
+    events.append(("do_test", first, close))
+    condition = masked[first:close].strip() if proof_safe else ""
+    kind = {"true": "do_repeat", "false": "do_exit"}.get(condition, "do_branch")
+    events.append((kind, 0, 0))
+    return semicolon + 1
+
+
 def _shader_events(masked: str, *, proof_safe: bool = False) -> list[_ShaderEvent]:
     """Split shader statements into expression, lexical-scope and control events."""
-    scan = (masked, proof_safe)
-    spans = statement_spans(masked)
-    complete = len(spans) <= _MAX_STATEMENTS
-    spans = spans[:_MAX_STATEMENTS]
+    spans = statement_spans(masked, shader=True)
     if not spans:
         return []
-    limit = spans[-1][1]
-    boundaries = iter(end for _, end in spans)
-    boundary = next(boundaries)
+    complete = len(spans) <= _MAX_STATEMENTS
+    spans = spans[:_MAX_STATEMENTS]
+    events, closed = _shader_scan_events((masked, proof_safe), [end for _, end in spans])
+    return _counted_events(masked, events) if complete and closed and proof_safe else events
+
+
+def _shader_scan_events(scan: tuple[str, bool], ends: list[int]) -> tuple[list[_ShaderEvent], bool]:
+    """Consume bounded statements and report whether the event scan finished."""
+    masked, _ = scan
+    limit = ends[-1]
+    complete = True
     events: list[_ShaderEvent] = []
     # Private continuations share the tuple shape but are never emitted.
     pending: list[_ShaderEvent] = [("root", 0, 0)]
     cursor = 0
     while pending:
+        if len(events) >= 8 * _MAX_STATEMENTS:
+            events.append(("stop", 0, 0))
+            complete = False
+            break
         kind, first, end = pending.pop()
-        if kind not in {"root", "block", "statement", "else"}:
+        if kind not in {"root", "block", "statement", "else", "do_tail"}:
             events.append((kind, first, end))
             continue
         cursor = _skip_space(masked, cursor, limit)
         if kind == "else":
             cursor = _shader_schedule_else(masked, (cursor, limit), first, events, pending)
+            continue
+        if kind == "do_tail":
+            cursor = _shader_scan_do_tail(scan, cursor, ends, events)
             continue
         if kind == "block" and (cursor == limit or masked[cursor] == "}"):
             end = min(cursor + 1, limit)
@@ -1132,10 +1196,18 @@ def _shader_events(masked: str, *, proof_safe: bool = False) -> list[_ShaderEven
             break
         if kind != "statement":
             pending.append((kind, first, end))
-        while boundary <= cursor:
-            boundary = next(boundaries)
+        boundary = ends[bisect_right(ends, cursor)]
         cursor = _shader_schedule_statement(scan, (cursor, boundary), first, events, pending)
-    return _counted_events(masked, events) if complete and proof_safe else events
+    return events, complete
+
+
+def _shader_scan_do_tail(
+    scan: tuple[str, bool], cursor: int, ends: list[int], events: list[_ShaderEvent]
+) -> int:
+    """Consume a do-loop tail only when it starts inside the scan window."""
+    if cursor >= ends[-1]:
+        return cursor
+    return _shader_do_tail(scan, cursor, ends[bisect_right(ends, cursor)], events)
 
 
 def _shader_schedule_else(
@@ -1281,6 +1353,90 @@ def _counted_proof(
     return count if _counted_steps(body, update, counter) else None
 
 
+_GLSL_NEWLINE = re.compile(r"\r\n|[\r\n]")
+_GLSL_LITERALS = re.compile(
+    r"(?m:^[ \t]*\#(?:\\\n|[^\n])*)|//[^\n]*|/\*.*?\*/"
+    r"""|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*' """.rstrip(),
+    re.S,
+)
+
+
+def _glsl_lexical_view(source: str) -> str:
+    """Make every physical line end in LF in the lexer view, without shifting offsets."""
+    return source.replace("\r\n", " \n").replace("\r", "\n")
+
+
+def _glsl_blank(text: str) -> str:
+    return re.sub(r"[^\r\n]", " ", text)
+
+
+def _shader_directive_view(source: str) -> str:
+    """Keep CRLF continuations visible to the lexer without shifting offsets."""
+    # Move the space representing CR before the continuation backslash.
+    return re.sub(
+        r"\\ \n",
+        lambda match: " \\" + "\n" if source[match.start() + 1] == "\r" else match[0],
+        _glsl_lexical_view(source),
+    )
+
+
+def _shader_arm_activity(
+    parent: bool | None, available: bool, possible: bool, truth: bool | None
+) -> bool | None:
+    """Classify a preprocessor arm as dead, live, or uncertain."""
+    if parent is False or not possible or truth is False:
+        return False
+    if parent is True and available and truth is True:
+        return True
+    return None
+
+
+def _shader_mask(source: str) -> tuple[str, list[int], list[int]]:
+    """Blank known-dead arms and record spans belonging to uncertain arms."""
+    # Each frame holds the parent's activity, whether no earlier arm could
+    # have matched, and whether no earlier arm must have matched.
+    stack: list[tuple[bool | None, bool, bool]] = []
+    active: bool | None = True
+    pieces: list[str] = []
+    uncertain_starts: list[int] = []
+    uncertain_ends: list[int] = []
+    cursor = 0
+    view = _shader_directive_view(source)
+    for match in _GLSL_LITERALS.finditer(view):
+        start, end = match.span()
+        text = source[cursor:start]
+        pieces.append(_glsl_blank(text) if active is False else text)
+        if active is None and cursor < start:
+            uncertain_starts.append(cursor)
+            uncertain_ends.append(start)
+        pieces.append(_glsl_blank(source[start:end]))
+        cursor = end
+        directive = re.match(r"[ \t]*#[ \t]*(\w+)\b(.*)", match[0], re.S)
+        if directive is None:
+            continue
+        name, argument = directive[1], directive[2].strip()
+        if name == "endif" and stack:
+            active = stack.pop()[0]
+            continue
+        if name in {"if", "ifdef", "ifndef"}:
+            parent, available, possible = active, True, True
+        elif name in {"elif", "else"} and stack:
+            parent, available, possible = stack.pop()
+        else:
+            continue
+        truth = True if name == "else" else None
+        if name in {"if", "elif"}:
+            truth = {"0": False, "1": True}.get(argument)
+        active = _shader_arm_activity(parent, available, possible, truth)
+        stack.append((parent, available and truth is False, possible and truth is not True))
+    text = source[cursor:]
+    pieces.append(_glsl_blank(text) if active is False else text)
+    if active is None and text:
+        uncertain_starts.append(cursor)
+        uncertain_ends.append(len(source))
+    return "".join(pieces), uncertain_starts, uncertain_ends
+
+
 _COUNTED_VERSION = re.compile(
     r"[ \t]*#[ \t]*version[ \t]+450(?:[ \t]+(?:core|compatibility))?[ \t]*\r?"
 )
@@ -1296,7 +1452,7 @@ def _shader_proof_safe(source: str) -> bool:
     # single line without inline comments. Whitespace and comments may precede it.
     leading = True
     cursor = 0
-    for match in LITERALS.finditer(source):
+    for match in _GLSL_LITERALS.finditer(_glsl_lexical_view(source)):
         if source[cursor : match.start()].strip():
             leading = False
         text = match[0]
@@ -1358,6 +1514,8 @@ class _ShaderFrame:
         self.alternate: int | None = None
         self.breaks: list[int] = []
         self.continues: list[int] = []
+        self.labels: list[int] = []
+        self.has_default = False
 
     def finish(self, edges: list[tuple[int, ...]], end: int) -> None:
         """Connect the optional arm and all breaks to their destinations."""
@@ -1381,40 +1539,56 @@ def _shader_jump(
     edges[index] = ()
     if word == "break":
         for frame in reversed(frames):
-            if frame.kind in {"loop", "switch"}:
+            if frame.kind in {"loop", "do", "switch"}:
                 frame.breaks.append(index)
                 return
     if word == "continue":
         for frame in reversed(frames):
-            if frame.kind == "loop":
+            if frame.kind in {"loop", "do"}:
                 frame.continues.append(index)
                 return
 
 
 def _shader_finish_frame(frame: _ShaderFrame, edges: list[tuple[int, ...]], index: int) -> None:
     """Resolve a join, with only break edges exiting an always-true loop."""
-    if frame.kind == "loop" and frame.branch == frame.opening:
-        for origin in frame.breaks:
-            edges[origin] = (index,)
-    else:
+    if frame.kind == "switch":
+        edges[frame.opening] = tuple(frame.labels) + (() if frame.has_default else (index,))
+    elif frame.kind == "loop" and frame.branch != frame.opening or frame.kind == "if":
         frame.finish(edges, index)
+        return
+    for origin in frame.breaks:
+        edges[origin] = (index,)
+
+
+def _shader_record_label(kind: str, index: int, frames: list[_ShaderFrame]) -> None:
+    """Attach a label to the innermost enclosing switch, if any."""
+    for frame in reversed(frames):
+        if frame.kind == "switch":
+            frame.labels.append(index)
+            frame.has_default |= kind == "default"
+            return
 
 
 def _shader_control_edge(
     kind: str, index: int, frames: list[_ShaderFrame], edges: list[tuple[int, ...]]
 ) -> None:
     """Resolve branches, loop back edges and pending abrupt transfers."""
-    if kind in {"if", "switch", "loop"}:
+    if kind in {"if", "switch", "loop", "do"}:
         frames.append(_ShaderFrame(kind, index))
+    elif kind in {"case", "default"}:
+        _shader_record_label(kind, index, frames)
+    elif kind in {"do_test", "update"}:
+        for origin in frames[-1].continues:
+            edges[origin] = (index,)
+    elif kind in {"do_repeat", "do_branch"}:
+        back = frames[-1].opening + 1
+        edges[index] = (back,) if kind == "do_repeat" else (back, index + 1)
     elif kind in {"test", "never"}:
         frames[-1].branch = index
         frames[-1].exit_only = kind == "never"
     # An "always" event keeps its fallthrough and leaves branch at opening.
     elif kind == "alternate":
         frames[-1].alternate = index
-    elif kind == "update":
-        for origin in frames[-1].continues:
-            edges[origin] = (index,)
     elif kind == "repeat":
         edges[index] = (frames[-1].opening + 1,)
     elif kind == "join":
@@ -1427,9 +1601,16 @@ class _ShaderFlow:
     @classmethod
     def from_source(cls, source: str) -> _ShaderFlow:
         proof_safe = _shader_proof_safe(source)
-        return cls(mask_literals(source), proof_safe=proof_safe)
+        masked, starts, ends = _shader_mask(source)
+        return cls(masked, proof_safe=proof_safe, uncertain=(starts, ends))
 
-    def __init__(self, masked: str, *, proof_safe: bool = False) -> None:
+    def __init__(
+        self,
+        masked: str,
+        *,
+        proof_safe: bool = False,
+        uncertain: tuple[list[int], list[int]] | None = None,
+    ) -> None:
         self.masked = masked
         self.events = _shader_events(masked, proof_safe=proof_safe)
         self.edges: list[tuple[int, ...]] = [(i + 1,) for i in range(len(self.events))]
@@ -1446,6 +1627,24 @@ class _ShaderFlow:
                     _shader_jump(word[0], index, frames, self.edges)
             if kind in {"stop", "header"}:
                 self.edges[index] = ()
+        if uncertain is not None:
+            self._restore_uncertain_fallthrough(*uncertain)
+
+    def _restore_uncertain_fallthrough(self, starts: list[int], ends: list[int]) -> None:
+        """Keep fallthrough possible when preprocessing might remove a jump."""
+        for index, (kind, start, end) in enumerate(self.events):
+            if kind not in {"expr", "default"}:
+                continue
+            span = bisect_right(starts, start) - 1
+            if span < 0 or start >= ends[span]:
+                continue
+            word = _IDENTIFIER.match(self.masked, start, end)
+            if (
+                word is not None
+                and word[0] in {"return", "discard", "break", "continue"}
+                and index + 1 not in self.edges[index]
+            ):
+                self.edges[index] += (index + 1,)
 
     def reachable(self) -> set[int]:
         """Follow control edges from the source entry and independent header/body entries."""
@@ -1550,7 +1749,7 @@ def _shader_use_paths(masked: str, flow: _ShaderFlow, origin: int, use: _ShaderU
             if state in seen or index >= len(flow.events) or flow.depths[index] < use.floor:
                 continue
             kind, start, end = flow.events[index]
-            step = kind in {"expr", "update"} and start < end
+            step = kind in {"expr", "update", "do_test"} and start < end
             if step and distance == _USE_WINDOW:
                 continue
             seen.add(state)
@@ -1597,7 +1796,7 @@ def _load_normalized(
         if helpers[caller]:
             return True
     name = _assigned_name(statement, load_start, load_end)
-    if kind not in {"expr", "update"} or name is None:
+    if kind not in {"expr", "update", "do_test"} or name is None:
         return False
     return _use_normalized(masked, flow, index, name, pattern)
 
@@ -1619,7 +1818,7 @@ def shader_site(shader_path: str, source: str, kind: str) -> str | None:
     helpers: dict[tuple[str, int, int], bool] = {}
     first_offset: int | None = None
     for index, (event, start, end) in enumerate(flow.events):
-        if index not in reachable or event not in {"expr", "header", "update"}:
+        if index not in reachable or event not in {"expr", "header", "update", "do_test"}:
             continue
         if first_offset is not None and start >= first_offset:
             continue
@@ -1629,7 +1828,8 @@ def shader_site(shader_path: str, source: str, kind: str) -> str | None:
                 break
     if first_offset is None:
         return None
-    return f"{shader_path}:{masked.count(chr(10), 0, first_offset) + 1}"
+    line = 1 + sum(1 for _ in _GLSL_NEWLINE.finditer(source, 0, first_offset))
+    return f"{shader_path}:{line}"
 
 
 def first_shader_match(

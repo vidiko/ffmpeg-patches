@@ -2030,8 +2030,6 @@ class VulkanSweepTest(unittest.TestCase):
             ("compound_mask", ("px &= 0xffu;",), site),
             ("parenthesized_target", ("((px)) = flags;", output), None),
             ("parenthesized_assignment", ("((px = flags));", output), None),
-            ("indexed_sub_write", ("px[0] = flags;", output), site),
-            ("member_sub_write", ("px.r = flags;", output), site),
         ]
         for label, tail, expected in cases:
             with self.subTest(label=label):
@@ -2125,6 +2123,105 @@ class VulkanSweepTest(unittest.TestCase):
                 }
             ),
         )
+
+    def test_shift_count_normalization_is_not_sample_normalization(self) -> None:
+        """Verify that CPU and shader site detection distinguish normalization of the
+        shift count from normalization of the sample.
+        """
+        site = "s.comp.glsl:3"
+        load = "imageLoad(img, pos).r"
+        for call in ("clamp", "av_clip", "CLIP"):
+            count = f"{call}(n, 0, 7)"
+            for rhs, kind in (
+                (f"src[0] >> {count}", "shift"),
+                (f"src[0] >> ({count})", "shift"),
+                (f"(src[0] >> {count}) & 0xffu", "mask"),
+            ):
+                with self.subTest(rhs=rhs):
+                    self.assertEqual(sweep_port_parity.cpu_sites(f"out = {rhs};"), [(1, kind)])
+
+        for line, kind in (
+            ("out = av_clip(src[0] >> clamp(n, 0, 7), 0, 255);", "clip"),
+            ("for (unsigned v = src[0]; v; v >>= clamp(n, 0, 7)) {}", "shift"),
+        ):
+            with self.subTest(line=line):
+                self.assertEqual(sweep_port_parity.cpu_sites(line), [(1, kind)])
+
+        for rhs, mask in (
+            (f"{load} >> clamp(n, 0, 7)", None),
+            (f"{load} >> (clamp(n, 0, 7))", None),
+            (f"{load} >> clamp(n & 0xffu, 0, 7)", None),
+            (f"{load} >> av_clip(n, 0, 7)", None),
+            (f"({load} >> clamp(n, 0, 7)) & 0xffu", site),
+        ):
+            with self.subTest(shader_rhs=rhs):
+                source = shader_line_source(f"uint out_px = {rhs};")
+                for kind, expected in (
+                    ("shift", site),
+                    ("mask", mask),
+                    ("clamp", None),
+                    ("clip", None),
+                ):
+                    self.assertEqual(
+                        sweep_port_parity.shader_site("s.comp.glsl", source, kind), expected, kind
+                    )
+
+        for arg, clamp in (("n", None), ("px", site)):
+            with self.subTest(compound_count=arg):
+                source = shader_line_source(f"uint px = {load};", f"px >>= clamp({arg}, 0, 7);")
+                self.assertEqual(
+                    sweep_port_parity.shader_site("s.comp.glsl", source, "shift"), site
+                )
+                self.assertEqual(
+                    sweep_port_parity.shader_site("s.comp.glsl", source, "clamp"), clamp
+                )
+
+    def test_shader_binding_stops_at_assignment_rhs_comma(self) -> None:
+        """Verify that shader mask detection respects the comma that ends an assignment's
+        right-hand side without stopping at commas in nested calls.
+        """
+        site = "s.comp.glsl:3"
+        for line, expected in (
+            ("px = flags, emit(px & 0xffu);", None),
+            ("(px = flags), emit(px & 0xffu);", None),
+            ("((px = flags, emit(px & 0xffu)));", None),
+            ("px = px & 0xffu, emit(px);", site),
+            ("px = combine(flags, inner(0u, px & 0xffu)), emit(px);", site),
+            ("px = combine(flags, inner(0u, flags)), emit(px & 0xffu);", None),
+            ("px &= 0xffu, emit(px);", site),
+        ):
+            with self.subTest(line=line):
+                source = shader_line_source("uint px = imageLoad(img, pos).r;", line)
+                self.assertEqual(
+                    sweep_port_parity.shader_site("s.comp.glsl", source, "mask"), expected
+                )
+
+    def test_shader_vector_component_provenance(self) -> None:
+        """Overwriting vector lanes invalidates aliases but preserves untouched lanes."""
+        site = "s.comp.glsl:3"
+        cases = [
+            (("px.r = flags;",), "px.r", None),
+            (("px.r = flags;",), "px.g", site),
+            (("px[0] = flags;",), "px.r", None),
+            (("px[0] = flags;",), "px.g", site),
+            (("px.s = flags;",), "px.x", None),
+            (("px[0x0u] = flags;",), "px.r", None),
+            (("px.x = flags;",), "px[00U]", None),
+            (("(px.rb) = uvec2(flags);",), "px.b", None),
+            (("px.rb = uvec2(flags);",), "px.g", site),
+            (("px.r = flags;", "px.g |= flags;"), "px.g", None),
+            (("px = uvec4(flags);",), "px.g", None),
+            (("px.r = px.r & 0xffu;",), "px.r", site),
+            (("px.r = flags;", "px.r &= 0xffu;"), "px.r", None),
+        ]
+        for writes, read, expected in cases:
+            with self.subTest(writes=writes, read=read):
+                source = shader_line_source(
+                    "uvec4 px = imageLoad(img, pos);", *writes, f"uint o = {read} & 0xffu;"
+                )
+                self.assertEqual(
+                    sweep_port_parity.shader_site("s.comp.glsl", source, "mask"), expected
+                )
 
     def test_cr22_parenthesized_feature_receiver(self) -> None:
         """Redundant parentheses preserve the feature receiver's root type."""
@@ -2901,6 +2998,30 @@ class VulkanSweepTest(unittest.TestCase):
         )
         pairs = [(s.feature, s.line) for s in sweep_vulkan_features.c_feature_reads(source)]
         self.assertEqual(pairs, [("shaderInt64", 4)])
+
+    def test_control_assignment_does_not_shadow_feature_pointer(self) -> None:
+        """Branch and loop assignments preserve the declaration; a local shadow does not."""
+        bind_g3_maps_fixture(self)
+        for statement in ("if (c) p = q; else p = q;", "do p = q; while (0);"):
+            with self.subTest(statement=statement):
+                source = (
+                    "struct Other { int shaderInt64; };\n"
+                    "int gate(int c, VkPhysicalDeviceFeatures *p, VkPhysicalDeviceFeatures *q) {\n"
+                    f"    {statement}\n"
+                    "    if (p->shaderInt64) return 1;\n"
+                    "    {\n"
+                    "        struct Other other = {0};\n"
+                    "        struct Other *p = &other;\n"
+                    "        if (p->shaderInt64) return 2;\n"
+                    "    }\n"
+                    "    return p->shaderInt64;\n"
+                    "}\n"
+                )
+                sites = sweep_vulkan_features.c_feature_reads(source)
+                self.assertEqual(
+                    [(site.feature, site.line) for site in sites],
+                    [("shaderInt64", 4), ("shaderInt64", 10)],
+                )
 
     def test_goto_label_does_not_shadow_feature_parameter(self) -> None:
         """A label leaves the parameter visible, but a local declaration hides it."""

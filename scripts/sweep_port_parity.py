@@ -337,7 +337,7 @@ def _attached_result_parens(statement: str, read_start: int) -> int:
 
 
 def attached_operator_text(statement: str, read_start: int, read_end: int) -> str:
-    """Return attached operator text with shift-count masks excluded."""
+    """Return attached operator text with shift-count normalization excluded."""
     depth = statement[:read_start].count("(") - statement[:read_start].count(")")
     shift_rhs_spans: list[tuple[int, int]] = []
     end = _operand_scan_end(
@@ -352,7 +352,10 @@ def attached_operator_text(statement: str, read_start: int, read_end: int) -> st
     for rhs_start, rhs_end in shift_rhs_spans:
         pieces.append(statement[start:rhs_start])
         # Keep offsets stable for callers that clip the focus to a header boundary.
-        pieces.append(statement[rhs_start:rhs_end].replace("&", " "))
+        count = statement[rhs_start:rhs_end].replace("&", " ")
+        for pattern in (CLIP, CLAMP):
+            count = pattern.sub(lambda match: " " * (len(match[0]) - 1) + "(", count)
+        pieces.append(count)
         start = rhs_end
     pieces.append(statement[start:end])
     return "".join(pieces)
@@ -529,11 +532,8 @@ def _header_assignment_rhs(
 def _compound_assignment_focus(statement: str, rhs: int, end: int) -> str:
     """Return attached-operator text when the assignment ending at rhs is compound."""
     if statement.endswith(">>=", 0, rhs):
-        # The whole RHS is the shift count, so a mask in it never applies to the value.
-        synthetic = f">> {statement[rhs:end]}"
-        after = _skip_space(synthetic, 2, len(synthetic))
-        shift_end = _extend_shift_tail(synthetic, after, len(synthetic))
-        return synthetic[:shift_end].replace("&", " ")
+        # The whole RHS is the count; only the shift applies to the old value.
+        return ">> 0"
     if statement.endswith("<<=", 0, rhs):
         return ""
     if rhs >= 2 and statement[rhs - 2] in "+-*/%&|^":
@@ -822,7 +822,37 @@ def _assigned_name(statement: str, load_start: int, load_end: int) -> str | None
     return None if match is None else match[1]
 
 
-def _statement_use_matches(statement: str, name: str, pattern: re.Pattern[str]) -> bool:
+def _vector_access(statement: str, start: int, end: int, width: int) -> int:
+    """Map a vector access back to its original lanes; unknown selectors may touch any lane."""
+    lanes = list(range(width))
+    for _ in range(_SUFFIX_STEPS):
+        match = _LOAD_SUFFIX.match(statement, start, end)
+        if match is None:
+            break
+        selector = match[0].strip()
+        if selector.startswith("."):
+            swizzle = selector[1:]
+            alphabet = next(
+                (a for a in ("xyzw", "rgba", "stpq") if all(c in a for c in swizzle)),
+                "",
+            )
+            indices = [alphabet.index(c) for c in swizzle] if alphabet else []
+        else:
+            literal = selector[1:-1].strip().removesuffix("u").removesuffix("U")
+            if re.fullmatch(r"(?:0[xX]0*[0-3]|0*[0-3])", literal, re.ASCII):
+                indices = [int(literal[-1])]
+            else:
+                indices = []
+        if not indices or max(indices) >= len(lanes):
+            break
+        lanes = [lanes[i] for i in indices]
+        start = match.end()
+    return sum(1 << lane for lane in set(lanes))
+
+
+def _statement_use_matches(
+    statement: str, name: str, pattern: re.Pattern[str], width: int = 0, live: int = 0
+) -> bool:
     """Return whether a non-member use of name in the statement carries the pattern."""
     index = 0
     for _ in range(_OPERAND_OPS):
@@ -832,15 +862,20 @@ def _statement_use_matches(statement: str, name: str, pattern: re.Pattern[str]) 
         index = hit + 1
         if not _whole_word_at(statement, hit, name) or _follows_member_operator(statement, hit, 0):
             continue
-        use_end = _load_end(statement, hit + len(name))
+        base_end = hit + len(name)
+        use_end = _load_end(statement, base_end)
+        if width:
+            lanes = _vector_access(statement, base_end, use_end, width)
+            if lanes & live != lanes:
+                continue
         use_start, use_end = unwrap_expression(statement, hit, use_end)
         if pattern.search(normalization_focus(statement, use_start, use_end)):
             return True
     return False
 
 
-def _statement_assignment_rhs(statement: str, name: str) -> int | None:
-    """Return the RHS start when a statement assigns directly to the bound name."""
+def _statement_assignment(statement: str, name: str, width: int) -> tuple[int, int] | None:
+    """Return the RHS start and affected lanes for a recognized assignment."""
     limit = len(statement)
     start = _skip_space(statement, 0, limit)
     openings = []
@@ -852,46 +887,56 @@ def _statement_assignment_rhs(statement: str, name: str) -> int | None:
     if not _whole_word_at(statement, start, name):
         return None
 
-    target_start, target_end = _unwrap_target_parens(statement, start, start + len(name), 0, limit)
+    base_end = start + len(name)
+    access_end = _load_end(statement, base_end) if width else base_end
+    target_start, target_end = _unwrap_target_parens(statement, start, access_end, 0, limit)
     match = _VALUE_ASSIGNMENT.match(statement, target_end)
     if match is None:
         return None
 
     if openings and openings[0] < target_start:
-        # Parentheses not consumed by the target must wrap the whole assignment.
-        close = _non_space_index(statement, limit - 1, 0)
-        if close is not None and statement[close] == ";":
-            close = _non_space_index(statement, close - 1, 0)
-        for opening in openings:
-            if opening >= target_start:
-                break
-            if close is None or matching_close_paren(statement, opening) != close:
-                return None
-            close = _non_space_index(statement, close - 1, 0)
-    return match.end()
+        # The leading assignment may be followed by a comma expression.
+        close = matching_close_paren(statement, openings[0])
+        if close is None:
+            return None
+        tail = _skip_space(statement, close + 1, limit)
+        if tail < limit and statement[tail] not in ",;":
+            return None
+    lanes = _vector_access(statement, base_end, access_end, width) if width else 1
+    return match.end(), lanes
 
 
 def _use_normalized(
-    masked: str,
-    spans: list[tuple[int, int]],
+    source: tuple[str, list[tuple[int, int]]],
     index: int,
     name: str,
     pattern: re.Pattern[str],
+    width: int = 0,
 ) -> bool:
-    """Return whether a later use of name in the same block carries the pattern."""
+    """Return whether a later use normalizes lanes still derived from the load."""
+    masked, spans = source
     depth = 0
+    live = (1 << (width or 1)) - 1
     for follow in range(index + 1, min(len(spans), index + 1 + _USE_WINDOW)):
         statement = masked[spans[follow][0] : spans[follow][1]]
-        rhs = _statement_assignment_rhs(statement, name)
-        if rhs is not None and pattern.search(
-            _compound_assignment_focus(statement, rhs, len(statement))
-        ):
+        assignment = _statement_assignment(statement, name, width)
+        focus = statement
+        if assignment is not None:
+            rhs, lanes = assignment
+            end = next(
+                _top_level_separators(statement, rhs, len(statement), ",;)]}"), len(statement)
+            )
+            if lanes & live == lanes and pattern.search(
+                _compound_assignment_focus(statement, rhs, end)
+            ):
+                return True
+            focus = statement[rhs:end]
+        if _statement_use_matches(focus, name, pattern, width, live):
             return True
-        focus = statement if rhs is None else statement[rhs:]
-        if _statement_use_matches(focus, name, pattern):
-            return True
-        if rhs is not None and depth == 0:
-            return False
+        if assignment is not None and depth == 0:
+            live &= ~lanes
+            if not live:
+                return False
         if statement.endswith("{"):
             depth += 1
         elif statement.endswith("}"):
@@ -921,7 +966,11 @@ def _load_normalized(
         if helpers[caller]:
             return True
     name = _assigned_name(statement, load_start, load_end)
-    return name is not None and _use_normalized(masked, spans, index, name, pattern)
+    if name is None:
+        return False
+    vector = re.search(r"\b(?:[biud]?vec)([2-4])\s+\w+\s*=\s*\Z", statement[:load_start], re.ASCII)
+    width = int(vector[1]) if vector is not None else 0
+    return _use_normalized((masked, spans), index, name, pattern, width)
 
 
 def shader_site(shader_path: str, source: str, kind: str) -> str | None:

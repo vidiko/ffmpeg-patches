@@ -542,8 +542,20 @@ STRUCT_TAG_DECL = re.compile(
     r"\bstruct\s+(\w+)\s*(\*+\s*|\s+)(\w+)\s*(?=[,;=)])",
     re.ASCII,
 )
+_NON_DECL_TYPE_KEYWORDS = WRAPPER_PRED_KEYWORDS | {
+    "break",
+    "continue",
+    "default",
+    "for",
+    "goto",
+    "if",
+    "sizeof",
+    "struct",
+    "switch",
+    "while",
+}
 GENERIC_DECL = re.compile(
-    r"\b(?!VkPhysicalDevice|struct|if|for|while|return|sizeof|switch|goto\b)"
+    rf"\b(?!VkPhysicalDevice|(?:{'|'.join(sorted(_NON_DECL_TYPE_KEYWORDS))})\b)"
     r"([A-Za-z_]\w*)\s+(\*+\s*)?(\w+)\s*(?=[,;=)])",
     re.ASCII,
 )

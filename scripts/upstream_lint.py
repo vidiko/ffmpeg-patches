@@ -187,17 +187,38 @@ this rule. Error-handling subjects worded otherwise are not detected.
 
 The doc-terms step fails when base..head adds lines both to library or fftools
 sources and to Texinfo files under doc/, and an added source line shows a
-behaviour whose added description leaves one of its cases out: a test for
-non-RGB input (a comparison against a COLOR_RGB constant, or a negated
-AV_PIX_FMT_FLAG_RGB flag test, in either operand order) while the added
-docs say YUV but never non-RGB, gray or grey, or a colour range comparison
-while the added docs mention range
-or rangein but never unspecified, unknown or untagged. The added source lines
-are read from the head file with comments, string literals and preprocessor
-lines blanked, so a comment that names the behaviour does not count, and
-neither does a macro that tests the flag. --doc-reason TEXT waives it and
-prints the reason. Only these two pairs are checked; any other gap between
-what the code does and what the docs say is not detected.
+behaviour whose added description leaves one of its cases out. The non-RGB
+pair fires when the code tests non-RGB input (a comparison against a COLOR_RGB
+constant, or a negated AV_PIX_FMT_FLAG_RGB flag test, in either operand order)
+while the added docs say YUV but never non-RGB, gray or grey. The
+unspecified-range pair fires on a colour range comparison while the added docs
+mention range or rangein but never unspecified, unknown or untagged. The added
+source lines are read from the head file with comments, string literals and
+preprocessor lines blanked, so a comment that names the behaviour does not
+count, and neither does a macro that tests the flag. It also fails when an added
+line tests one AVOption field within three head lines of a test of a neighbour
+field from the same AVOption table in that file, and the changed Texinfo entry
+for that option gains text but never names any public option name that shares
+the neighbour field (underscore in the name may match a hyphen or space).
+Commented-out AVOption table headers and entry rows are ignored, whitespace
+after -> is allowed in option tests, and naming any alias of the neighbour
+field in a table that holds both options on different fields satisfies the entry.
+Texinfo @c and @comment text and @ignore text in an entry do not name a neighbour option;
+@verbatim and @verb text is literal, so a @c line inside it does name one.
+An explicit array bound in an AVOption table header still starts a new table.
+A structure field on the left of an assignment, in or outside a condition, is not a test,
+even when the assignment operator sits on a later line, while a field read inside the
+subscript of an assignment target is still a test.
+Consecutive @item and @itemx headings share one entry, running to the line before the next
+heading of the same table or that table's @end with inner blocks and raw blocks included;
+the full entry text at head is used, not added lines alone. Only structure member access
+with -> is treated as an option test, and inside an if or while condition only
+the condition text counts, so a field assigned after the condition closes is not
+an option test; interplay beyond the window of three head lines or across files
+is not detected. --doc-reason TEXT waives it and prints the reason.
+The non-RGB pair, the unspecified-range pair, and this option-interplay check
+are the only doc-term rules; any other gap between what the code does and what
+the docs say is not detected.
 
 The doc-wrap step fails an added line of filled prose in a changed doc/*.texi
 file that is shorter than half of both neighbouring prose lines, each at least
@@ -2746,6 +2767,476 @@ def is_doc_path(name: str) -> bool:
     return len(parts) > 1 and parts[0] == "doc" and name.endswith(".texi")
 
 
+OPTION_WINDOW = 3
+AVOPTION_HELP = r'(?:(?:"(?:[^"\\]|\\.)*"\s*)+|NULL\s*)'
+AVOPTION_FIELD = (
+    r"(?:OFFSET\s*\(\s*(\w+(?:\[[^\]]*\])?)\s*\)|"
+    r"offsetof\s*\(\s*\w+\s*,\s*(\w+(?:\[[^\]]*\])?)\s*\))"
+)
+AVOPTION_ENTRY = re.compile(rf"\{{\s*\"([^\"]+)\"\s*,\s*{AVOPTION_HELP}\s*,\s*{AVOPTION_FIELD}")
+AVOPTION_TABLE_HEAD = re.compile(r"\bAVOption\s+[A-Za-z_]\w*\s*\[\s*[^\]\n]*\s*\]\s*=\s*\{")
+FIELD_ASSIGN_TARGET = re.compile(
+    r"(?P<member>->\s*\w+)"
+    r"(?P<subscript>\[(?:[^\[\]]|\[[^\[\]]*\])*\])?"
+    r"(?P<operator>\s*(?:=(?!=)|\+=|-=|\*=|/=|%=|&=|\|=|\^=|<<=|>>=))"
+)
+CONDITION_HEAD = re.compile(r"\b(?:if|while)\s*\(")
+TEXI_ITEM_HEAD = re.compile(r"^@itemx?\s+(\S+)")
+TEXI_ENTRY_TABLES = frozenset(("ftable", "table", "vtable"))
+OPTION_TEST_MARKERS = ("if (", "while (", "&&", "||", "?")
+OUTSIDE_TEST_MARKERS = ("&&", "||", "?")
+SpanList = tuple[tuple[int, int], ...] | list[tuple[int, int]]
+
+
+def _avoption_parse_source(raw: str) -> str:
+    """Return source with C comments blanked for AVOption table parsing."""
+
+    def blank_comment(match: re.Match[str]) -> str:
+        piece = match[0]
+        if piece.startswith("/*") or piece.startswith("//"):
+            return re.sub(r"[^\n]", " ", piece)
+        return piece
+
+    return C_NONCODE.sub(blank_comment, raw)
+
+
+def _avoption_entries_map(chunk: str) -> dict[str, list[str]]:
+    """Map each AVOption OFFSET field in one source slice to its option names."""
+    mapping: dict[str, list[str]] = {}
+    for match in AVOPTION_ENTRY.finditer(chunk):
+        name = match[1]
+        field = match[2] or match[3]
+        if field:
+            names = mapping.setdefault(field, [])
+            if name not in names:
+                names.append(name)
+    return mapping
+
+
+def avoption_tables(raw: str) -> list[dict[str, list[str]]]:
+    """Return one field-to-option-names map per AVOption table in source order."""
+    source = _avoption_parse_source(raw)
+    headers = list(AVOPTION_TABLE_HEAD.finditer(source))
+    if not headers:
+        only = _avoption_entries_map(source)
+        return [only] if only else []
+    tables: list[dict[str, list[str]]] = []
+    leading = _avoption_entries_map(source[: headers[0].start()])
+    if leading:
+        tables.append(leading)
+    for index, header in enumerate(headers):
+        end = headers[index + 1].start() if index + 1 < len(headers) else len(source)
+        tables.append(_avoption_entries_map(source[header.end() : end]))
+    return tables
+
+
+def avoption_field_map(raw: str) -> dict[str, list[str]]:
+    """Map each AVOption OFFSET field to its public option names in table order."""
+    merged: dict[str, list[str]] = {}
+    for table in avoption_tables(raw):
+        for option_field, names in table.items():
+            target = merged.setdefault(option_field, [])
+            for name in names:
+                if name not in target:
+                    target.append(name)
+    return merged
+
+
+def _condition_spans(code_lines: list[str]) -> dict[int, list[tuple[int, int]]]:
+    """Map 1-based line numbers to half-open character spans in if or while conditions."""
+    spans: dict[int, list[tuple[int, int]]] = {}
+    depth = 0
+    for number, line in enumerate(code_lines, 1):
+        line_spans: list[tuple[int, int]] = []
+        pos = 0
+        span_start = 0
+        while pos < len(line):
+            if depth == 0:
+                match = CONDITION_HEAD.search(line, pos)
+                if match is None:
+                    break
+                depth = 1
+                pos = match.end()
+                span_start = pos
+                continue
+            if line[pos] == "(":
+                depth += 1
+            elif line[pos] == ")":
+                depth -= 1
+                if depth == 0:
+                    line_spans.append((span_start, pos))
+            pos += 1
+        if depth > 0:
+            line_spans.append((span_start, len(line)))
+        if line_spans:
+            spans[number] = line_spans
+    return spans
+
+
+def _outside_spans(line: str, spans: SpanList) -> str:
+    """Return space-joined slices of line outside sorted half-open spans."""
+    parts: list[str] = []
+    cursor = 0
+    for start, end in spans:
+        parts.append(line[cursor:start])
+        cursor = end
+    parts.append(line[cursor:])
+    return " ".join(parts)
+
+
+def _texi_comment_command_at(line: str, at: int) -> int | None:
+    """Return the index of a Texinfo @c or @comment command, or None."""
+    if line.startswith("@comment", at):
+        tail = at + 8
+        if tail == len(line) or line[tail] in " \t":
+            return at
+        return None
+    if line.startswith("@c", at):
+        tail = at + 2
+        if tail == len(line) or line[tail] in " \t":
+            return at
+        return None
+    return None
+
+
+def _texi_verb_end(line: str, at: int) -> int | None:
+    """Return the index after @verb text at an index, the line end if unclosed, else None."""
+    if not line.startswith("@verb{", at):
+        return None
+    if at + 6 >= len(line):
+        return len(line)
+    close = line.find(line[at + 6] + "}", at + 7)
+    return len(line) if close < 0 else close + 2
+
+
+def _texi_strip_comments_line(line: str) -> str:
+    """Return one Texinfo line with @c and @comment suffix text removed."""
+    index = 0
+    limit = len(line)
+    for _ in range(limit):
+        if index >= limit:
+            break
+        if line[index] != "@":
+            index += 1
+            continue
+        if index + 1 < limit and line[index + 1] == "@":
+            index += 2
+            continue
+        verb_end = _texi_verb_end(line, index)
+        if verb_end is not None:
+            index = verb_end
+            continue
+        command = _texi_comment_command_at(line, index)
+        if command is not None:
+            return line[:command].rstrip()
+        index += 1
+    return line
+
+
+def _texi_strip_step(line: str, stack: list[str]) -> str | None:
+    """Return one line as texi_strip_comments keeps it, or None when the line is dropped."""
+    if stack:
+        top = stack[-1]
+        _texi_raw_line(line, stack)
+    elif (command := TEXI_COMMAND.match(line)) and command[1] in TEXI_RAW:
+        top = command[1]
+        stack.append(top)
+    else:
+        return _texi_strip_comments_line(line)
+    if top == "ignore":
+        return None
+    if top == "verbatim":
+        return line
+    return _texi_strip_comments_line(line)
+
+
+def texi_strip_comments(text: str) -> str:
+    """Strip @c and @comment text, drop @ignore blocks, keep @verbatim and @verb literal."""
+    stack: list[str] = []
+    kept: list[str] = []
+    for line in text.split("\n"):
+        stripped = _texi_strip_step(line, stack)
+        if stripped is not None:
+            kept.append(stripped)
+    return "\n".join(kept)
+
+
+def _blank_assignment_target(match: re.Match[str]) -> str:
+    """Blank the member and operator of an assignment target, keeping any subscript."""
+    member = re.sub(r"[^\n]", " ", match["member"])
+    subscript = match["subscript"] or ""
+    operator = re.sub(r"[^\n]", " ", match["operator"])
+    return f"{member}{subscript}{operator}"
+
+
+def _text_without_assignment_targets(text: str) -> str:
+    """Return text with structure-member assignment targets replaced by blanks."""
+    return FIELD_ASSIGN_TARGET.sub(_blank_assignment_target, text)
+
+
+def _lines_without_assignment_targets(code_lines: list[str]) -> list[str]:
+    """Return the code lines with assignment targets blanked even when the operator is later."""
+    if not code_lines:
+        return []
+    return FIELD_ASSIGN_TARGET.sub(_blank_assignment_target, "\n".join(code_lines)).split("\n")
+
+
+def _option_fields_tested(
+    line: str,
+    fields: frozenset[str],
+    *,
+    spans: SpanList = (),
+) -> frozenset[str]:
+    """Return option structure fields tested on one blanked source line."""
+    if spans:
+        targets = [_text_without_assignment_targets(line[start:end]) for start, end in spans]
+        outside = _outside_spans(line, spans)
+        if any(marker in outside for marker in OUTSIDE_TEST_MARKERS):
+            targets.append(_text_without_assignment_targets(outside))
+    elif any(marker in line for marker in OPTION_TEST_MARKERS):
+        targets = [_text_without_assignment_targets(line)]
+    else:
+        return frozenset()
+    found: set[str] = set()
+    for option_field in fields:
+        pattern = rf"->\s*{re.escape(option_field)}(?!\w)"
+        if any(re.search(pattern, part) for part in targets):
+            found.add(option_field)
+    return frozenset(found)
+
+
+def texi_option_name(token: str) -> str:
+    """Strip @option or @var from the first word of a Texinfo item line."""
+    if token.startswith("@option{") and token.endswith("}"):
+        return token[8:-1]
+    if token.startswith("@var{") and token.endswith("}"):
+        return token[5:-1]
+    return token
+
+
+def _is_texi_entry_head(stack: list[str], has_open_entry: bool, entry_depth: int) -> bool:
+    """Return whether an @item or @itemx line at stack is a table entry head."""
+    if not stack:
+        return True
+    if stack[-1] not in TEXI_ENTRY_TABLES:
+        return False
+    return not (has_open_entry and len(stack) > entry_depth)
+
+
+def _append_texi_entry(
+    entries: list[tuple[int, int, str, str]],
+    lines: list[str],
+    start: int,
+    end: int,
+    names: list[str],
+) -> None:
+    """Append one 1-based range, name and text tuple per heading in an entry group."""
+    text = "\n".join(lines[start:end])
+    for name in names:
+        entries.append((start + 1, end, name, text))
+
+
+def texi_entry_ranges(lines: list[str]) -> list[tuple[int, int, str, str]]:
+    """Return 1-based line ranges, option names and text for each @item entry."""
+    blocks = _texi_blocks(lines)
+    stack: list[str] = []
+    entries: list[tuple[int, int, str, str]] = []
+    names: list[str] = []
+    start = 0
+    entry_depth = 0
+    in_headings = False
+    for index, line in enumerate(lines):
+        depth_before = len(stack)
+        kind = _texi_block_step(line, blocks, stack)
+        if kind == "end" and names and (len(stack) < entry_depth or depth_before == 0):
+            _append_texi_entry(entries, lines, start, index, names)
+            names = []
+        if kind is not None:
+            in_headings = False
+            continue
+        match = TEXI_ITEM_HEAD.match(line)
+        if not match or not _is_texi_entry_head(stack, bool(names), entry_depth):
+            in_headings = False
+            continue
+        name = texi_option_name(match[1])
+        if names and in_headings and line.startswith("@itemx"):
+            names.append(name)
+            continue
+        if names:
+            _append_texi_entry(entries, lines, start, index, names)
+        names = [name]
+        start = index
+        entry_depth = len(stack)
+        in_headings = True
+    if names:
+        _append_texi_entry(entries, lines, start, len(lines), names)
+    return entries
+
+
+def option_named_in_text(name: str, text: str) -> bool:
+    """Return whether an option name appears in Texinfo text."""
+    body = "[_\\- ]".join(re.escape(part) for part in name.split("_"))
+    return re.search(rf"(?<![\w-]){body}(?![\w-])", text) is not None
+
+
+def _doc_entries_with_additions(tree: Path, head: str, range_patch: str) -> dict[str, list[str]]:
+    """Map option names to changed entry texts in document order."""
+    entries: dict[str, list[str]] = {}
+    for path, hunks, _added in _patch_files(range_patch):
+        if not is_doc_path(path):
+            continue
+        added = _added_lines("\n".join(hunks))
+        if not added:
+            continue
+        lines = _git(tree, "show", f"{head}:{path}").split("\n")
+        for start, end, name, text in texi_entry_ranges(lines):
+            if any(start <= number <= end for number in added):
+                entries.setdefault(name, []).append(text)
+    return entries
+
+
+def _option_pairs_between(
+    tested: frozenset[str], nearby: frozenset[str], field_map: dict[str, list[str]]
+) -> list[tuple[str, str]]:
+    """Return option name pairs between two tested field sets in one source file."""
+    pairs: list[tuple[str, str]] = []
+    for field_a in tested:
+        for option_a in field_map[field_a]:
+            for field_b in nearby:
+                if field_a == field_b:
+                    continue
+                for option_b in field_map[field_b]:
+                    pairs.append((option_a, option_b))
+    return pairs
+
+
+def _interplay_pairs_for_line(
+    number: int,
+    tested: frozenset[str],
+    code_lines: list[str],
+    tables: list[dict[str, list[str]]],
+    cond_spans: dict[int, list[tuple[int, int]]],
+) -> list[tuple[int, str, str]]:
+    """List option name pairs one added line triggers within OPTION_WINDOW."""
+    fields = frozenset(option_field for table in tables for option_field in table)
+    low = max(1, number - OPTION_WINDOW)
+    high = min(len(code_lines), number + OPTION_WINDOW)
+    raw: list[tuple[int, str, str]] = []
+    for other in range(low, high + 1):
+        nearby = _option_fields_tested(
+            code_lines[other - 1],
+            fields,
+            spans=cond_spans.get(other, ()),
+        )
+        for table in tables:
+            table_fields = frozenset(table)
+            pairs = _option_pairs_between(tested & table_fields, nearby & table_fields, table)
+            for option_a, option_b in pairs:
+                raw.append((number, option_a, option_b))
+    return raw
+
+
+def _neighbour_alias_group_for_pair(
+    tables: list[dict[str, list[str]]],
+    option_a: str,
+    option_b: str,
+) -> frozenset[str]:
+    """Union neighbour-field aliases from tables holding both options on different fields."""
+    group: set[str] = {option_b}
+    for table in tables:
+        field_a = None
+        field_b = None
+        for option_field, names in table.items():
+            if option_a in names:
+                field_a = option_field
+            if option_b in names:
+                field_b = option_field
+        if field_a is None or field_b is None or field_a == field_b:
+            continue
+        group.update(table.get(field_b, ()))
+    return frozenset(group)
+
+
+def _dedupe_interplay_pairs(
+    raw: list[tuple[int, str, str]],
+) -> list[tuple[int, str, str]]:
+    """Keep the first added line for each option name pair in one source file."""
+    seen: dict[tuple[str, str], int] = {}
+    for number, option_a, option_b in raw:
+        key = (option_a, option_b)
+        if key not in seen or number < seen[key]:
+            seen[key] = number
+    return [(seen[key], key[0], key[1]) for key in seen]
+
+
+def _interplay_pairs(
+    code_lines: list[str], added: set[int], tables: list[dict[str, list[str]]]
+) -> list[tuple[int, str, str]]:
+    """List unique option name pairs from added lines tested within OPTION_WINDOW."""
+    fields = frozenset(option_field for table in tables for option_field in table)
+    cond_spans = _condition_spans(code_lines)
+    test_lines = _lines_without_assignment_targets(code_lines)
+    raw: list[tuple[int, str, str]] = []
+    for number in sorted(added):
+        if number > len(code_lines):
+            continue
+        tested = _option_fields_tested(
+            test_lines[number - 1],
+            fields,
+            spans=cond_spans.get(number, ()),
+        )
+        if not tested:
+            continue
+        raw.extend(_interplay_pairs_for_line(number, tested, test_lines, tables, cond_spans))
+    return _dedupe_interplay_pairs(raw)
+
+
+def _interplay_findings_one_path(
+    tree: Path,
+    head: str,
+    path: str,
+    hunks: list[str],
+    doc_entries: dict[str, list[str]],
+) -> list[str]:
+    """Return option-interplay doc-terms findings for one changed source file."""
+    added = _added_lines("\n".join(hunks))
+    if not added:
+        return []
+    raw = _git(tree, "show", f"{head}:{path}")
+    tables = avoption_tables(raw)
+    if not any(tables):
+        return []
+    raw_lines = raw.split("\n")
+    code_lines = _code_lines(raw)
+    findings: list[str] = []
+    for number, option_a, option_b in _interplay_pairs(code_lines, added, tables):
+        entry_texts = doc_entries.get(option_a)
+        if entry_texts is None:
+            continue
+        group = _neighbour_alias_group_for_pair(tables, option_a, option_b)
+        stripped = [texi_strip_comments(text) for text in entry_texts]
+        if all(any(option_named_in_text(alias, text) for alias in group) for text in stripped):
+            continue
+        snippet = raw_lines[number - 1].strip()
+        findings.append(
+            f'option interplay: added code tests {option_a} near {option_b} in "{snippet}"; '
+            f"the {option_a} docs never name {option_b}; say how {option_b} changes {option_a}"
+        )
+    return findings
+
+
+def option_interplay_findings(
+    tree: Path, head: str, range_patch: str, doc_entries: dict[str, list[str]]
+) -> list[str]:
+    """Return doc-terms findings for coupled AVOption tests and under-documented entries."""
+    findings: list[str] = []
+    for path, hunks, _added in _patch_files(range_patch):
+        if not is_source_path(path):
+            continue
+        findings.extend(_interplay_findings_one_path(tree, head, path, hunks, doc_entries))
+    return findings
+
+
 def doc_term_findings(code: str, docs: str) -> list[str]:
     """Return a finding per doc term the added code shows and the added docs omit."""
     findings: list[str] = []
@@ -2779,9 +3270,12 @@ def _doc_terms(tree: Path, base: str, head: str, waiver: str) -> Step:
             code.extend(_added_code(tree, head, path, hunks))
         elif is_doc_path(path):
             docs.extend(added)
+    doc_entries = _doc_entries_with_additions(tree, head, range_patch)
+    findings = doc_term_findings("\n".join(code), "\n".join(docs))
+    findings.extend(option_interplay_findings(tree, head, range_patch, doc_entries))
     return _waivable_step(
         "doc-terms",
-        doc_term_findings("\n".join(code), "\n".join(docs)),
+        findings,
         waiver,
         f"no omitted doc term in {len(docs)} added doc line(s)",
         "name the case in the docs, or pass --doc-reason",
@@ -2808,20 +3302,26 @@ def _texi_raw_line(line: str, stack: list[str]) -> None:
         stack.pop()
 
 
-def _texi_prose_line(line: str, blocks: frozenset[str], stack: list[str]) -> bool:
-    """Track the open Texinfo blocks for one line and return whether it is filled prose."""
+def _texi_block_step(line: str, blocks: frozenset[str], stack: list[str]) -> str | None:
+    """Update open Texinfo blocks for one line and return the transition kind, or None."""
     if stack and stack[-1] in TEXI_RAW:
         _texi_raw_line(line, stack)
-        return False
-    end = TEXI_END.match(line)
-    if end:
+        return "raw"
+    if end := TEXI_END.match(line):
         if end[1] in stack:
             del stack[len(stack) - 1 - stack[::-1].index(end[1]) :]
+        return "end"
+    if (command := TEXI_COMMAND.match(line)) and command[1] in blocks:
+        stack.append(command[1])
+        return "open"
+    return None
+
+
+def _texi_prose_line(line: str, blocks: frozenset[str], stack: list[str]) -> bool:
+    """Track the open Texinfo blocks for one line and return whether it is filled prose."""
+    if _texi_block_step(line, blocks, stack) is not None:
         return False
     command = TEXI_COMMAND.match(line)
-    if command and command[1] in blocks:
-        stack.append(command[1])
-        return False
     if command and not (command[1] in TEXI_INLINE and line[command.end() :].startswith("{")):
         return False
     return bool(line.strip()) and all(name in TEXI_FILLED for name in stack)

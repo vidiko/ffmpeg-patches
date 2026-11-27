@@ -1103,7 +1103,7 @@ def _shader_events(masked: str) -> list[_ShaderEvent]:
             continue
         cursor = _skip_space(masked, cursor, limit)
         if kind == "else":
-            cursor = _shader_schedule_else(masked, cursor, first, events, pending)
+            cursor = _shader_schedule_else(masked, (cursor, limit), first, events, pending)
             continue
         if kind == "block" and (cursor == limit or masked[cursor] == "}"):
             cursor = min(cursor + 1, limit)
@@ -1123,10 +1123,15 @@ def _shader_events(masked: str) -> list[_ShaderEvent]:
 
 
 def _shader_schedule_else(
-    masked: str, cursor: int, depth: int, events: list[_ShaderEvent], pending: list[_ShaderEvent]
+    masked: str,
+    bounds: tuple[int, int],
+    depth: int,
+    events: list[_ShaderEvent],
+    pending: list[_ShaderEvent],
 ) -> int:
     """Consume an optional else arm and give it its own lexical scope."""
-    if not _whole_word_at(masked, cursor, "else"):
+    cursor, limit = bounds
+    if cursor >= limit or not _whole_word_at(masked, cursor, "else"):
         return cursor
     events.append(("alternate", 0, 0))
     _shader_schedule_body(events, pending, depth)
@@ -1222,6 +1227,21 @@ class _ShaderFlow:
                     _shader_jump(word[0], index, frames, self.edges)
             if kind in {"stop", "header"}:
                 self.edges[index] = ()
+
+    def reachable(self) -> set[int]:
+        """Follow control edges from the source entry and independent header/body entries."""
+        pending = [0]
+        for index, (kind, _, _) in enumerate(self.events):
+            if kind == "header":
+                pending.extend((index, index + 1))
+        seen: set[int] = set()
+        while pending:
+            index = pending.pop()
+            if index >= len(self.events) or index in seen:
+                continue
+            seen.add(index)
+            pending.extend(self.edges[index])
+        return seen
 
 
 def _shader_declaration(statement: str) -> re.Match[str] | None:
@@ -1376,10 +1396,11 @@ def shader_site(shader_path: str, source: str, kind: str) -> str | None:
         return None
     masked = mask_literals(source)
     flow = _ShaderFlow(masked)
+    reachable = flow.reachable()
     helpers: dict[tuple[str, int, int], bool] = {}
     first_offset: int | None = None
     for index, (event, start, end) in enumerate(flow.events):
-        if event not in {"expr", "header", "update"}:
+        if index not in reachable or event not in {"expr", "header", "update"}:
             continue
         if first_offset is not None and start >= first_offset:
             continue

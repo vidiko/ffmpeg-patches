@@ -2325,6 +2325,19 @@ class VulkanSweepTest(unittest.TestCase):
         for label, body, found in cases:
             self._assert_port_parity_shader_mask(label, body, found)
 
+    def test_port_parity_shader_for_update_clamp(self) -> None:
+        """Report the clamp site only when the loop can reach its image-load update."""
+        for tail, expected in (("break;", None), ("", "test.comp:1"), ("continue;", "test.comp:1")):
+            with self.subTest(tail=tail):
+                source = (
+                    "void main(){vec4 x=vec4(0);for(;;x=imageLoad(img,ivec2(0))){\n"
+                    f"color=clamp(x,0.,1.);{tail}"
+                    "}}"
+                )
+                self.assertEqual(
+                    sweep_port_parity.shader_site("test.comp", source, "clamp"), expected
+                )
+
     def test_port_parity_shader_loop_edges(self) -> None:
         """Track loaded lanes through loop edges and loop-local bindings."""
         load = "uvec4 px = imageLoad(img, pos);"

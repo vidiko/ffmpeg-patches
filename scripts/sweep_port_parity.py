@@ -235,15 +235,21 @@ def sample_read_end(statement: str, read_start: int, read_end: int) -> int:
 
 
 def enclosing_clip_focus(statement: str, read_start: int, read_end: int) -> str | None:
-    """Return clip or clamp call text when the sample read is one of its arguments."""
+    """Return enclosing clip text, or clamp text when the read is in its value argument."""
     for pattern in (CLIP, CLAMP):
         for match in pattern.finditer(statement):
             open_index = match.end() - 1
             close_index = matching_close_paren(statement, open_index)
-            if close_index is None:
+            if close_index is None or not (open_index < read_start < read_end <= close_index):
                 continue
-            if open_index < read_start and read_end <= close_index:
-                return statement[match.start() : close_index + 1]
+            if pattern is CLAMP:
+                value_end = next(
+                    iter(_top_level_separators(statement, open_index + 1, close_index, ",")),
+                    close_index,
+                )
+                if read_end > value_end:
+                    continue
+            return statement[match.start() : close_index + 1]
     return None
 
 
@@ -1143,8 +1149,19 @@ def _shader_do_tail(
     if semicolon == boundary or masked[semicolon] != ";":
         return cursor
     events.append(("do_test", first, close))
-    condition = masked[first:close].strip() if do_proof_safe else ""
-    kind = {"true": "do_repeat", "false": "do_exit"}.get(condition, "do_branch")
+    kind = "do_branch"
+    if do_proof_safe:
+        left = _skip_space(masked, first, close)
+        right = _non_space_index(masked, close - 1, first)
+        while right is not None and left < right and masked[left] == "(" and masked[right] == ")":
+            left = _skip_space(masked, left + 1, right)
+            right = _non_space_index(masked, right - 1, left)
+        if right is not None:
+            width = right - left + 1
+            if width == 4 and masked.startswith("true", left):
+                kind = "do_repeat"
+            elif width == 5 and masked.startswith("false", left):
+                kind = "do_exit"
     events.append((kind, 0, 0))
     return semicolon + 1
 
@@ -1903,10 +1920,13 @@ class _ShaderFlow:
         masked, starts, ends = _shader_mask(view, groups)
         events = _shader_pp_events(masked, groups)
         extended_proof_safe = proof_safe or _shader_proof_safe(source, version=_SWITCH_VERSION)
+        do_proof_safe = extended_proof_safe or (
+            bool(positions) and _shader_proof_safe(view, version=_SWITCH_VERSION)
+        )
         flow = cls(
             masked,
             proof_safe=proof_safe,
-            extended_proof_modes=(extended_proof_safe, extended_proof_safe),
+            extended_proof_modes=(extended_proof_safe, do_proof_safe),
             uncertain=(starts, ends),
             pp_events=events,
         )

@@ -6,7 +6,36 @@ from scripts.sweep_port_parity import shader_site
 
 
 class PortParitySplicingTests(unittest.TestCase):
-    """Check reachable masks and physical load anchors after line splicing."""
+    """Check reachable normalization and physical load anchors after line splicing."""
+
+    def test_clamp_requires_load_in_value_argument(self) -> None:
+        """Nested commas do not split clamp arguments, and bounds do not count."""
+        for newline in ("\n", "\r\n", "\r"):
+            for spliced in (False, True):
+                read = "imageLoad(img, ivec2(0)).r"
+                if spliced:
+                    read = "image" + chr(92) + newline + "Load(img, ivec2(0)).r"
+                for expr, expected in (
+                    (f"clamp({read}, 0u, 7u)", "fixture.frag:7"),
+                    (f"clamp((pick(({read}), 0u)), 0u, 7u)", "fixture.frag:7"),
+                    (f"clamp(0u, {read}, 0xffffffffu)", None),
+                    (f"clamp(0u, 0u, {read})", None),
+                    (f"clamp(0u, 0u, (pick(({read}), 0u)))", None),
+                ):
+                    with self.subTest(newline=repr(newline), spliced=spliced, expr=expr):
+                        source = newline.join(
+                            (
+                                "#version 450",
+                                "layout(binding=0,r32ui) readonly uniform uimage2D img;",
+                                "layout(location=0) out uint color;",
+                                "uint pick(uint x, uint y) { return x + y; }",
+                                "void main() {",
+                                "    color =",
+                                f"        {expr};",
+                                "}",
+                            )
+                        )
+                        self.assertEqual(shader_site("fixture.frag", source, "clamp"), expected)
 
     def test_continued_comments_hide_apparent_directives(self) -> None:
         """A real overwrite kills the load; a commented overwrite does not."""

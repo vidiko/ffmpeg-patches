@@ -1484,8 +1484,6 @@ _GLSL_DIRECTIVE_OR_QUOTE = re.compile(
     r"""|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'""",
     re.M | re.S,
 )
-# Keep the raw-source proof guard's directive-first matching unchanged.
-_GLSL_LITERALS = re.compile(r"(?m:^[ \t]*\#[^\n]*)|" + _GLSL_LITERAL_PATTERN, re.S)
 
 
 def _glsl_lexical_view(source: str) -> str:
@@ -1561,9 +1559,9 @@ def _shader_mask_arm(
 
 
 def _shader_comment_free(view: str) -> str:
-    """Blank comments without shifting logical offsets or changing quoted text."""
+    """Replace comments with offset-preserving spaces before recognizing directives."""
     return _GLSL_TRIVIA.sub(
-        lambda match: _glsl_blank(match[0]) if match[0].startswith(("//", "/*")) else match[0],
+        lambda match: " " * len(match[0]) if match[0].startswith(("//", "/*")) else match[0],
         view,
     )
 
@@ -1628,20 +1626,20 @@ def _shader_proof_safe(source: str, *, version: re.Pattern[str] = _COUNTED_VERSI
     # Check raw source before masking and leave all offsets untouched.
     if "\\\n" in source or "\\\r" in source:
         return False
-    # Allow only the caller's version directive, on a single line without
-    # inline comments. Whitespace and comments may precede it.
+    # Recognize directives exactly as the masking lexer does, but validate
+    # the version against the unblanked spelling to reject inline comments.
+    raw_view = _glsl_lexical_view(source)
+    view = _shader_comment_free(raw_view)
     leading = True
     cursor = 0
-    for match in _GLSL_LITERALS.finditer(_glsl_lexical_view(source)):
-        if source[cursor : match.start()].strip():
+    for match in _GLSL_DIRECTIVE_OR_QUOTE.finditer(view):
+        if view[cursor : match.start()].strip():
             leading = False
-        text = match[0]
-        if text.lstrip(" \t").startswith("#"):
-            if not leading or version.fullmatch(text) is None:
+        if match.lastgroup == "directive":
+            hash_start = match.start() + match[0].index("#")
+            if not leading or version.fullmatch(raw_view[hash_start : match.end()]) is None:
                 return False
-            leading = False
-        elif not text.startswith(("//", "/*")):
-            leading = False
+        leading = False
         cursor = match.end()
     return True
 

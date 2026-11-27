@@ -50,6 +50,39 @@ class PortParityLexicalFlowTests(unittest.TestCase):
                 )
                 self.assertEqual(shader_site("fixture.frag", source, "mask"), expected)
 
+    def test_block_comment_in_if_preserves_live_load(self) -> None:
+        """A true condition split by a block comment keeps its load reachable."""
+        source = """#version 460
+layout(set = 0, binding = 0, r32ui) uniform readonly uimage2D img;
+layout(location = 0) out uint color;
+void main() {
+    color = 0u;
+#if 0 /* note
+*/ || 1
+    ;
+    color = imageLoad(img, ivec2(0)).r & 0xffu;
+#endif
+}
+"""
+        self.assertEqual(shader_site("fixture.frag", source, "mask"), "fixture.frag:9")
+
+    def test_block_comment_in_if_excludes_dead_overwrite(self) -> None:
+        """A false condition split by a block comment cannot kill the live load."""
+        source = """#version 460
+layout(set = 0, binding = 0, r32ui) uniform readonly uimage2D img;
+layout(location = 0) out uint color;
+void main() {
+    uint px = imageLoad(img, ivec2(0)).r;
+#if 1 /* note
+*/ && 0
+    ;
+    px = 0u;
+#endif
+    color = px & 0xffu;
+}
+"""
+        self.assertEqual(shader_site("fixture.frag", source, "mask"), "fixture.frag:5")
+
     def test_dead_commented_arm_is_not_a_match(self) -> None:
         """A block comment after #if 0 does not make the disabled load match."""
         source = "\n".join(

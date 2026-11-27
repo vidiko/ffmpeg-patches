@@ -41,6 +41,17 @@ class PortParityLoopFlowTests(unittest.TestCase):
         )
         self.assertEqual(shader_site("fixture.frag", source, "mask"), "fixture.frag:8")
 
+    def test_comment_prefixed_macro_keeps_do_back_edge(self) -> None:
+        """A comment before the macro directive does not hide the true loop tail."""
+        source = _FIXTURE.replace("#version 460\n", "#version 460\n/* pad */ #define false true\n")
+        source = source.replace("uniform uimage2D", "uniform readonly uimage2D")
+        source = source.replace("    do {\n", "    int visits = 0;\n    do {\n")
+        source = source.replace(
+            "        color = px & 0xffu;\n",
+            "        color = px & 0xffu;\n        if (++visits == 2) break;\n",
+        )
+        self.assertEqual(shader_site("fixture.frag", source, "mask"), "fixture.frag:11")
+
     def test_spliced_macro_keeps_possible_back_edge_and_physical_anchor(self) -> None:
         """A spliced tail macro preserves the back edge and physical load line."""
         for newline in ("\n", "\r\n", "\r"):

@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import ast
+import bisect
 import contextlib
 import importlib.util
 import io
@@ -12,6 +13,7 @@ import os
 import re
 import signal
 import subprocess  # nosec B404 - Fixed argv is used for the zombie regression test.
+import sys
 import tempfile
 import time
 import unittest
@@ -49,6 +51,960 @@ ARGS = [
     "--round",
     "2",
 ]
+
+FIX5_PROBE_CASES: tuple[tuple[str, str, bool], ...] = (
+    (
+        "g01 grep -e then repo file then lane file",
+        "grep -E -e '.{80}' scripts/lane_brief.py .lane/tmp/draft.txt",
+        True,
+    ),
+    (
+        "g02 grep -f then repo file then lane file",
+        "grep -E -f .lane/tmp/pat scripts/lane_brief.py .lane/tmp/d.txt",
+        True,
+    ),
+    (
+        "g03 grep --regexp= joined",
+        "grep -E --regexp='.{80}' scripts/a.py .lane/tmp/d.txt",
+        True,
+    ),
+    (
+        "g04 grep --regexp spaced",
+        "grep -E --regexp '.{80}' scripts/a.py .lane/tmp/d.txt",
+        True,
+    ),
+    (
+        "g05 grep --file spaced",
+        "grep -E --file .lane/tmp/pat scripts/a.py .lane/tmp/d.txt",
+        True,
+    ),
+    (
+        "g06 grep -e joined value",
+        "grep -E -e.{80} scripts/a.py .lane/tmp/d.txt",
+        True,
+    ),
+    (
+        "g07 grep two -e options",
+        "grep -E -e '.{80}' -e x scripts/a.py .lane/tmp/d.txt",
+        True,
+    ),
+    (
+        "g08 control grep -e lane file only",
+        "grep -E -e '.{80}' .lane/tmp/draft.txt",
+        False,
+    ),
+    (
+        "g09 control grep plain pattern repo file",
+        "grep -E '.{80}' scripts/a.py",
+        True,
+    ),
+    (
+        "g10 control grep plain pattern lane file",
+        "grep -E '.{80}' .lane/tmp/d.txt",
+        False,
+    ),
+    (
+        "p01 diff then grep repo file then awk",
+        "git diff -- scripts/a.py | grep '^' scripts/a.py | awk 'length > 72'",
+        True,
+    ),
+    (
+        "p02 diff then cat repo file then wc",
+        "git diff -- scripts/a.py | cat scripts/a.py | wc -L",
+        True,
+    ),
+    (
+        "p03 diff then sed repo file then awk",
+        "git diff -- scripts/a.py | sed -n p scripts/a.py | awk 'length > 72'",
+        True,
+    ),
+    (
+        "p04 diff then grep stdin redirect repo file",
+        "git diff | grep '^' < scripts/a.py | awk 'length > 72'",
+        True,
+    ),
+    (
+        "p05 control diff then grep stdin then awk",
+        "git diff -- scripts/a.py | grep '^+' | awk 'length > 72'",
+        False,
+    ),
+    (
+        "p06 control diff then wc",
+        "git diff -- scripts/a.py | wc -L",
+        False,
+    ),
+    (
+        "a01 gawk -- length program repo file",
+        "gawk -- 'length > 72' scripts/a.py",
+        True,
+    ),
+    (
+        "a02 awk -- length program repo file",
+        "awk -- 'length > 72' scripts/a.py",
+        True,
+    ),
+    (
+        "a03 awk -F, -- length program repo file",
+        "awk -F, -- 'length > 72' scripts/a.py",
+        True,
+    ),
+    (
+        "a04 control awk -- print program repo file",
+        "awk -- '{print $1}' scripts/a.py",
+        False,
+    ),
+    (
+        "a05 control awk -- length program lane file",
+        "awk -- 'length > 72' .lane/tmp/a.txt",
+        False,
+    ),
+    (
+        "w01 wc -L -m repo then lane",
+        "wc -L -m scripts/a.py .lane/tmp/a.txt",
+        True,
+    ),
+    (
+        "w02 wc -m -L repo then lane",
+        "wc -m -L scripts/a.py .lane/tmp/a.txt",
+        True,
+    ),
+    (
+        "w03 wc -L -c repo then lane",
+        "wc -L -c scripts/a.py .lane/tmp/a.txt",
+        True,
+    ),
+    (
+        "w04 wc -L -l repo then lane",
+        "wc -L -l scripts/a.py .lane/tmp/a.txt",
+        True,
+    ),
+    (
+        "w05 wc -L -w repo then lane",
+        "wc -L -w scripts/a.py .lane/tmp/a.txt",
+        True,
+    ),
+    (
+        "w06 control wc -L -m lane only",
+        "wc -L -m .lane/tmp/a.txt",
+        False,
+    ),
+    (
+        "w07 grep -m value then repo file",
+        "grep -E -m 5 '.{80}' scripts/a.py",
+        True,
+    ),
+    (
+        "w08 control grep -m value lane file",
+        "grep -E -m 5 '.{80}' .lane/tmp/a.txt",
+        False,
+    ),
+    (
+        "r01 diff then leading stdin redirect wc",
+        "git diff -- scripts/a.py | < scripts/a.py wc -L",
+        True,
+    ),
+    (
+        "r02 leading stdin redirect wc alone",
+        "< scripts/a.py wc -L",
+        True,
+    ),
+    (
+        "r03 joined leading stdin redirect wc",
+        "<scripts/a.py wc -L",
+        True,
+    ),
+    (
+        "r04 fd0 leading stdin redirect wc",
+        "0< scripts/a.py wc -L",
+        True,
+    ),
+    (
+        "r05 diff then leading redirect awk",
+        "git diff | < scripts/a.py awk 'length > 72'",
+        True,
+    ),
+    (
+        "r06 control leading lane redirect wc",
+        "< .lane/tmp/a.txt wc -L",
+        False,
+    ),
+    (
+        "r07 control trailing stdin redirect repo",
+        "wc -L < scripts/a.py",
+        True,
+    ),
+)
+
+FIX5_G1_PARSE_CASES: tuple[tuple[str, bool], ...] = (
+    ("wc -Lm file", True),
+    ("wc -Lm .lane/tmp/a.txt", False),
+    ("wc -L --files0-from=.lane/tmp/list", True),
+    ("wc -L --files0-from=.lane/tmp/list .lane/tmp/a.txt", True),
+    ("wc --max-line-length file", True),
+    ("wc --max-line-length .lane/tmp/a.txt", False),
+    ("grep -nA3 '.\\{80\\}' file", True),
+    ("grep -nA3 '.\\{80\\}' .lane/tmp/a.txt", False),
+    ("grep --regexp='.\\{80\\}' file", True),
+    ("grep --regexp='.\\{80\\}' .lane/tmp/a.txt", False),
+    ("grep -E -- '.{80}' .lane/tmp/a.txt", False),
+    ("grep -rE '.{80}'", True),
+    ("grep -rE '.{80}' .lane/tmp/a.txt", True),
+    ("grep -d recurse -E '.{80}' .lane/tmp/a.txt", True),
+    ("rg -g '*.py' '.{80}' scripts", True),
+    ("rg -g '*.py' '.{80}' .lane/tmp/a.txt", False),
+    ("awk -F, -v x=1 'length > 72' file", True),
+    ("awk -F, -v x=1 'length > 72' .lane/tmp/a.txt", False),
+    ("awk -f .lane/tmp/p.awk scripts/a.py", True),
+    ("awk -f .lane/tmp/p.awk .lane/tmp/a.txt", True),
+    ("wc -L --bogus .lane/tmp/a.txt", True),
+    ("wc -L -Z .lane/tmp/a.txt", True),
+)
+
+FIX5_G3_CHAIN_CASES: tuple[tuple[str, bool], ...] = (
+    ("git diff | grep '^+' | awk 'length > 72'", False),
+    ("git diff | sed 's/^+//' | wc -L", False),
+    ("git diff | sed 's/error/warn/g' | wc -L", False),
+    ("git diff | cat | wc -L", False),
+    ("git diff | cat - | wc -L", False),
+    ("git diff | tr -d '\\r' | wc -L", False),
+    ("git diff | tee .lane/tmp/x | wc -L", True),
+    ("git diff | awk '{ getline l < \"scripts/a.py\" } 1' | wc -L", True),
+    ("git diff | awk '{ getline } 1' | wc -L", True),
+    ("git diff | awk '{ system(\"true\") }' | wc -L", True),
+    ("git diff | awk '{ print | \"cat\" }' | wc -L", True),
+    ("git diff | sed 'r scripts/a.py' | wc -L", True),
+    ("git diff | sed 's/a/b/w .lane/tmp/x' | wc -L", True),
+    ("git diff | sed 's/a/b/e' | wc -L", True),
+    ("git diff | grep -r x | wc -L", True),
+    ("git diff | grep x scripts/a.py | wc -L", True),
+    ("git diff | sort --files0-from=.lane/tmp/list | wc -L", True),
+)
+
+FIX6_PROBE_CASES: tuple[tuple[str, str, bool], ...] = (
+    (
+        "i01 awk ARGV reassign",
+        "git diff | awk 'BEGIN{ARGV[1]=\"scripts/a.py\";ARGC=2} 1' | wc -L",
+        True,
+    ),
+    (
+        "i02 awk ARGV append",
+        "git diff | awk 'BEGIN{ARGV[ARGC++]=\"scripts/a.py\"} 1' | wc -L",
+        True,
+    ),
+    (
+        "i03 gawk ARGV reassign",
+        "git diff | gawk 'BEGIN{ARGV[1]=\"scripts/a.py\";ARGC=2} 1' | wc -L",
+        True,
+    ),
+    (
+        "i04 awk ARGV via -v",
+        "git diff | awk -v f=scripts/a.py 'BEGIN{ARGV[1]=f;ARGC=2} 1' | wc -L",
+        True,
+    ),
+    (
+        "i05 awk ARGV string concat",
+        'git diff | awk \'BEGIN{ARGV[1]="scripts/" "a.py";ARGC=2} 1\' | wc -L',
+        True,
+    ),
+    (
+        "i06 gawk SYMTAB ARGV",
+        'git diff | gawk \'BEGIN{SYMTAB["ARGV"][1]="scripts/a.py";ARGC=2} 1\' | wc -L',
+        True,
+    ),
+    (
+        "i07 gawk SYMTAB ARGC",
+        'git diff | gawk \'BEGIN{SYMTAB["ARGC"]=2;ARGV[1]="scripts/a.py"} 1\' | wc -L',
+        True,
+    ),
+    (
+        "i08 gawk indirect builtin call",
+        'git diff | gawk \'BEGIN{f="system";@f("cat scripts/a.py")} 1\' | wc -L',
+        True,
+    ),
+    (
+        "i09 gawk @include",
+        "git diff | gawk '@include \"scripts/inc.awk\"\n1' | wc -L",
+        True,
+    ),
+    (
+        "i10 gawk -i include",
+        "git diff | gawk -i scripts/inc.awk 1 | wc -L",
+        True,
+    ),
+    (
+        "i11 awk print to command",
+        "git diff | awk '{print | \"cat scripts/a.py\"}' | wc -L",
+        True,
+    ),
+    (
+        "i12 awk command getline",
+        "git diff | awk 'BEGIN{\"cat scripts/a.py\" | getline l; print l} 1' | wc -L",
+        True,
+    ),
+    (
+        "i13 awk -f lane program",
+        "git diff | awk -f .lane/tmp/p.awk | wc -L",
+        True,
+    ),
+    (
+        "i14 awk getline from var",
+        "git diff | awk 'BEGIN{f=\"scripts/a.py\"; while ((getline l < f) > 0) print l} 1' | wc -L",
+        True,
+    ),
+    (
+        "i15 awk print redirect to file",
+        "git diff | awk '{print > \"/dev/stderr\"}' | wc -L",
+        True,
+    ),
+    (
+        "i16 gawk -e program ARGV",
+        "git diff | gawk -e 'BEGIN{ARGV[1]=\"scripts/a.py\";ARGC=2}' -e 1 | wc -L",
+        True,
+    ),
+    (
+        "i17 awk -- program ARGV",
+        "git diff | awk -- 'BEGIN{ARGV[1]=\"scripts/a.py\";ARGC=2} 1' | wc -L",
+        True,
+    ),
+    ("c01 awk field print", "git diff | awk '{print $1}' | wc -L", False),
+    ("c02 awk -v user var", "git diff | awk -v n=3 'NR > n' | wc -L", False),
+    (
+        "c03 awk user function",
+        "git diff | awk 'function f(x) { return x } { print f($0) }' | wc -L",
+        False,
+    ),
+    ("c04 awk regex filter", r"git diff | awk '/^\+/ && !/^\+\+\+/' | wc -L", False),
+    ("c05 awk sub strip", "git diff | awk '{ sub(/^\\+/, \"\") } 1' | wc -L", False),
+    ("c06 awk regex naming ARGV", "git diff | awk '$0 ~ /ARGV/' | wc -L", False),
+    (
+        "c07 awk string naming ARGV",
+        "git diff | awk '{ x = \"ARGV getline\" } 1' | wc -L",
+        False,
+    ),
+    ("c08 awk comment naming ARGV", "git diff | awk '# ARGV getline\n1' | wc -L", False),
+    ("c09 awk uppercase user var", "git diff | awk 'BEGIN { N = 72 } length < N' | wc -L", False),
+    ("c10 awk -F field split", "git diff | awk -F: '{print $2}' | wc -L", False),
+    ("c11 awk logical or and", "git diff | awk 'NR > 1 || NF == 0 && 1' | wc -L", False),
+    ("c12 awk division", "git diff | awk '{ print NF / 2 }' | wc -L", False),
+    (
+        "f01 awk final ARGV",
+        "git diff | awk 'BEGIN{ARGV[1]=\"scripts/a.py\";ARGC=2} length > 80'",
+        True,
+    ),
+    (
+        "f02 awk final ARGV append",
+        "git diff | awk 'BEGIN{ARGV[ARGC++]=\"scripts/a.py\"} length($0) > 80'",
+        True,
+    ),
+    (
+        "f03 gawk final -i include",
+        "git diff | gawk -i scripts/inc.awk 'length > 80'",
+        True,
+    ),
+    (
+        "f04 awk final print to command",
+        "git diff | awk 'length < 80 { print | \"cat scripts/a.py\" }'",
+        True,
+    ),
+    ("f05 awk final -f lane program", "git diff | awk -f .lane/tmp/p.awk", True),
+    (
+        "f06 gawk final SYMTAB",
+        'git diff | gawk \'BEGIN{SYMTAB["ARGV"][1]="scripts/a.py";ARGC=2} length > 80\'',
+        True,
+    ),
+    ("f07 awk final control", "git diff | awk 'length > 80'", False),
+    (
+        "f08 awk final control with NR",
+        "git diff | awk 'length($0) > 80 { print NR \": \" $0 }'",
+        False,
+    ),
+    (
+        "l01 awk lane ARGV reassign",
+        "awk 'BEGIN{ARGV[1]=\"scripts/a.py\";ARGC=2} length > 80' .lane/tmp/a.txt",
+        True,
+    ),
+    (
+        "l02 awk lane ARGV append",
+        "awk 'BEGIN{ARGV[ARGC++]=\"scripts/a.py\"} length > 80' .lane/tmp/a.txt",
+        True,
+    ),
+    (
+        "l03 awk lane print to command",
+        "awk 'length < 80 { print | \"cat scripts/a.py\" }' .lane/tmp/a.txt",
+        True,
+    ),
+    (
+        "l04 gawk lane -i include",
+        "gawk -i scripts/inc.awk 'length > 80' .lane/tmp/a.txt",
+        True,
+    ),
+    ("l05 awk lane -f lane program", "awk -f .lane/tmp/p.awk .lane/tmp/a.txt", True),
+    (
+        "l06 gawk lane SYMTAB",
+        'gawk \'BEGIN{SYMTAB["ARGV"][1]="scripts/a.py"} length > 80\' .lane/tmp/a.txt',
+        True,
+    ),
+    ("l07 awk lane control", "awk 'length > 80' .lane/tmp/a.txt", False),
+    ("l08 awk lane -v control", "awk -v n=80 'length > n' .lane/tmp/a.txt", False),
+    ("l09 wc lane control", "wc -L .lane/tmp/a.txt", False),
+    ("l10 grep lane control", "grep -E '.{80}' .lane/tmp/a.txt", False),
+)
+
+FIX6_AWK_SCANNER_CASES: tuple[tuple[str, bool], ...] = (
+    ('ARGV[1]="x"', False),
+    ("ARGC=2", False),
+    ('SYMTAB["ARGV"][1]="x"', False),
+    ('PROCINFO["x"]', False),
+    ('ENVIRON["X"]', False),
+    ("getline l", False),
+    ('"c" | getline', False),
+    ('system("x")', False),
+    ('close("x")', False),
+    ("fflush()", False),
+    ("nextfile", False),
+    ('@include "x"', False),
+    ("BEGINFILE{}", False),
+    ('print | "x"', False),
+    ('print > "x"', False),
+    ('print $1 >> "x"', False),
+    ('printf "%s" > "x"', False),
+    ("a & b", False),
+    (r"x = y \ z", False),
+    ("awk::NR", False),
+    ("foo(1)", False),
+    ('"unterminated', False),
+    ("/unterminated", False),
+    ("length > 72", True),
+    ("$0 ~ /ARGV/", True),
+    ("!/getline/", True),
+    ('{ x = "ARGV getline" } 1', True),
+    ("# ARGV getline\n1", True),
+    ("function f(x) { return x } { print f($0) }", True),
+    ("BEGIN { N = 72 } length < N", True),
+    ("NR > 1 || NF == 0 && 1", True),
+    ("{ print NF / 2 }", True),
+    ("{ print (a > b) }", True),
+    (r'printf("%s\n", $0)', True),
+    (r'{ sub(/^\+/, "") } 1', True),
+    ("NR > 1 \\\n&& NF == 0", True),
+)
+
+CLI_THREAD_CASES: tuple[tuple[str, bool], ...] = (
+    ("gawk -- 'length > 72' scripts/a.py", True),
+    ("awk -- '{print $1}' scripts/a.py", False),
+    ("awk -- 'length > 72' .lane/tmp/a.txt", False),
+    ("wc -L -m scripts/a.py .lane/tmp/a.txt", True),
+    ("wc -L -m .lane/tmp/a.txt", False),
+    ("git diff -- scripts/a.py | < scripts/a.py wc -L", True),
+    ("git diff | < scripts/a.py awk 'length > 72'", True),
+    ("< .lane/tmp/a.txt wc -L", False),
+    ("grep -E -e '.{80}' scripts/lane_brief.py .lane/tmp/draft.txt", True),
+    ("grep -E -e '.{80}' .lane/tmp/draft.txt", False),
+    ("git diff -- scripts/a.py | grep '^' scripts/a.py | awk 'length > 72'", True),
+    ("git diff -- scripts/a.py | cat scripts/a.py | awk 'length > 72'", True),
+    ("git diff -- scripts/a.py | grep '^+' | awk 'length > 72'", False),
+)
+
+MAKE_BAN_CASES: tuple[tuple[str, bool], ...] = (
+    ("Never run make.\n- `make fate-x`\n", True),
+    ("limits: Never run make or pre-commit.\n- `make -j4 fate-x`\n", True),
+    ("Never run make or praetorctl except praetorctl admit.\n- `make fate-x`\n", True),
+    ("Never run make.\n- host ran `make fate-x` (rc 0)\n", False),
+    ("Never run make.\nSee `make verify-all`.\n", False),
+    ("Never run `make` or `praetorctl`.\n", False),
+    ("Never run push.\n- `make fate-x`\n", False),
+    ("Never run make or praetorctl.\n- `make fate-x`\n", True),
+    ("Never run praetorctl.\n- `make fate-x`\n", True),
+    ("Never run make verify-all.\n- `make fate-x`\n", False),
+    (
+        (
+            "- `# Why: in a make recipe, column 1 is the recipe prefix, not a shell boundary.`\n"
+            "never run `make verify-all`, `make lint-all` or any whole-repository gate.\n"
+        ),
+        False,
+    ),
+    (
+        (
+            '- `self.skipTest("no cc or Vulkan headers; '
+            'VK_FFMPEG and VK_DEVICE make the build mandatory")`\n'
+            "Never run make, pre-commit, lefthook, praetorctl, semgrep, uv or pip; no network.\n"
+        ),
+        False,
+    ),
+    ("- `the make step`\nNever run make.\n", False),
+    (
+        (
+            "5. Planted cases: `make verify` with verify depending on test.\n"
+            "- never run a make target of a real repository.\n"
+        ),
+        True,
+    ),
+    ("- `cd tests && make fate-x`\nNever run make.\n", True),
+    ("- `FOO=1 make fate-x`\nNever run make.\n", True),
+    ("- `timeout 600 make fate-x`\nNever run make.\n", True),
+    ("Never run scripts that make network calls.\n- `make fate-x`\n", False),
+    ("Never run steps that make commits.\n- `make fate-x`\n", False),
+    ("Never run pre-commit, make or lefthook.\n- `make fate-x`\n", True),
+    ("never run a make target of a real repository.\n- `make fate-x`\n", True),
+    ("Never run make.\n- `praetorctl admit -- make fate-x`\n", True),
+)
+
+
+ROUND11_CASES: tuple[tuple[str, str, int, str], ...] = (
+    ("c01", "f1", 0, "Never run make.\n- `printf '%s\\n' 'example; make fate-x'`\n"),
+    ("c02", "f1", 1, "Never run make.\n- `cd tests && make fate-x`\n"),
+    ("c03", "f1", 0, "Never run make.\n- `make verify-all`\n"),
+    ("c04", "f1", 0, "Never run make.\n- host ran: `make fate-x`\n"),
+    ("c05", "f1", 1, 'Never run make.\n- `echo "$(make fate-x)"`\n'),
+    ("c06", "f1", 1, "Never run make.\n- `(make fate-x)`\n"),
+    ("c07", "f1", 1, "Never run make.\n- `timeout 60 nice -n 10 make fate-x`\n"),
+    ("c08", "f1", 0, "Never run make.\n- `echo 'a | make b'`\n"),
+    ("c09", "f2", 1, "Never run `echo a; echo b` or make.\n- `make fate-x`\n"),
+    ("c10", "f2", 0, "Never run `echo a`; make is fine.\n- `make fate-x`\n"),
+    ("c11", "f4", 0, "- `git diff | grep -F '|' | wc -L`\n"),
+    ("c12", "f4", 1, "- `cat scripts/a.py | wc -L`\n"),
+    ("c13", "f4", 0, "- `git diff ';' | wc -L`\n"),
+    ("c14", "f4", 0, "- `git diff | grep -F '>' | wc -L`\n"),
+    ("c15", "f4", 1, "- `git diff | wc -L; cat scripts/a.py | wc -L`\n"),
+    ("c16", "f5", 0, "- `grep -F '.{80}' scripts/a.py`\n"),
+    ("c17", "f5", 1, "- `grep -E '.{80}' scripts/a.py`\n"),
+    ("c18", "f5", 0, "- `fgrep '.{80}' scripts/a.py`\n"),
+    ("c19", "f5", 1, "- `grep -F -E '.{80}' scripts/a.py`\n"),
+    ("c20", "f5", 0, "- `grep -iF '.{80}' scripts/a.py`\n"),
+    ("c21", "f5", 0, "- `rg -F '.{80}' scripts/a.py`\n"),
+    ("c22", "f5", 1, "- `rg -F --no-fixed-strings '.{80}' scripts/a.py`\n"),
+    ("c23", "f5", 0, "- `grep '.{80}' scripts/a.py`\n"),
+    ("c24", "f6", 1, "- `wc -L .lane/tmp/a.txt 2 > /dev/null`\n"),
+    ("c25", "f6", 0, "- `wc -L .lane/tmp/a.txt 2>/dev/null`\n"),
+    ("c26", "f6", 1, "- `wc -L .lane/tmp/a.txt '2'>/dev/null`\n"),
+    ("c27", "f6", 0, "- `wc -L .lane/tmp/a.txt > /dev/null`\n"),
+    ("c28", "f7", 1, "- `printf '%s\\n' \"$(cat scripts/a.py)\" 'git diff' | wc -L`\n"),
+    ("c29", "f7", 0, "- `git diff --cached | wc -L`\n"),
+    ("c30", "f7", 1, "- `echo git diff | wc -L`\n"),
+    ("c31", "f7", 1, "- `GIT_PAGER=cat git --no-pager diff | wc -L`\n"),
+    ("c32", "f7", 1, '- `git diff "$(cat scripts/a.py)" | wc -L`\n'),
+    ("c33", "f7", 1, "- `git log | wc -L`\n"),
+    ("c34", "f7", 1, "- `git -c diff.external=x diff | wc -L`\n"),
+    ("c35", "f7", 1, "- `git difftool | wc -L`\n"),
+)
+
+FIX11_LENGTH_ROWS: tuple[tuple[str, str, bool], ...] = (
+    ("f4 quoted pipe is a pattern", "git diff | grep -F '|' | wc -L", False),
+    ("f4 quoted semicolon is an argument", "git diff ';' | wc -L", False),
+    ("f4 quoted greater-than is a pattern", "git diff | grep -F '>' | wc -L", False),
+    ("f4 quoted ampersand is a pattern", "git diff | grep -F '&' | wc -L", False),
+    ("f4 real pipe from a file read", "cat scripts/a.py | wc -L", True),
+    ("f4 real semicolon starts a command", "git diff | wc -L; cat scripts/a.py | wc -L", True),
+    ("f4 real and-list starts a command", "git diff | wc -L && cat scripts/a.py | wc -L", True),
+    ("f6 joined descriptor accepted", "wc -L .lane/tmp/a.txt 2>/dev/null", False),
+    ("f6 joined descriptor to descriptor accepted", "wc -L .lane/tmp/a.txt 2>&1", False),
+    ("f6 spaced digit is an operand", "wc -L .lane/tmp/a.txt 2 > /dev/null", True),
+    ("f6 quoted digit is an operand", "wc -L .lane/tmp/a.txt '2'>/dev/null", True),
+    ("f6 spaced redirect without digit", "wc -L .lane/tmp/a.txt > /dev/null", False),
+    ("f5 grep -F fixed", "grep -F '.{80}' scripts/a.py", False),
+    ("f5 grep --fixed-strings fixed", "grep --fixed-strings '.{80}' scripts/a.py", False),
+    ("f5 grep combined -iF fixed", "grep -iF '.{80}' scripts/a.py", False),
+    ("f5 grep combined -Fi fixed", "grep -Fi '.{80}' scripts/a.py", False),
+    ("f5 grep repeated -F fixed", "grep -F -F '.{80}' scripts/a.py", False),
+    ("f5 fgrep fixed", "fgrep '.{80}' scripts/a.py", False),
+    ("f5 rg -F fixed", "rg -F '.{80}' scripts/a.py", False),
+    ("f5 rg --fixed-strings fixed", "rg --fixed-strings '.{80}' scripts/a.py", False),
+    ("f5 rg last toggle fixed", "rg --no-fixed-strings -F '.{80}' scripts/a.py", False),
+    ("f5 grep -F -E mixed", "grep -F -E '.{80}' scripts/a.py", True),
+    ("f5 grep -E -F mixed", "grep -E -F '.{80}' scripts/a.py", True),
+    ("f5 grep -F -G mixed", "grep -F -G '.{80}' scripts/a.py", True),
+    ("f5 grep -F -P mixed", "grep -F -P '.{80}' scripts/a.py", True),
+    ("f5 grep long mixed", "grep -F --extended-regexp '.{80}' scripts/a.py", True),
+    ("f5 grep long basic mixed", "grep --fixed-strings --basic-regexp '.{80}' scripts/a.py", True),
+    ("f5 grep long perl mixed", "grep --perl-regexp --fixed-strings '.{80}' scripts/a.py", True),
+    ("f5 fgrep -E mixed", "fgrep -E '.{80}' scripts/a.py", True),
+    ("f5 fgrep -P mixed", "fgrep -P '.{80}' scripts/a.py", True),
+    ("f5 egrep stays regex", "egrep '.{80}' scripts/a.py", True),
+    ("f5 grep basic braces literal", "grep '.{80}' scripts/a.py", False),
+    ("f5 grep -E regex", "grep -E '.{80}' scripts/a.py", True),
+    ("f5 rg regex", "rg '.{80}' scripts/a.py", True),
+    ("f5 rg --no-fixed-strings last", "rg -F --no-fixed-strings '.{80}' scripts/a.py", True),
+    ("f5 rg -F with -P", "rg -F -P '.{80}' scripts/a.py", True),
+    ("f5 rg -F with --pcre2", "rg -F --pcre2 '.{80}' scripts/a.py", True),
+    ("f5 rg -F with --engine", "rg -F --engine pcre2 '.{80}' scripts/a.py", True),
+    ("f7 real git diff", "git diff --cached | wc -L", False),
+    ("f7 allowed --no-pager", "git --no-pager diff | wc -L", False),
+    ("f7 allowed -P", "git -P diff | wc -L", False),
+    ("f7 allowed --no-optional-locks", "git --no-optional-locks diff --stat | wc -L", False),
+    ("f7 assignment and option", "GIT_PAGER=cat git --no-pager diff | wc -L", True),
+    ("f7 printf names git diff", "printf '%s\\n' \"$(cat scripts/a.py)\" 'git diff' | wc -L", True),
+    ("f7 echo names git diff", "echo git diff | wc -L", True),
+    ("f7 echo then diff word", "echo diff | wc -L", True),
+    ("f7 printf then diff word", "printf diff | wc -L", True),
+    ("f7 substitution in git stage", 'git diff "$(cat scripts/a.py)" | wc -L', True),
+    ("f7 input redirect in git stage", "git diff < scripts/a.py | wc -L", True),
+    ("f7 other subcommand", "git log | wc -L", True),
+    ("f7 difftool subcommand", "git difftool | wc -L", True),
+    ("f7 -c option", "git -c diff.external=x diff | wc -L", True),
+    ("f7 joined -c option", "git -cdiff.external=x diff | wc -L", True),
+    ("f7 exec-path option", "git --exec-path=x diff | wc -L", True),
+    ("f7 paginate option", "git --paginate diff | wc -L", True),
+    ("f7 --no-index option", "git diff --no-index a b | wc -L", True),
+    ("f7 --output option", "git diff --output=x | wc -L", True),
+    ("f7 spaced --output option", "git diff --output x | wc -L", True),
+    ("f7 quoted git word", "'git' diff | wc -L", True),
+)
+
+ROUND12_CASES: tuple[tuple[str, str, int, str], ...] = (
+    ("r12-c01", "f1", 1, "- `awk 'length > 80' scripts/a.py \"`\n"),
+    ("r12-c02", "f1", 1, "- `grep -E '.{80}' scripts/a.py \"`\n"),
+    ("r12-c03", "f1", 0, "- `awk '{print $1}' scripts/a.py \"`\n"),
+    ("r12-c04", "f2", 1, "Never run make.\n- `make fate-x`; the host ran the old build.\n"),
+    ("r12-c05", "f2", 0, "Never run make.\n- host ran: `make fate-x`\n"),
+    ("r12-c06", "f2", 0, "Never run make.\n- host ran `make fate-x` (rc 0)\n"),
+    ("r12-c07", "f2", 0, "Never run make.\n1. host ran: `make fate-x`\n"),
+    ("r12-c08", "f2", 0, "Never run make.\n- Host ran: `make fate-x`\n"),
+    ("r12-c09", "f2", 1, "Never run make.\n- Note: host ran earlier; now run `make fate-x`.\n"),
+    ("r12-c10", "f2", 1, "- Check `wc -L scripts/a.py` as the host ran it.\n"),
+    ("r12-c11", "f2", 0, "- host ran: `wc -L scripts/a.py` (rc 0)\n"),
+    (
+        "r12-c12",
+        "f2",
+        1,
+        (
+            "Keep lines at most 80 columns.\n"
+            "- Join the call onto one line; the host ran the old form.\n"
+        ),
+    ),
+    (
+        "r12-c13",
+        "f2",
+        0,
+        "Keep lines at most 80 columns.\n- host ran: joined the call into one line.\n",
+    ),
+    ("r12-c14", "f3", 0, "Never run echo praetorctl.\n- `make fate-x`\n"),
+    ("r12-c15", "f3", 0, "Never run grep praetorctl AGENTS.md.\n- `make fate-x`\n"),
+    ("r12-c16", "f3", 1, "Never run push or praetorctl.\n- `make fate-x`\n"),
+    ("r12-c17", "f3", 1, "Never run praetorctl.\n- `make fate-x`\n"),
+    ("r12-c18", "f3", 1, "Never run git push, praetorctl, or lefthook.\n- `make fate-x`\n"),
+    ("r12-c19", "f3", 1, "Never run lefthook and praetorctl.\n- `make fate-x`\n"),
+    ("r12-c20", "f3", 1, "Never run `praetorctl audit`.\n- `make fate-x`\n"),
+    ("r12-c21", "f3", 0, "Never run praetorctl except admit.\n- `make fate-x`\n"),
+    ("r12-c22", "f4", 0, "- `git diff |\nwc -L`\n"),
+    ("r12-c23", "f4", 0, "- `git diff | \n  wc -L`\n"),
+    ("r12-c24", "f4", 1, "- `cat scripts/a.py |\nwc -L`\n"),
+    ("r12-c25", "f4", 1, "- `git diff\nwc -L scripts/a.py`\n"),
+    ("r12-c26", "f4", 0, "- `git diff &&\ngit diff --cached | wc -L`\n"),
+    ("r12-c27", "f4", 1, "Never run make.\n- `cd tests &&\nmake fate-x`\n"),
+    ("r12-c28", "f5", 1, "Never run make.\n- `'make' fate-x`\n"),
+    ("r12-c29", "f5", 1, 'Never run make.\n- `"make" fate-x`\n'),
+    ("r12-c30", "f5", 1, "Never run make.\n- `m'ake' fate-x`\n"),
+    ("r12-c31", "f5", 0, "Never run make.\n- `echo 'make' fate-x`\n"),
+    ("r12-c32", "f5", 0, "Never run make.\n- `'make verify-all'`\n"),
+    ("r12-c33", "f5", 0, "Never run make.\n- `'make' verify-all`\n"),
+    ("r12-c34", "f6", 1, "Never run make.\n- `make verify-all clean`\n"),
+    ("r12-c35", "f6", 1, "Never run make.\n- `make verify-all-local`\n"),
+    ("r12-c36", "f6", 1, "Never run make.\n- `make verify-all.x`\n"),
+    ("r12-c37", "f6", 0, "Never run make.\n- `make verify-all`\n"),
+    ("r12-c38", "f6", 0, "Never run make.\n- `make verify-all && echo ok`\n"),
+    ("r12-c39", "f6", 0, "Never run make.\n- `make verify-all | tail -3`\n"),
+    ("r12-c40", "f6", 0, "Never run make.\n- `make verify-all 2>&1 | tail -3`\n"),
+    ("r12-c41", "f6", 1, 'Never run make.\n- `make verify-all-local "`\n'),
+    ("r12-c42", "f7", 0, "- `printf '%s\\n' wc -L`\n"),
+    ("r12-c43", "f7", 0, "- `echo grep -E '.{80}' scripts/a.py`\n"),
+    ("r12-c44", "f7", 1, "- `git diff --name-only | xargs wc -L`\n"),
+    ("r12-c45", "f7", 1, "- `env LC_ALL=C wc -L scripts/a.py`\n"),
+    ("r12-c46", "f7", 1, "- `timeout 5 wc -L scripts/a.py`\n"),
+    ("r12-c47", "f7", 1, "- `nice -n 5 grep -E '.{80}' scripts/a.py`\n"),
+    ("r12-c48", "f7", 1, "- `command wc -L scripts/a.py`\n"),
+    ("r12-c49", "f7", 1, "- `/usr/bin/wc -L scripts/a.py`\n"),
+    ("r12-c50", "f7", 1, "- `LC_ALL=C wc -L scripts/a.py`\n"),
+    ("r12-c51", "f7", 1, "- `find scripts -name '*.py' -exec wc -L {} +`\n"),
+    ("r12-c52", "f7", 1, "- `sudo wc -L scripts/a.py`\n"),
+    ("r12-c53", "f8", 0, "- `grep '.{80}' scripts/a.py`\n"),
+    ("r12-c54", "f8", 1, "- `grep '.\\{80\\}' scripts/a.py`\n"),
+    ("r12-c55", "f8", 1, "- `grep -e '.\\{80\\}' scripts/a.py`\n"),
+    ("r12-c56", "f8", 1, "- `grep -G '.\\{80\\}' scripts/a.py`\n"),
+    ("r12-c57", "f8", 0, "- `grep -G '.{80}' scripts/a.py`\n"),
+    ("r12-c58", "f8", 1, "- `grep -E '.{80}' scripts/a.py`\n"),
+    ("r12-c59", "f8", 0, "- `grep -E '.\\{80\\}' scripts/a.py`\n"),
+    ("r12-c60", "f8", 1, "- `egrep '.{80}' scripts/a.py`\n"),
+    ("r12-c61", "f8", 1, "- `grep -P '.{80}' scripts/a.py`\n"),
+    ("r12-c62", "f8", 1, "- `rg '.{80}' scripts/a.py`\n"),
+    ("r12-c63", "f8", 0, "- `rg '.\\{80\\}' scripts/a.py`\n"),
+    ("r12-c64", "f8", 1, "- `grep -E -G '.\\{80\\}' scripts/a.py`\n"),
+    ("r12-c65", "f9", 1, "- `git diff | wc -L 0<>scripts/a.py`\n"),
+    ("r12-c66", "f9", 1, "- `git diff | wc -L <>scripts/a.py`\n"),
+    ("r12-c67", "f9", 1, "- `git diff | wc -L 0>&3`\n"),
+    ("r12-c68", "f9", 1, "- `git diff | wc -L <&3`\n"),
+    ("r12-c69", "f9", 1, "- `git diff | 0<>scripts/a.py wc -L`\n"),
+    ("r12-c70", "f9", 1, "- `git diff | sort 0<>scripts/a.py | wc -L`\n"),
+    ("r12-c71", "f9", 1, "- `git diff | wc -L 3<scripts/a.py`\n"),
+    ("r12-c72", "f9", 1, "- `git diff | wc -L 0< scripts/a.py`\n"),
+    ("r12-c73", "f9", 0, "- `git diff | wc -L 2>/dev/null`\n"),
+    ("r12-c74", "f9", 0, "- `git diff | wc -L 2>&1`\n"),
+    ("r12-c75", "f9", 0, "- `git diff | wc -L`\n"),
+    ("r12-c76", "f9", 0, "- `git diff | grep -E '.{80}' 2>/dev/null`\n"),
+    ("r12-c77", "f10", 1, "- `git diff /dev/null scripts/a.py | wc -L`\n"),
+    ("r12-c78", "f10", 1, "- `git diff -- /dev/null scripts/a.py | wc -L`\n"),
+    ("r12-c79", "f10", 1, "- `git diff ../outside.txt scripts/a.py | wc -L`\n"),
+    ("r12-c80", "f10", 1, "- `git diff /etc/hostname scripts/a.py | wc -L`\n"),
+    ("r12-c81", "f10", 1, "- `git diff ~/x scripts/a.py | wc -L`\n"),
+    ("r12-c82", "f10", 1, '- `git diff "$HOME/x" scripts/a.py | wc -L`\n'),
+    ("r12-c83", "f10", 0, "- `git diff -U0 -- scripts/a.py | wc -L`\n"),
+    ("r12-c84", "f10", 0, "- `git diff HEAD~1 -- scripts/a.py | wc -L`\n"),
+    ("r12-c85", "f10", 0, "- `git diff scripts/a.py scripts/b.py | wc -L`\n"),
+    ("r12-c86", "f10", 0, "- `git diff --cached | wc -L`\n"),
+    ("r12-c87", "f11", 0, "- `git -C other -C {ABS} rev-parse HEAD`\nHEAD {NESTED}\n"),
+    ("r12-c88", "f11", 1, "- `git -C missing -C {ABS} rev-parse HEAD`\nHEAD {NESTED}\n"),
+    ("r12-c89", "f11", 1, "- `git -C sub/missing -C ../nested rev-parse HEAD`\nHEAD {NESTED}\n"),
+    ("r12-c90", "f11", 1, "- `git -C sub -C missing -C {ABS} rev-parse HEAD`\nHEAD {NESTED}\n"),
+    ("r12-c91", "f11", 0, "- `git -C sub -C nested rev-parse HEAD`\nHEAD {NESTED}\n"),
+    ("r12-c92", "f11", 0, "- `git -C '' -C sub/nested rev-parse HEAD`\nHEAD {NESTED}\n"),
+)
+
+ROUND12_EXTRA_ROWS: tuple[tuple[str, str, int, str], ...] = (
+    ("r12-x01", "f2", 0, "Never run make.\n- HOST RAN: `make fate-x`\n"),
+    ("r12-x02", "f2", 0, "Never run make.\n  2) host ran: `make fate-x`\n"),
+    ("r12-x03", "f2", 1, "Never run make.\n- hosted ran: `make fate-x`\n"),
+    ("r12-x04", "f2", 1, "Never run make.\n- the host ran: `make fate-x`\n"),
+    ("r12-x05", "f3", 0, "Never run praetorctl gate.\n- `make fate-x`\n"),
+    ("r12-x06", "f3", 1, "Never run an echo or any praetorctl audit.\n- `make fate-x`\n"),
+    ("r12-x07", "f3", 0, "Never run echo and grep praetorctl.\n- `make fate-x`\n"),
+    ("r12-x08", "f4", 1, "- `git diff '|'\nwc -L scripts/a.py`\n"),
+    ("r12-x09", "f4", 0, "- `git diff |&\nwc -L`\n"),
+    ("r12-x10", "f4", 1, "- `git diff ||\nwc -L scripts/a.py`\n"),
+    ("r12-x11", "f5", 1, 'Never run make.\n- `"make"`\n'),
+    ("r12-x12", "f5", 0, 'Never run make.\n- `echo "make" verify-all-local`\n'),
+    ("r12-x13", "f6", 0, "Never run make.\n- `make verify-all 2>&1`\n"),
+    ("r12-x14", "f6", 0, "Never run make.\n- `make VERIFY-ALL 2>/dev/null`\n"),
+    ("r12-x15", "f6", 1, "Never run make.\n- `make verify-all fate-x`\n"),
+    ("r12-x16", "f6", 1, "Never run make.\n- `make verify-all-local 2>&1`\n"),
+    ("r12-x17", "f6", 0, "Never run make.\n- `make verify-all > out.txt`\n"),
+    ("r12-x18", "f6", 1, 'Never run make.\n- `make verify-all 2>&1 "`\n'),
+    ("r12-x19", "f6", 1, 'Never run make.\n- `make verify-all clean "`\n'),
+    ("r12-x20", "f7", 1, "- `echo $(wc -L scripts/a.py)`\n"),
+    ("r12-x21", "f7", 0, "- `echo wc -L scripts/a.py`\n"),
+    ("r12-x22", "f8", 1, "- `grep -G -E '.\\{80\\}' scripts/a.py`\n"),
+    ("r12-x23", "f8", 1, "- `grep -E -G '.{80}' scripts/a.py`\n"),
+    ("r12-x24", "f8", 0, "- `grep -P '.\\{80\\}' scripts/a.py`\n"),
+    ("r12-x25", "f8", 1, "- `fgrep -E '.\\{80\\}' scripts/a.py`\n"),
+    ("r12-x26", "f8", 1, "- `egrep -G '.\\{80\\}' scripts/a.py`\n"),
+    ("r12-x27", "f8", 0, "- `egrep '.\\{80\\}' scripts/a.py`\n"),
+    ("r12-x28", "f8", 1, "- `grep --basic-regexp '.\\{80,\\}' scripts/a.py`\n"),
+    ("r12-x29", "f9", 1, "- `git diff | wc -L <<<x`\n"),
+    ("r12-x30", "f9", 1, "- `git diff | wc -L 0<<<x`\n"),
+    ("r12-x31", "f9", 0, "- `git diff | wc -L 1>/dev/null`\n"),
+    ("r12-x32", "f9", 0, "- `git diff | wc -L &>/dev/null`\n"),
+    ("r12-x33", "f10", 0, "- `git diff HEAD~1..HEAD -- scripts/a.py | wc -L`\n"),
+    ("r12-x34", "f10", 0, "- `git diff a..b | wc -L`\n"),
+    ("r12-x35", "f10", 1, "- `git diff -- ../a.py | wc -L`\n"),
+    ("r12-x36", "f10", 1, "- `git diff -- sub/../../a.py | wc -L`\n"),
+    ("r12-x37", "f10", 0, "- `git diff -U0 -- scripts/a.py 2>/dev/null | wc -L`\n"),
+    ("r12-x38", "f11", 1, "- `git -C missing -C other -C {ABS} rev-parse HEAD`\nHEAD {NESTED}\n"),
+    ("r12-x39", "f11", 0, "- `git -C other -C ../sub/nested rev-parse HEAD`\nHEAD {NESTED}\n"),
+)
+
+ROUND13_CASES: tuple[tuple[str, str, int, str], ...] = (
+    ("r13-d01", "g1", 1, "Never run make.\n- `> build.log make fate-x`\n"),
+    ("r13-d02", "g1", 1, "Never run make.\n- `2>err make fate-x`\n"),
+    ("r13-d03", "g1", 1, "Never run make.\n- `cd x && > log make all`\n"),
+    ("r13-d04", "g1", 1, "Never run make.\n- `<in.txt make fate-x`\n"),
+    ("r13-d05", "g1", 1, "Never run make.\n- `> log FOO=1 make fate-x`\n"),
+    ("r13-d06", "g1", 1, "Never run make.\n- `FOO=1 > log make fate-x`\n"),
+    ("r13-d07", "g1", 1, "Never run make.\n- `2>&1 make fate-x`\n"),
+    ("r13-d08", "g1", 1, "Never run make.\n- `>>log 2>&1 make fate-x`\n"),
+    ("r13-d09", "g1", 1, "Never run make.\n- `> log env make fate-x`\n"),
+    ("r13-d10", "g1", 0, "Never run make.\n- `> build.log make verify-all`\n"),
+    ("r13-d11", "g1", 0, "Never run make.\n- `echo > build.log make`\n"),
+    ("r13-d12", "g1", 0, "Never run make.\n- `> make fate-x`\n"),
+    ("r13-d13", "g1", 0, "Never run make.\n- `'>' make fate-x`\n"),
+    ("r13-d14", "g1", 1, "Never run praetorctl.\n- `> build.log make fate-x`\n"),
+    ("r13-d15", "g1", 0, "Never run make.\n- host ran: `> build.log make fate-x`\n"),
+    ("r13-d16", "g1", 1, "Never run make.\n- `env > log make fate-x`\n"),
+    ("r13-d17", "g1", 1, "Never run make.\n- `> log nohup make all`\n"),
+    ("r13-d18", "g1", 1, "Never run make.\n- `2> err make`\n"),
+    ("r13-e01", "g2", 1, "Never run make.\n- `make verify-all >/dev/null clean`\n"),
+    ("r13-e02", "g2", 1, "Never run make.\n- `make verify-all 2>&1 clean`\n"),
+    ("r13-e03", "g2", 1, "Never run make.\n- `make verify-all > log clean`\n"),
+    ("r13-e04", "g2", 1, "Never run make.\n- `make verify-all 2>err -k`\n"),
+    ("r13-e05", "g2", 0, "Never run make.\n- `make verify-all >/dev/null`\n"),
+    ("r13-e06", "g2", 0, "Never run make.\n- `make verify-all > log 2>&1`\n"),
+    ("r13-e07", "g2", 0, "Never run make.\n- `make verify-all >log && echo ok`\n"),
+    ("r13-e08", "g2", 1, 'Never run make.\n- `make verify-all >/dev/null clean "`\n'),
+    ("r13-e09", "g2", 1, 'Never run make.\n- `make verify-all 2>&1 clean "`\n'),
+    ("r13-e10", "g2", 0, "Never run make.\n- `make verify-all 2>&1 >/dev/null`\n"),
+    ("r13-e11", "g2", 1, "Never run make.\n- `make verify-all >/dev/null 2>err -k`\n"),
+    ("r13-e12", "g2", 1, 'Never run make.\n- `make verify-all >/dev/null "`\n'),
+    ("r13-e13", "g2", 0, "Never run make.\n- `make verify-all >/dev/null | tee x`\n"),
+    ("r13-f01", "g3", 0, "- `echo wc -L $(echo text)`\n"),
+    ("r13-f02", "g3", 0, "- `printf '%s\\n' wc -L $(date)`\n"),
+    ("r13-f03", "g3", 0, "- `echo grep -E '.{80}' $(echo x)`\n"),
+    ("r13-f04", "g3", 1, "- `echo $(wc -L scripts/a.py)`\n"),
+    ("r13-f05", "g3", 1, "- `echo $(LC_ALL=C wc -L scripts/a.py)`\n"),
+    ("r13-f06", "g3", 1, "- `echo x $(timeout 5 wc -L scripts/a.py)`\n"),
+    ("r13-f07", "g3", 1, "- `echo $(echo x) $(wc -L scripts/a.py)`\n"),
+    ("r13-f08", "g3", 1, "- `printf '%s' \"$(wc -L scripts/a.py)\"`\n"),
+    ("r13-f09", "g3", 1, "- `git diff --name-only | xargs wc -L`\n"),
+    ("r13-f10", "g3", 1, "- `echo x; wc -L scripts/a.py`\n"),
+    ("r13-f11", "g3", 0, "- `echo $(date) wc -L scripts/a.py`\n"),
+    ("r13-f12", "g3", 1, "- `echo $(echo $(wc -L scripts/a.py))`\n"),
+    ("r13-f13", "g3", 1, "- `echo $(cat scripts/a.py | wc -L)`\n"),
+    ("r13-f14", "g3", 1, "- `echo ( wc -L scripts/a.py )`\n"),
+    ("r13-j01", "g4", 1, "at most 80 cols\nJoin the call onto one line, not two.\n"),
+    ("r13-j02", "g4", 0, "at most 80 cols\nDo not join the call onto one line.\n"),
+    ("r13-j03", "g4", 1, "at most 80 cols\nDo not wrap. Join the call onto one line.\n"),
+    ("r13-j04", "g4", 1, "at most 80 cols\nNever split it; join the call onto one line.\n"),
+    ("r13-j05", "g4", 0, "at most 80 cols\nWrap it, but do not join the call onto one line.\n"),
+    ("r13-h01", "g5", 1, "- `GIT_EXTERNAL_DIFF=cat git diff | wc -L`\n"),
+    ("r13-h02", "g5", 1, "- `env GIT_EXTERNAL_DIFF=cat git diff | wc -L`\n"),
+    ("r13-h03", "g5", 1, "- `git diff --ext-diff | wc -L`\n"),
+    (
+        "r13-h04",
+        "g5",
+        1,
+        (
+            "- `GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=diff.external "
+            "GIT_CONFIG_VALUE_0=cat git diff | wc -L`\n"
+        ),
+    ),
+    ("r13-h05", "g5", 1, "- `git -c diff.external=cat diff | wc -L`\n"),
+    ("r13-h06", "g5", 1, "- `GIT_DIR=/tmp/x git diff | wc -L`\n"),
+    ("r13-h07", "g5", 0, "- `LC_ALL=C git diff | wc -L`\n"),
+    ("r13-h08", "g5", 1, "- `git diff -O/etc/hostname | wc -L`\n"),
+    ("r13-h11", "g5", 1, "- `git diff -U99999 | wc -L`\n"),
+    ("r13-h12", "g5", 1, "- `git diff --unified=99999 | wc -L`\n"),
+    ("r13-h13", "g5", 1, "- `git diff -W | wc -L`\n"),
+    ("r13-h14", "g5", 1, "- `git diff --function-context | wc -L`\n"),
+    ("r13-h15", "g5", 1, "- `GIT_CONFIG_PARAMETERS=\"'diff.external=cat'\" git diff | wc -L`\n"),
+    ("r13-h16", "g5", 1, "- `env -i git diff | wc -L`\n"),
+    ("r13-h17", "g5", 0, "- `env LC_ALL=C git diff | wc -L`\n"),
+    ("r13-h18", "g5", 0, "- `git diff --staged | wc -L`\n"),
+    ("r13-h19", "g5", 0, "- `git diff --cached --no-ext-diff -- scripts/a.py | wc -L`\n"),
+    ("r13-h20", "g5", 0, "- `git diff HEAD~1..HEAD -- scripts/a.py | wc -L`\n"),
+    ("r13-h21", "g5", 1, "- `LANG=C GIT_EXTERNAL_DIFF=cat git diff | wc -L`\n"),
+    ("r13-h09", "g5", 0, "- `git diff --no-ext-diff | wc -L`\n"),
+    ("r13-h10", "g5", 0, "- `git diff | wc -L`\n"),
+    ("r13-k01", "g6", 1, "- `printf '%s\\n' \"$(cat scripts/a.py)\" 'git diff' | wc -L`\n"),
+)
+
+ROUND13_G5_LENGTH_ROWS: tuple[tuple[str, str, bool], ...] = (
+    ("context 3 accepted", "git diff -U3 | wc -L", False),
+    ("context 4 refused", "git diff -U4 | wc -L", True),
+    ("long context 3 accepted", "git diff --unified=3 | wc -L", False),
+    ("long context 4 refused", "git diff --unified=4 | wc -L", True),
+    ("locale upper-case name accepted", "LC_CTYPE=C git diff | wc -L", False),
+    ("locale lower-case name refused", "LC_ctype=C git diff | wc -L", True),
+    ("pager assignment without option refused", "GIT_PAGER=cat git diff | wc -L", True),
+    ("leading output redirect accepted", "> out.txt git diff | wc -L", False),
+    ("leading input redirect refused", "< scripts/a.py git diff | wc -L", True),
+    ("allow-listed option after redirect", "git diff 2>/dev/null --stat | wc -L", False),
+    ("refused option after redirect", "git diff 2>/dev/null --ext-diff | wc -L", True),
+    ("options stop at double dash", "git diff -- --ext-diff | wc -L", False),
+    ("pager option still allowed", "git --no-pager diff | wc -L", False),
+)
+
+FALLBACK_TOOLS = ("awk", "gawk", "mawk", "nawk", "grep", "egrep", "fgrep", "rg", "wc", "cat")
+FALLBACK_EXPRESSIONS = (
+    "length > 80",
+    "length($0)",
+    "length(x)",
+    "x.length",
+    "-L",
+    "-c",
+    ".{80}",
+    ".\\{80\\}",
+    "\\.{80}",
+    ".{8}",
+)
+
+
+JOIN_DIFFERENTIAL_BRIEFS: tuple[str, ...] = (
+    "at most 80 cols.\njoin the call onto a single line.\n",
+    "at most 100 cols.\n- don't join the call onto one line.\n",
+    "at most 100 cols.\n- never let the call go to one line.\n",
+    "no line you write longer than 100 columns.\n  - finding: round 1 joined it into one line.\n",
+    "no line you write longer than 100 columns.\n- host ran: joined the call into one line.\n",
+    "no line you write longer than 100 columns.\nDo not touch the header. Join it onto one line.\n",
+    "Keep lines at most 72 columns.\nDo not touch the header, but join the call onto one line.\n",
+    "over 100 columns.\nask it to go to one line.\n",
+    "more than 120 columns.\nit must be joined into one line.\n",
+    "<= 80 columns.\ncode becomes a single line.\n",
+    "limit: at most 80 columns.\n" + "Do not join the call onto one line. " * 40,
+    "limit: at most 80 columns.\n"
+    + "- do not join the call onto one line.\n- join it onto one line.\n" * 20,
+    "limit: at most 80 columns.\n" + "Do not touch it, but join the call onto one line. " * 20,
+    "limit: at most 80 columns.\n"
+    + "Never join it onto one line; however join that onto one line! " * 20,
+    "limit: at most 80 columns.\n\n"
+    + "Do not join it onto one line.\n\nJoin it onto one line.\n" * 20,
+)
+
+
+JOIN_COST_HEAD = "at most 80 cols\n"
+JOIN_COST_LINE = "Do not join the call onto one line\n"
+JOIN_COST_COPIES = 9000
+JOIN_COST_LIMIT = 4
+
+
+def reference_join_segment(
+    content: str, boundaries: lane_brief.JoinBoundaries, position: int
+) -> str:
+    """Return the segment as the slice-based helper of the previous version built it."""
+    index = bisect.bisect_right(boundaries.ends, position)
+    if index < len(boundaries.starts) and boundaries.starts[index] < position:
+        return lane_brief.JOIN_BOUNDARY.split(content[:position])[-1]
+    begin = boundaries.ends[index - 1] if index else 0
+    return content[begin:position]
+
+
+def reference_join_excluded(
+    content: str, match: re.Match[str], boundaries: lane_brief.JoinBoundaries
+) -> bool:
+    """Return the exclusion verdict as the slice-based helper of the previous version did."""
+    start, end = lane_brief.line_bounds(content, match.start(), match.end())
+    line = content[start:end]
+    if lane_brief.FINDING_PREFIX.match(line) or lane_brief.is_host_record(line):
+        return True
+    segment = reference_join_segment(content, boundaries, match.start())
+    return bool(lane_brief.JOIN_NEGATION.search(segment))
+
+
+class SliceCountingStr(str):
+    """A str that counts the characters copied by slices taken from it."""
+
+    copied = 0
+
+    def __getitem__(self, key: int | slice) -> str:
+        """Return the item and count the characters of a slice."""
+        result = super().__getitem__(key)
+        if isinstance(key, slice):
+            self.copied += len(result)
+        return result
+
+
+class CountingPattern:
+    """Wrap a compiled pattern and count every scan method call."""
+
+    def __init__(self, pattern: re.Pattern[str]) -> None:
+        """Remember the wrapped pattern and start counting at zero."""
+        self.pattern = pattern
+        self.calls = 0
+
+    def finditer(self, *args: object) -> object:
+        """Count and forward finditer."""
+        self.calls += 1
+        return self.pattern.finditer(*args)
+
+    def split(self, *args: object) -> list[str]:
+        """Count and forward split."""
+        self.calls += 1
+        return self.pattern.split(*args)
+
+    def search(self, *args: object) -> object:
+        """Count and forward search."""
+        self.calls += 1
+        return self.pattern.search(*args)
+
+    def match(self, *args: object) -> object:
+        """Count and forward match."""
+        self.calls += 1
+        return self.pattern.match(*args)
 
 
 def _signal_probe(pid: int) -> bool:
@@ -513,6 +1469,1281 @@ class LaneBriefTest(unittest.TestCase):
         self.assertIn("missing required line", error)
         self.assertFalse(calls.exists())
 
+    def check_snippet(self, snippet: str, *, worktree: Path | None = None) -> tuple[int, str]:
+        """Validate a rendered brief containing snippet and return status and stderr."""
+        brief = self.root / "brief.md"
+        brief.write_text(f"{self.rendered()}\n{snippet}", encoding="utf-8")
+        target = worktree if worktree is not None else self.root
+        rc, _, error = self.run_cli(
+            "check", str(brief), "--worktree", str(target), "--config", str(CONFIG)
+        )
+        return rc, error
+
+    def commit_fixture(self) -> tuple[Path, str]:
+        """Create a one-commit temporary Git repository and return its path and HEAD."""
+        worktree = repo(self.root / "worktree")
+        commit = run_git(worktree, "rev-parse", "HEAD", preserve_config=True)
+        return worktree, commit
+
+    def test_conflict_does_not_call_runner(self) -> None:
+        """Reject a conflicting brief before checking isolation or invoking the runner."""
+        brief, runner, calls = self.runner_fixture()
+        content = brief.read_text(encoding="utf-8")
+        brief.write_text(content + "\n- `wc -L tests/checkasm/vvc_mc.c`\n", encoding="utf-8")
+        rc, _, error = self.run_cli("check", str(brief), "--runner", str(runner))
+        self.assertEqual(rc, 1, error)
+        self.assertIn(f"{brief}: conflict:", error)
+        self.isolation.assert_not_called()
+        self.assertFalse(calls.exists())
+
+    def test_conflict_case_1a_refused(self) -> None:
+        """Refuse case 1a naming make in backticks while forbidding praetorctl."""
+        rc, error = self.check_snippet(
+            "- `nice -n 10 make -j6 x > log`\n"
+            "limits: Never run cherry-pick, rebase, lefthook or praetorctl; never\n"
+        )
+        self.assertEqual(rc, 1, error)
+        self.assertIn("conflict:", error)
+        self.assertIn("nice -n 10 make -j6 x > log", error)
+        self.assertIn("praetorctl admit", error)
+
+    def test_conflict_case_1b_passes(self) -> None:
+        """Pass case 1b when Never run forbids both make and praetorctl."""
+        rc, error = self.check_snippet(
+            "host builds.\n"
+            "limits: Never run make, cherry-pick, rebase, lefthook or praetorctl; never\n"
+        )
+        self.assertEqual(rc, 0, error)
+
+    def test_conflict_case_1c_passes(self) -> None:
+        """Pass case 1c when praetorctl is forbidden without any make command."""
+        rc, error = self.check_snippet(
+            "- `git add a`\nlimits: Never run push or praetorctl; never\n"
+        )
+        self.assertEqual(rc, 0, error)
+
+    def test_conflict_case_1d_passes(self) -> None:
+        """Pass case 1d when make is named without forbidding praetorctl."""
+        rc, error = self.check_snippet("- `make fate-x`\nlimits: Never run push; never\n")
+        self.assertEqual(rc, 0, error)
+
+    def test_conflict_case_2a_refused(self) -> None:
+        """Refuse case 2a asking a declaration to become one line under 100 columns."""
+        rc, error = self.check_snippet(
+            "- FFmpeg style: no line you write longer than 100 columns.\n"
+            "  2. `alf_gradient_tmp` (`int32_t`; the two-line declaration becomes one line).\n"
+        )
+        self.assertEqual(rc, 1, error)
+        self.assertIn("conflict:", error)
+        self.assertIn("becomes one line", error)
+        self.assertIn("longer than 100 columns", error)
+        self.assertIn("exact wrapped form", error)
+
+    def test_conflict_case_2b_passes(self) -> None:
+        """Pass case 2b asking for one line when no column limit is set."""
+        rc, error = self.check_snippet("the two-line declaration becomes one line.\n")
+        self.assertEqual(rc, 0, error)
+
+    def test_conflict_case_2c_passes(self) -> None:
+        """Pass case 2c giving a wrapped form under a 100-column limit."""
+        rc, error = self.check_snippet(
+            "no line you write longer than 100 columns.\n"
+            "write it as two lines:\n"
+            "```c\n"
+            "    a *\n"
+            "        b;\n"
+            "```\n"
+        )
+        self.assertEqual(rc, 0, error)
+
+    def test_conflict_case_2d_refused(self) -> None:
+        """Refuse case 2d joining a call onto a single line under 80 cols."""
+        rc, error = self.check_snippet("at most 80 cols.\njoin the call onto a single line.\n")
+        self.assertEqual(rc, 1, error)
+        self.assertIn("conflict:", error)
+        self.assertIn("join the call onto a single line", error)
+        self.assertIn("at most 80 cols", error)
+
+    def test_conflict_case_3a_refused(self) -> None:
+        """Refuse case 3a running awk length on a whole file."""
+        rc, error = self.check_snippet(
+            "- `awk 'length($0) > 100 {print FILENAME\":\"FNR}' "
+            "libavfilter/tests/hqdn3d_vulkan.c` (must print nothing)\n"
+        )
+        self.assertEqual(rc, 1, error)
+        self.assertIn("conflict:", error)
+        self.assertIn("hqdn3d_vulkan.c", error)
+        self.assertIn("added lines of a git diff", error)
+
+    def test_conflict_case_3b_refused(self) -> None:
+        """Refuse case 3b running grep with a dot-repeat width on a whole file."""
+        rc, error = self.check_snippet(r"- `grep -n '.\{101\}' libavcodec/vvc/inter.c`" + "\n")
+        self.assertEqual(rc, 1, error)
+        self.assertIn("conflict:", error)
+        self.assertIn(r"grep -n '.\{101\}' libavcodec/vvc/inter.c", error)
+        self.assertIn("added lines of a git diff", error)
+
+    def test_conflict_case_3c_refused(self) -> None:
+        """Refuse case 3c running wc -L on a whole file."""
+        rc, error = self.check_snippet("- `wc -L tests/checkasm/vvc_mc.c`\n")
+        self.assertEqual(rc, 1, error)
+        self.assertIn("conflict:", error)
+        self.assertIn("wc -L tests/checkasm/vvc_mc.c", error)
+        self.assertIn("added lines of a git diff", error)
+
+    def test_conflict_case_3d_passes(self) -> None:
+        """Pass case 3d piping git diff output into an awk length check."""
+        rc, error = self.check_snippet(
+            "- `git diff -U0 HEAD~1 -- a.c | grep '^+[^+]' | awk 'length($0) > 101'` "
+            "(must print nothing)\n"
+        )
+        self.assertEqual(rc, 0, error)
+
+    def test_conflict_case_3e_passes(self) -> None:
+        """Pass case 3e running awk without a length check."""
+        rc, error = self.check_snippet("- `awk '{print $1}' list.txt`\n")
+        self.assertEqual(rc, 0, error)
+
+    def test_conflict_case_4a_refused(self) -> None:
+        """Refuse case 4a naming a zero-padded 40-hex commit absent from the worktree."""
+        worktree, commit = self.commit_fixture()
+        padded = commit[:7] + ("0" * 33)
+        self.assertNotEqual(padded, commit)
+        rc, error = self.check_snippet(f"HEAD {padded} (origin/main)\n", worktree=worktree)
+        self.assertEqual(rc, 1, error)
+        self.assertIn("conflict:", error)
+        self.assertIn(padded, error)
+        self.assertIn("git rev-parse", error)
+
+    def test_conflict_case_4b_passes(self) -> None:
+        """Pass case 4b naming the full 40-hex commit held by the worktree."""
+        worktree, commit = self.commit_fixture()
+        self.assertEqual(len(commit.strip()), 40)
+        rc, error = self.check_snippet(f"HEAD {commit} (origin/main)\n", worktree=worktree)
+        self.assertEqual(rc, 0, error)
+
+    def test_conflict_case_4c_passes(self) -> None:
+        """Pass case 4c containing only a short commit name and a 64-hex digest."""
+        worktree, commit = self.commit_fixture()
+        digest = "a" * 64
+        rc, error = self.check_snippet(f"HEAD {commit[:7]}; sha256 {digest}\n", worktree=worktree)
+        self.assertEqual(rc, 0, error)
+
+    def test_conflict_case_4d_passes(self) -> None:
+        """Pass case 4d containing a 41-hex run rather than a standalone 40-hex name."""
+        worktree, commit = self.commit_fixture()
+        self.assertEqual(len(commit.strip()), 40)
+        rc, error = self.check_snippet(f"HEAD {commit}0 (origin/main)\n", worktree=worktree)
+        self.assertEqual(rc, 0, error)
+
+    def nested_commit_fixture(self) -> tuple[Path, str, str]:
+        """Create a worktree repository with a distinct nested repository under sub/nested."""
+        worktree, outer_commit = self.commit_fixture()
+        nested = worktree / "sub" / "nested"
+        nested.parent.mkdir(parents=True)
+        (worktree / "other").mkdir()
+        repo(nested)
+        run_git(nested, "commit", "-q", "--allow-empty", "-m", "nested-only", preserve_config=True)
+        nested_commit = run_git(nested, "rev-parse", "HEAD", preserve_config=True)
+        self.assertNotEqual(nested_commit, outer_commit)
+        return worktree, outer_commit, nested_commit
+
+    def test_conflict_case_4e_fail_closed(self) -> None:
+        """Fail closed with exit 2 for case 4e when the worktree or Git fails."""
+        worktree, commit = self.commit_fixture()
+        resolved_top = f"{worktree.resolve()}\n"
+        not_repo = self.root / "not_repo"
+        not_repo.mkdir()
+        (not_repo / ".git").write_text("gitdir: missing\n", encoding="utf-8")
+        with self.subTest(case="not_repo"):
+            rc, error = self.check_snippet(f"HEAD {commit} (origin/main)\n", worktree=not_repo)
+            self.assertEqual(rc, 2, error)
+            self.assertIn("could not resolve", error)
+            self.assertIn(commit, error)
+        for case, stderr, expected in (
+            ("corrupt_repo", "corrupt repo", "corrupt repo"),
+            ("empty_stderr", "", "git cat-file exited 128"),
+        ):
+            with self.subTest(case=case):
+
+                def fake_git(
+                    args: list[str], text: str = stderr
+                ) -> subprocess.CompletedProcess[str]:
+                    """Stub toplevel resolution and a failing cat-file probe."""
+                    if "--show-toplevel" in args:
+                        return subprocess.CompletedProcess(args, 0, resolved_top, "")
+                    if "cat-file" in args:
+                        return subprocess.CompletedProcess(args, 128, "", text)
+                    return subprocess.CompletedProcess(args, 0, "", "")
+
+                with patch.object(lane_isolation, "run_git", side_effect=fake_git):
+                    rc, error = self.check_snippet(
+                        f"HEAD {commit} (origin/main)\n", worktree=worktree
+                    )
+                self.assertEqual(rc, 2, error)
+                self.assertIn(expected, error)
+        with self.subTest(case="timed_out"):
+
+            def timeout_git(args: list[str]) -> subprocess.CompletedProcess[str]:
+                """Raise an isolation timeout on the repository-root query."""
+                if "--show-toplevel" in args:
+                    raise lane_isolation.IsolationError("timed out")
+                return subprocess.CompletedProcess(args, 0, f"{worktree / '.git'}\n", "")
+
+            with patch.object(lane_isolation, "run_git", side_effect=timeout_git):
+                rc, error = self.check_snippet(f"HEAD {commit} (origin/main)\n", worktree=worktree)
+            self.assertEqual(rc, 2, error)
+            self.assertIn("timed out", error)
+
+    def test_conflict_stub_c1_passes(self) -> None:
+        """Pass stub c1 recording a host-ran make verify-all line under Never run."""
+        rc, error = self.check_snippet(
+            "limits: Never run make verify-all, lefthook or praetorctl.\n"
+            "- host ran: `make verify-all` (rc 0)\n"
+        )
+        self.assertEqual(rc, 0, error)
+
+    def test_conflict_stub_c2_passes(self) -> None:
+        """Pass stub c2 recording a host-ran make target under a praetorctl ban."""
+        rc, error = self.check_snippet(
+            "limits: Never run lefthook or praetorctl.\n- host ran: `make fate-vvc` (rc 0)\n"
+        )
+        self.assertEqual(rc, 0, error)
+
+    def test_conflict_stub_c3_passes(self) -> None:
+        """Pass stub c3 forbidding a one-line join under a 100-column limit."""
+        rc, error = self.check_snippet(
+            "no line you write longer than 100 columns.\n"
+            "- do not join the declaration onto one line.\n"
+        )
+        self.assertEqual(rc, 0, error)
+
+    def test_conflict_stub_c4_passes(self) -> None:
+        """Pass stub c4 checking awk field length rather than whole-line length."""
+        rc, error = self.check_snippet("- check `awk 'length($1) == 40' refs.txt`\n")
+        self.assertEqual(rc, 0, error)
+
+    def test_conflict_stub_c5_passes(self) -> None:
+        """Pass stub c5 carrying an external 40-hex commit inside a URL token."""
+        worktree, _ = self.commit_fixture()
+        rc, error = self.check_snippet(
+            "see https://example.org/commit/1111111111111111111111111111111111111111 for context\n",
+            worktree=worktree,
+        )
+        self.assertEqual(rc, 0, error)
+
+    def test_conflict_stub_c7_exits_2(self) -> None:
+        """Fail closed with exit 2 for stub c7 on a plain subdirectory inside a checkout."""
+        worktree, commit = self.commit_fixture()
+        plain = worktree / "notrepo"
+        plain.mkdir()
+        self.assertFalse((plain / ".git").exists())
+        rc, error = self.check_snippet(f"base {commit}\n", worktree=plain)
+        self.assertEqual(rc, 2, error)
+        self.assertIn("could not resolve", error)
+        self.assertIn(commit, error)
+
+    def test_conflict_stub_c8_passes(self) -> None:
+        """Pass stub c8 when backtick spans appear inside the Never run clause itself."""
+        rc, error = self.check_snippet("Never run `make verify-all` or `praetorctl`.\n")
+        self.assertEqual(rc, 0, error)
+
+    def test_conflict_make_branch_allowances_pass(self) -> None:
+        """Pass make spans with except-admit, scoped praetorctl bans, or verify-all spans."""
+        for snippet in (
+            "limits: Never run lefthook or praetorctl except praetorctl admit.\n- `make fate-x`\n",
+            "limits: Never run praetorctl gate.\n- `make fate-x`\n",
+            "limits: Never run praetorctl admit.\n- `make fate-x`\n",
+            "limits: Never run make verify-all or praetorctl.\nSee `make verify-all`.\n",
+        ):
+            with self.subTest(snippet=snippet):
+                rc, error = self.check_snippet(snippet)
+                self.assertEqual(rc, 0, error)
+
+    def test_conflict_make_verify_all_ban_still_refuses_make(self) -> None:
+        """Refuse a make span outside Never run when the clause only bans make verify-all."""
+        rc, error = self.check_snippet(
+            "limits: Never run make verify-all or praetorctl.\n- `make fate-x`\n"
+        )
+        self.assertEqual(rc, 1, error)
+        self.assertIn("conflict:", error)
+
+    def test_conflict_join_negations_and_records_pass(self) -> None:
+        """Pass negated join clauses and finding or host-ran lines under a column limit."""
+        for snippet in (
+            "at most 100 cols.\n- don't join the call onto one line.\n",
+            "at most 100 cols.\n- never let the call go to one line.\n",
+            (
+                "no line you write longer than 100 columns.\n"
+                "  - finding: round 1 joined the call into one line.\n"
+            ),
+            (
+                "no line you write longer than 100 columns.\n"
+                "- host ran: joined the call into one line.\n"
+            ),
+        ):
+            with self.subTest(snippet=snippet):
+                rc, error = self.check_snippet(snippet)
+                self.assertEqual(rc, 0, error)
+
+    def test_conflict_join_after_negated_sentence_refused(self) -> None:
+        """Refuse a join phrase in a later sentence after an earlier negated sentence."""
+        for snippet in (
+            (
+                "no line you write longer than 100 columns.\n"
+                "Do not touch the header. Join the call onto one line.\n"
+            ),
+            (
+                "no line you write longer than 100 columns.\n"
+                "Do not join the header onto one line. Join the call onto one line.\n"
+            ),
+        ):
+            with self.subTest(snippet=snippet):
+                rc, error = self.check_snippet(snippet)
+                self.assertEqual(rc, 1, error)
+                self.assertIn("conflict:", error)
+
+    def test_conflict_whole_file_skipped_contexts_pass(self) -> None:
+        """Pass whole-file length spans inside Never run or host-ran lines and 1-digit dots."""
+        for snippet in (
+            "limits: Never run `wc -L tests/checkasm/vvc_mc.c`.\n",
+            "- host ran: `wc -L tests/checkasm/vvc_mc.c` (rc 0)\n",
+            "- `rg 'foo.{2}bar' a.c`\n",
+        ):
+            with self.subTest(snippet=snippet):
+                rc, error = self.check_snippet(snippet)
+                self.assertEqual(rc, 0, error)
+
+    def test_conflict_whole_file_extra_forms_refused(self) -> None:
+        """Refuse bare awk length, empty-arg length, gawk, rg, and wc --max-line-length."""
+        for snippet in (
+            "- `awk 'length > 100' a.c`\n",
+            "- `awk 'length() > 100' a.c`\n",
+            "- `gawk 'length($0) > 100' a.c`\n",
+            "- `rg '.{101}' a.c`\n",
+            "- `wc --max-line-length a.c`\n",
+        ):
+            with self.subTest(snippet=snippet):
+                rc, error = self.check_snippet(snippet)
+                self.assertEqual(rc, 1, error)
+                self.assertIn("conflict:", error)
+
+    def test_conflict_whole_file_lane_owned_awk_passes(self) -> None:
+        """Pass awk length without parentheses over a commit message draft under .lane/."""
+        rc, error = self.check_snippet("- `awk 'length > 72' .lane/evidence/x/msg-new.txt`\n")
+        self.assertEqual(rc, 0, error)
+
+    def test_conflict_whole_file_lane_owned_grep_passes(self) -> None:
+        """Pass grep with a three-digit counted dot over a lane-owned file."""
+        rc, error = self.check_snippet(r"- `grep -n '.\{101\}' .lane/evidence/foo/body.txt`" + "\n")
+        self.assertEqual(rc, 0, error)
+
+    def test_conflict_whole_file_lane_owned_wc_passes(self) -> None:
+        """Pass wc max-line-length over a file under .lane/tmp/."""
+        rc, error = self.check_snippet("- `wc --max-line-length .lane/tmp/wrap-check.txt`\n")
+        self.assertEqual(rc, 0, error)
+
+    def test_conflict_whole_file_lane_owned_absolute_passes(self) -> None:
+        """Pass when an absolute path operand contains a /.lane/ segment."""
+        rc, error = self.check_snippet(
+            "- `awk 'length > 72' "
+            "/home/example/dev/worktrees/ffmpeg-patches/.lane/evidence/x/msg.txt`\n"
+        )
+        self.assertEqual(rc, 0, error)
+
+    def test_conflict_whole_file_repository_awk_refused(self) -> None:
+        """Refuse bare awk length over a repository file under scripts/."""
+        rc, error = self.check_snippet("- `awk 'length > 72' scripts/lane_brief.py`\n")
+        self.assertEqual(rc, 1, error)
+        self.assertIn("conflict:", error)
+        self.assertIn("lane_brief.py", error)
+
+    def test_conflict_whole_file_mixed_lane_repo_operands_refused(self) -> None:
+        """Refuse when one operand is lane-owned and another is a repository file."""
+        rc, error = self.check_snippet(
+            "- `awk 'length > 72' .lane/tmp/a.txt scripts/lane_brief.py`\n"
+        )
+        self.assertEqual(rc, 1, error)
+        self.assertIn("conflict:", error)
+
+    def test_conflict_whole_file_lane_dotdot_operand_refused(self) -> None:
+        """Refuse a .lane path that escapes through a parent .. segment."""
+        rc, error = self.check_snippet("- `awk 'length > 72' .lane/tmp/../scripts/x.py`\n")
+        self.assertEqual(rc, 1, error)
+        self.assertIn("conflict:", error)
+
+    def test_conflict_whole_file_bare_filename_refused(self) -> None:
+        """Refuse a whole-file length check on a bare worktree-root filename."""
+        rc, error = self.check_snippet("- `awk 'length > 72' Makefile`\n")
+        self.assertEqual(rc, 1, error)
+        self.assertIn("conflict:", error)
+
+    def test_conflict_nested_repository_passes(self) -> None:
+        """Accept a 40-hex commit held by a nested repository named with git -C."""
+        worktree, _, nested_commit = self.nested_commit_fixture()
+        snippet = f"- `git -C sub/nested rev-parse HEAD`\nHEAD {nested_commit}\n"
+        rc, error = self.check_snippet(snippet, worktree=worktree)
+        self.assertEqual(rc, 0, error)
+
+    def test_conflict_nested_repository_without_git_c_refused(self) -> None:
+        """Refuse a nested repository commit when the brief omits git -C for it."""
+        worktree, _, nested_commit = self.nested_commit_fixture()
+        rc, error = self.check_snippet(f"HEAD {nested_commit}\n", worktree=worktree)
+        self.assertEqual(rc, 1, error)
+        self.assertIn("conflict:", error)
+        self.assertIn(nested_commit, error)
+
+    def test_conflict_nested_repository_outside_worktree_refused(self) -> None:
+        """Ignore a git -C relative path that leaves the worktree via two dots."""
+        worktree, _ = self.commit_fixture()
+        outside = repo(self.root / "outside")
+        run_git(
+            outside, "commit", "-q", "--allow-empty", "-m", "outside-only", preserve_config=True
+        )
+        outside_commit = run_git(outside, "rev-parse", "HEAD", preserve_config=True)
+        snippet = f"- `git -C ../outside rev-parse HEAD`\nHEAD {outside_commit}\n"
+        rc, error = self.check_snippet(snippet, worktree=worktree)
+        self.assertEqual(rc, 1, error)
+        self.assertIn("conflict:", error)
+        self.assertIn(outside_commit, error)
+
+    def test_conflict_plain_slash_object_path_refused(self) -> None:
+        """Check a 40-hex name after a plain slash when no URL scheme separator is present."""
+        worktree, commit = self.commit_fixture()
+        missing = commit[:7] + ("0" * 33)
+        rc, error = self.check_snippet(f"see refs/x/{missing} in tree\n", worktree=worktree)
+        self.assertEqual(rc, 1, error)
+        self.assertIn("conflict:", error)
+        self.assertIn(missing, error)
+
+    def test_conflict_nested_probe_error_and_cap(self) -> None:
+        """Fail closed on nested Git errors and ignore non-root or excess git -C paths."""
+        worktree, _, nested_commit = self.nested_commit_fixture()
+        (worktree / "plain").mkdir()
+        extra = " ".join(f"`git -C plain{i} status`" for i in range(8))
+        rc, error = self.check_snippet(
+            f"{extra} `git -C sub/nested status`\nHEAD {nested_commit}\n", worktree=worktree
+        )
+        self.assertEqual(rc, 1, error)
+        nested_path = str((worktree / "sub" / "nested").resolve())
+        real_run_git = lane_isolation.run_git
+
+        def fail_nested_probe(args: list[str]) -> subprocess.CompletedProcess[str]:
+            """Fail cat-file on the nested repository with exit status 128."""
+            if "cat-file" in args and nested_path in args:
+                return subprocess.CompletedProcess(args, 128, "", "nested broken")
+            return real_run_git(args)
+
+        with patch.object(lane_isolation, "run_git", side_effect=fail_nested_probe):
+            rc, error = self.check_snippet(
+                f"- `git -C plain status`\n- `git -C sub/nested status`\nHEAD {nested_commit}\n",
+                worktree=worktree,
+            )
+        self.assertEqual(rc, 2, error)
+        self.assertIn("nested broken", error)
+
+    def test_round3_k1_never_run_span_semicolon_passes(self) -> None:
+        """Pass K1 when a Never run clause holds a semicolon inside its backtick span."""
+        rc, error = self.check_snippet("Never run `wc -L scripts/a.py; echo done`.\n")
+        self.assertEqual(rc, 0, error)
+        rc, error = self.check_snippet("- run `wc -L scripts/a.py`\n")
+        self.assertEqual(rc, 1, error)
+        self.assertIn("conflict:", error)
+
+    def test_round3_k2_awk_string_literal_passes(self) -> None:
+        """Pass K2 when awk prints a literal length string on a repository file."""
+        rc, error = self.check_snippet("- `awk '{print \"length\"}' scripts/a.py`\n")
+        self.assertEqual(rc, 0, error)
+        for snippet in (
+            "- `awk 'length > 72' scripts/a.py`\n",
+            "- `awk 'length($0) > 72' scripts/a.py`\n",
+        ):
+            with self.subTest(snippet=snippet):
+                rc, error = self.check_snippet(snippet)
+                self.assertEqual(rc, 1, error)
+                self.assertIn("conflict:", error)
+
+    def test_round3_k3_wc_l_after_other_option_refused(self) -> None:
+        """Refuse K3 when wc lists -L after another option on a repository file."""
+        rc, error = self.check_snippet("- `wc -l -L scripts/a.py`\n")
+        self.assertEqual(rc, 1, error)
+        self.assertIn("conflict:", error)
+        rc, error = self.check_snippet("- `wc -l scripts/a.py`\n")
+        self.assertEqual(rc, 0, error)
+
+    def test_round3_k4_uppercase_object_names_normalized(self) -> None:
+        """Normalize K4 standalone 40-hex names from either hex case."""
+        upper = "F" * 40
+        lower = "f" * 40
+        self.assertEqual(lane_brief.standalone_object_names(f"HEAD {upper}\n"), [lower])
+        self.assertEqual(lane_brief.standalone_object_names(f"HEAD {lower}\n"), [lower])
+        mixed = "aAbBcCdDeEfF0123456789aAbBcCdDeEfF012345"
+        self.assertEqual(len(mixed), 40)
+        self.assertEqual(
+            lane_brief.standalone_object_names(f"HEAD {mixed}\n"),
+            [mixed.lower()],
+        )
+        self.assertEqual(lane_brief.standalone_object_names("HEAD " + upper + "0\n"), [])
+        self.assertEqual(lane_brief.standalone_object_names("HEAD " + ("F" * 64) + "\n"), [])
+
+    def test_round3_k4_upper_lower_deduped(self) -> None:
+        """Deduplicate K4 names after lowering mixed-case duplicates."""
+        name = "a" * 40
+        text = f"HEAD {name.upper()} then {name}\n"
+        self.assertEqual(lane_brief.standalone_object_names(text), [name])
+
+    def test_round3_k5_non_clause_spans_matches_bruteforce(self) -> None:
+        """Match K5 non_clause_spans against a brute-force clause scan."""
+        samples = (
+            "Never run `make`;\n`outer`\n",
+            "Never run `a` and `b`;\n`between`\n",
+            "Never run x;\nNever run y;\n`tail`\n",
+            "line one\nNever run `inner;\n` semicolon`.\n`after`\n",
+        )
+        for text in samples:
+            with self.subTest(text=text):
+                brute = [
+                    match
+                    for match in lane_brief.BACKTICK_SPAN.finditer(text)
+                    if not any(
+                        clause.start() <= match.start() and match.end() <= clause.end()
+                        for clause in lane_brief.NEVER_RUN_CLAUSE.finditer(
+                            lane_brief.mask_backtick_inners(text)
+                        )
+                    )
+                ]
+                self.assertEqual(
+                    [match.span() for match in lane_brief.non_clause_spans(text)],
+                    [match.span() for match in brute],
+                )
+
+    def test_round3_k5_non_clause_spans_large_brief_under_two_seconds(self) -> None:
+        """Finish K5 non_clause_spans within two seconds on ten thousand clause pairs."""
+        count = 10_000
+        text = "Never run x;\n" * count + "`a`\n" * count
+        started = time.monotonic()
+        outside = lane_brief.non_clause_spans(text)
+        elapsed = time.monotonic() - started
+        self.assertEqual(len(outside), count)
+        self.assertLess(elapsed, 2.0)
+
+    def test_round3_k6_make_span_with_make_ban_refused(self) -> None:
+        """Refuse K6 when a make span appears while Never run also forbids make."""
+        rc, error = self.check_snippet("Never run make or praetorctl.\n- `make fate-x`\n")
+        self.assertEqual(rc, 1, error)
+        self.assertIn("conflict:", error)
+        rc, error = self.check_snippet("Never run praetorctl.\n- `make fate-x`\n")
+        self.assertEqual(rc, 1, error)
+
+    def test_round3_k7_contrast_clause_limits_join_negation(self) -> None:
+        """Refuse K7 join requests after a contrast clause under a column limit."""
+        snippet = (
+            "Keep lines at most 72 columns.\n"
+            "Do not touch the header, but join the call onto one line.\n"
+        )
+        rc, error = self.check_snippet(snippet)
+        self.assertEqual(rc, 1, error)
+        self.assertIn("conflict:", error)
+        rc, error = self.check_snippet(
+            "Keep lines at most 72 columns.\nDo not join the call onto one line.\n"
+        )
+        self.assertEqual(rc, 0, error)
+        rc, error = self.check_snippet(
+            "Keep lines at most 72 columns.\nJoin the call onto one line.\n"
+        )
+        self.assertEqual(rc, 1, error)
+
+    def test_round3_k8_quoted_operands_lane_check(self) -> None:
+        """Apply K8 lane-owned checks to quoted file operands."""
+        rc, error = self.check_snippet('- `wc -L ".lane/tmp/message draft.txt"`\n')
+        self.assertEqual(rc, 0, error)
+        rc, error = self.check_snippet('- `wc -L .lane/tmp/draft.txt "scripts/lane_brief.py"`\n')
+        self.assertEqual(rc, 1, error)
+        self.assertIn("conflict:", error)
+        rc, error = self.check_snippet("- `wc -L .lane/tmp/draft.txt`\n")
+        self.assertEqual(rc, 0, error)
+
+    def test_round3_k9_bare_makefile_operand_refused(self) -> None:
+        """Refuse K9 when wc -L reads a bare repository filename with a lane path."""
+        rc, error = self.check_snippet("- `wc -L .lane/tmp/draft.txt Makefile`\n")
+        self.assertEqual(rc, 1, error)
+        self.assertIn("conflict:", error)
+
+    def test_round3_k10_relative_lane_segment_refused(self) -> None:
+        """Refuse K10 repository-relative paths that only embed a /.lane/ segment."""
+        rc, error = self.check_snippet("- `wc -L tests/.lane/golden.txt`\n")
+        self.assertEqual(rc, 1, error)
+        self.assertIn("conflict:", error)
+        rc, error = self.check_snippet("- `wc -L /w/x/.lane/tmp/d.txt`\n")
+        self.assertEqual(rc, 0, error)
+
+    def test_round3_k11_diff_exemption_needs_stdin_chain(self) -> None:
+        """Refuse K11 when a piped wc reads an explicit repository file operand."""
+        rc, error = self.check_snippet("- `git diff -- scripts/a.py | wc -L scripts/a.py`\n")
+        self.assertEqual(rc, 1, error)
+        self.assertIn("conflict:", error)
+        rc, error = self.check_snippet(
+            "- `git diff -U0 -- scripts/a.py | grep '^+' | awk 'length > 72'`\n"
+        )
+        self.assertEqual(rc, 0, error)
+
+    def test_round3_k12_broken_nested_git_exits_two(self) -> None:
+        """Exit 2 for K12 when a nested checkout gitdir cannot be resolved."""
+        worktree, commit = self.commit_fixture()
+        broken = worktree / "sub"
+        broken.mkdir()
+        (broken / ".git").write_text("gitdir: /nonexistent/x\n", encoding="utf-8")
+        missing = "1" * 40
+        rc, error = self.check_snippet(f"`git -C sub log -1`\nHEAD {missing}\n", worktree=worktree)
+        self.assertEqual(rc, 2, error)
+        plain = worktree / "plain"
+        plain.mkdir()
+        self.assertFalse(lane_brief.valid_nested_root(plain, worktree.resolve()))
+        self.assertFalse(lane_brief.valid_nested_root(worktree / "missing", worktree.resolve()))
+
+    def test_round3_k13_fixture_head_stays_sha1(self) -> None:
+        """Keep K13 fixture HEAD at 40 hex even when GIT_DEFAULT_HASH is sha256."""
+        with patch.dict(os.environ, {"GIT_DEFAULT_HASH": "sha256"}, clear=False):
+            worktree, commit = self.commit_fixture()
+        self.assertEqual(len(commit.strip()), 40)
+        self.assertEqual(lane_brief.standalone_object_names(f"HEAD {commit}\n"), [commit.strip()])
+
+    def test_round3_g2_grep_context_operand_refused(self) -> None:
+        """Refuse grep counted-dot patterns with a repository operand after -A."""
+        rc, error = self.check_snippet(r"- `grep -A 2 '.\{101\}' scripts/a.py`\n")
+        self.assertEqual(rc, 1, error)
+        self.assertIn("conflict:", error)
+
+    def test_round3_g2_wc_input_redirect_refused(self) -> None:
+        """Refuse wc -L when input is redirected from a repository file."""
+        rc, error = self.check_snippet("- `wc -L < scripts/a.py`\n")
+        self.assertEqual(rc, 1, error)
+        self.assertIn("conflict:", error)
+
+    def test_round3_g2_semicolon_second_command_refused(self) -> None:
+        """Refuse a span whose second semicolon-separated command runs wc -L."""
+        rc, error = self.check_snippet("- `git diff --stat; wc -L scripts/a.py`\n")
+        self.assertEqual(rc, 1, error)
+        self.assertIn("conflict:", error)
+
+    def test_round3_g2_xargs_wc_refused(self) -> None:
+        """Refuse xargs wc -L when file names would come from git diff."""
+        rc, error = self.check_snippet("- `git diff --name-only | xargs wc -L`\n")
+        self.assertEqual(rc, 1, error)
+        self.assertIn("conflict:", error)
+
+    def test_round3_g2_unclosed_quote_wc_refused(self) -> None:
+        """Refuse an unclosed quote span that still names wc -L."""
+        rc, error = self.check_snippet('- `wc -L "scripts/a.py`\n')
+        self.assertEqual(rc, 1, error)
+        self.assertIn("conflict:", error)
+
+    def test_round3_g2_wc_redirect_lane_passes(self) -> None:
+        """Pass wc -L on a lane file when output is redirected after a descriptor."""
+        rc, error = self.check_snippet("- `wc -L .lane/tmp/a.txt > /dev/null 2>&1`\n")
+        self.assertEqual(rc, 0, error)
+
+    def test_round3_g2_awk_f_lane_operand_passes(self) -> None:
+        """Pass awk length with -F colon and a lane-owned file operand."""
+        rc, error = self.check_snippet("- `awk -F: 'length > 72' .lane/evidence/x/msg.txt`\n")
+        self.assertEqual(rc, 0, error)
+
+    def test_fix4_r1_wc_joined_stdout_redirect_passes(self) -> None:
+        """Pass wc -L on a lane file when stdout redirect has no space before the target."""
+        rc, error = self.check_snippet("- `wc -L .lane/tmp/a.txt >/dev/null`\n")
+        self.assertEqual(rc, 0, error)
+
+    def test_fix4_r2_wc_spaced_stderr_redirect_passes(self) -> None:
+        """Pass wc -L on a lane file when stderr redirect tokens are spaced."""
+        rc, error = self.check_snippet("- `wc -L .lane/tmp/a.txt 2> /dev/null`\n")
+        self.assertEqual(rc, 0, error)
+
+    def test_fix4_r3_wc_joined_stderr_redirect_passes(self) -> None:
+        """Pass wc -L on a lane file when stderr descriptor and operator are joined."""
+        rc, error = self.check_snippet("- `wc -L .lane/tmp/a.txt 2>/dev/null`\n")
+        self.assertEqual(rc, 0, error)
+
+    def test_fix4_r4_wc_spaced_stdout_redirect_passes(self) -> None:
+        """Pass wc -L on a lane file when stdout redirect tokens are spaced (control)."""
+        rc, error = self.check_snippet("- `wc -L .lane/tmp/a.txt > /dev/null`\n")
+        self.assertEqual(rc, 0, error)
+
+    def test_fix4_r5_wc_spaced_descriptor_redirect_refused(self) -> None:
+        """Refuse wc -L when a spaced digit is a file operand, not a descriptor."""
+        rc, error = self.check_snippet("- `wc -L .lane/tmp/a.txt 2 > /dev/null`\n")
+        self.assertEqual(rc, 1, error)
+
+    def test_fix4_r6_wc_repo_file_joined_redirect_refused(self) -> None:
+        """Refuse wc -L on a repository file even when stdout redirect is joined."""
+        rc, error = self.check_snippet("- `wc -L scripts/a.py >/dev/null`\n")
+        self.assertEqual(rc, 1, error)
+        self.assertIn("conflict:", error)
+
+    def test_fix4_strip_awk_double_quotes_table(self) -> None:
+        """Pin strip_awk_double_quotes behavior for quoted and escaped awk programs."""
+        cases = {
+            r'print "he\"llo"': "print ",
+            'print "\\"': "print ",
+            'print "open': "print ",
+            'print "a" b "c"': "print  b ",
+            'print "a\nb" x': "print  x",
+        }
+        for program, expected in cases.items():
+            with self.subTest(program=program):
+                self.assertEqual(lane_brief.strip_awk_double_quotes(program), expected)
+
+    def test_fix4_awk_program_token_table(self) -> None:
+        """Pin awk_program_token for option shapes and end-of-argv programs."""
+        cases = [
+            (["awk", "-F:", "prog"], 0, ("prog", False)),
+            (["awk", "-F", ":", "prog"], 0, ("prog", False)),
+            (["awk", "-v", "x=1", "prog"], 0, ("prog", False)),
+            (["awk", "-f", "file.awk"], 0, (None, True)),
+            (["awk", "--", "prog"], 0, ("prog", False)),
+        ]
+        for words, tool_index, expected in cases:
+            with self.subTest(words=words):
+                self.assertEqual(lane_brief.awk_program_token(words, tool_index), expected)
+
+    def test_fix4_command_file_operands_table(self) -> None:
+        """Pin command_file_operands for options and lane-owned stdin redirects."""
+        cases = [
+            (["wc", "-L", "-c", "file"], ["file"]),
+            (["wc", "-L", "file", ">"], ["file"]),
+            (["wc", "-L", "lane", "<", ".lane/tmp/in.txt"], ["lane", ".lane/tmp/in.txt"]),
+        ]
+        for words, expected in cases:
+            with self.subTest(words=words):
+                self.assertEqual(lane_brief.command_file_operands(words), expected)
+
+    def test_fix4_command_file_operands_redirect_table(self) -> None:
+        """Pin command_file_operands redirect forms that differ from round-3 tokenization."""
+        cases = [
+            (["wc", "-L", "file", "2", ">&", "1"], ["file"]),
+            (["wc", "-L", "file", "&>", "out"], ["file"]),
+        ]
+        for words, expected in cases:
+            with self.subTest(words=words):
+                self.assertEqual(lane_brief.command_file_operands(words), expected)
+
+    def test_fix4_g3_nested_probe_status(self) -> None:
+        """Use probe failure kind for nested roots without changing worktree error text."""
+        worktree, _commit = self.commit_fixture()
+        broken = worktree / "sub"
+        broken.mkdir()
+        (broken / ".git").write_text("gitdir: /nonexistent/x\n", encoding="utf-8")
+        plain = worktree / "plain"
+        plain.mkdir()
+        probe_plain = lane_brief.probe_repository_root(plain)
+        missing = worktree / "missing"
+        probe_missing = lane_brief.probe_repository_root(missing)
+        probe_worktree = lane_brief.probe_repository_root(worktree)
+        _root, _err, kind = probe_plain
+        self.assertEqual(kind, "not_root")
+        _root2, _err2, kind2 = probe_missing
+        self.assertEqual(kind2, "git")
+        _wroot, werr, wkind = probe_worktree
+        self.assertEqual(wkind, "ok")
+        self.assertEqual(werr, "")
+        self.assertFalse(lane_brief.valid_nested_root(plain, worktree.resolve()))
+        self.assertFalse(lane_brief.valid_nested_root(missing, worktree.resolve()))
+        missing_id = "1" * 40
+        rc, error = self.check_snippet(
+            f"`git -C sub log -1`\nHEAD {missing_id}\n", worktree=worktree
+        )
+        self.assertEqual(rc, 2, error)
+
+    def conflict_rc(self, content: str, worktree: Path) -> int:
+        """Run check_conflicts on content and return its status with stderr muted."""
+        with contextlib.redirect_stderr(io.StringIO()):
+            return lane_brief.check_conflicts(content, "brief", worktree)
+
+    def test_round11_cases_table(self) -> None:
+        """Check every round-11 brief case against its wanted conflict status."""
+        worktree, _commit = self.commit_fixture()
+        for case_id, finding, want, content in ROUND11_CASES:
+            with self.subTest(case=case_id, finding=finding):
+                self.assertEqual(self.conflict_rc(content, worktree), want)
+
+    def test_round12_case_ids_complete(self) -> None:
+        """Keep all 92 round-12 case ids present exactly once."""
+        ids = [row[0] for row in ROUND12_CASES]
+        self.assertEqual(ids, [f"r12-c{number:02d}" for number in range(1, 93)])
+        extra_ids = [row[0] for row in ROUND12_EXTRA_ROWS]
+        self.assertEqual(len(extra_ids), len(set(extra_ids)))
+
+    def case_rows(
+        self, finding: str, *tables: tuple[tuple[str, str, int, str], ...], minimum: int = 2
+    ) -> None:
+        """Check the rows of one finding in the given case tables against their wanted status."""
+        worktree, _outer, nested_commit = self.nested_commit_fixture()
+        absolute = str(worktree.resolve() / "sub" / "nested")
+        rows = [row for table in tables for row in table if row[1] == finding]
+        self.assertGreater(len(rows), minimum)
+        for case_id, _finding, want, content in rows:
+            text = content.replace("{ABS}", absolute).replace("{NESTED}", nested_commit)
+            with self.subTest(case=case_id):
+                self.assertEqual(self.conflict_rc(text, worktree), want)
+
+    def round12_rows(self, finding: str) -> None:
+        """Check the round-12 rows of one finding against their wanted status."""
+        self.case_rows(finding, ROUND12_CASES, ROUND12_EXTRA_ROWS)
+
+    def round13_rows(self, finding: str, *, minimum: int = 2) -> None:
+        """Check the round-13 rows of one finding against their wanted status."""
+        self.case_rows(finding, ROUND13_CASES, minimum=minimum)
+
+    def test_round12_f1_cases_stay_refused(self) -> None:
+        """Keep malformed spans with a length check refused and others accepted."""
+        self.round12_rows("f1")
+
+    def test_round12_f1_fallback_equals_reference_search(self) -> None:
+        """Match the lazy reference search on malformed spans with every tool word."""
+        spans = ['wc -L "scripts/a.py', "echo 'a | make b", "make 'x", 'awk "', 'rg "']
+        for before in FALLBACK_TOOLS:
+            for after in FALLBACK_TOOLS:
+                for expression in FALLBACK_EXPRESSIONS:
+                    spans.append(f'{before} {expression} {after} "')
+                    spans.append(f'{expression} {before} {after} "')
+                    spans.append(f'{before} x {after} {expression} "')
+        refused = 0
+        for span in spans:
+            want = bool(lane_brief.WHOLE_FILE_LENGTH.search(span))
+            refused += int(want)
+            self.assertEqual(lane_brief.fallback_length_refused(span), want, span)
+        self.assertGreater(refused, 100)
+        self.assertLess(refused, len(spans))
+
+    def test_round12_f1_fallback_search_count_is_flat(self) -> None:
+        """Run the same few searches for 50 and for 200 tool words."""
+        names = ("AWK_TOOL_WORD", "AWK_LENGTH_EXPR", "GREP_TOOL_WORD", "GREP_LENGTH_EXPR")
+        for tail, verdict, want in (('"', False, [1, 1, 1, 0]), ('length "', True, [1, 1, 0, 0])):
+            totals = []
+            for count in (50, 200):
+                wrappers = {name: CountingPattern(getattr(lane_brief, name)) for name in names}
+                with contextlib.ExitStack() as stack:
+                    for name, wrapper in wrappers.items():
+                        stack.enter_context(patch.object(lane_brief, name, wrapper))
+                    got = lane_brief.fallback_length_refused("awk " * count + tail)
+                self.assertEqual(got, verdict)
+                totals.append([wrappers[name].calls for name in names])
+            self.assertEqual(totals, [want, want])
+
+    def test_round12_f2_host_record_starts_the_line(self) -> None:
+        """Exempt a host record only when it starts the line after list markers."""
+        self.round12_rows("f2")
+
+    def test_round12_f3_praetorctl_at_command_position(self) -> None:
+        """Count praetorctl as banned only at the command word of a Never run item."""
+        self.round12_rows("f3")
+
+    def test_round12_f4_newline_after_pipe_continues(self) -> None:
+        """Treat a newline after an unquoted pipe or list operator as a blank."""
+        self.round12_rows("f4")
+
+    def test_round12_f5_quoted_command_word_runs_make(self) -> None:
+        """Decide the make command word by its text after quote removal."""
+        self.round12_rows("f5")
+
+    def test_round12_f6_verify_all_is_sole_target(self) -> None:
+        """Exempt make only when verify-all is the sole target, also unparsed."""
+        self.round12_rows("f6")
+
+    def test_round12_f7_length_tool_at_command_position(self) -> None:
+        """Find the length tool at the command position; launchers stay refused."""
+        self.round12_rows("f7")
+
+    def test_round12_f8_interval_spelling_follows_dialect(self) -> None:
+        """Read the brace interval spelling of the effective grep dialect."""
+        self.round12_rows("f8")
+
+    def test_round12_f9_redirect_names_its_descriptor(self) -> None:
+        """Refuse a redirect that replaces stdin whatever its operator spelling."""
+        self.round12_rows("f9")
+
+    def test_round12_f10_git_diff_operands_stay_inside(self) -> None:
+        """Refuse a git diff operand that may leave the worktree."""
+        self.round12_rows("f10")
+
+    def test_round12_f11_every_c_step_must_exist(self) -> None:
+        """Skip a nested repository when any git -C step names no directory."""
+        self.round12_rows("f11")
+
+    def test_round13_case_ids_complete(self) -> None:
+        """Keep all 72 round-13 case ids present exactly once with six findings."""
+        ids = [row[0] for row in ROUND13_CASES]
+        self.assertEqual(len(ids), 72)
+        self.assertEqual(len(set(ids)), 72)
+        self.assertTrue(all(case_id.startswith("r13-") for case_id in ids))
+        counts = [sum(row[1] == f"g{n}" for row in ROUND13_CASES) for n in range(1, 7)]
+        self.assertEqual(counts, [18, 13, 14, 5, 21, 1])
+
+    def test_round13_g1_leading_redirect_runs_make(self) -> None:
+        """Find make after leading redirects, assignments, and wrappers in any order."""
+        self.round13_rows("g1")
+
+    def test_round13_g1_command_word_index_skips_redirects(self) -> None:
+        """Find the command word after joined descriptor, wrapper, and target-named redirects."""
+        rows = (
+            ("2>err make x", "make", 3),
+            ("env >log make x", "make", 3),
+            ("> make fate-x", "fate-x", 2),
+            ("FOO=1 2>&1 nohup >log make", "make", 7),
+            ("'>' make fate-x", ">", 0),
+            (">", ">", 0),
+            ("2>", "2", 0),
+        )
+        for span, word, want in rows:
+            with self.subTest(span=span):
+                tokens = lane_brief.span_shell_tokens(span)
+                self.assertIsNotNone(tokens)
+                index = lane_brief.command_word_index(tokens, 0, strict=False)
+                self.assertEqual((str(tokens[index]), index), (word, want))
+        widths = (("2>err make", 3), ("> make fate-x", 2), ("<in make", 2), ("make", 0), ("2>", 0))
+        for span, want in widths:
+            with self.subTest(width=span):
+                tokens = lane_brief.span_shell_tokens(span)
+                self.assertEqual(lane_brief.redirect_width(tokens, 0), want)
+
+    def test_round13_g2_redirect_then_word_is_another_target(self) -> None:
+        """Refuse a word after the redirects that follow verify-all, parsed or not."""
+        self.round13_rows("g2")
+
+    def test_round13_g2_fallback_redirect_run_is_linear(self) -> None:
+        """Judge 10000 redirects after verify-all with possessive quantifiers only."""
+        quantifiers = re.findall(r"[*+?]+", lane_brief.VERIFY_ALL_TAIL.replace("(?:", "("))
+        self.assertTrue(quantifiers)
+        self.assertEqual(set(quantifiers), {"*+", "++"})
+        redirects = " >/dev/null" * 10000
+        rows = (
+            (f"make verify-all{redirects}", False),
+            (f"make verify-all{redirects} && true", False),
+            (f'make verify-all{redirects} "', True),
+            (f"make verify-all{redirects} clean", True),
+            ('make verify-all 2>&1 "', True),
+            ("make verify-all 2>&1 | tail '", False),
+        )
+        for span, refused in rows:
+            with self.subTest(span=span[:40], size=len(span)):
+                self.assertEqual(lane_brief.MAKE_COMMAND.search(span) is not None, refused)
+
+    def test_round13_g3_group_spans_by_depth(self) -> None:
+        """Pair each opening token with its matching close; an open group ends at the stage end."""
+        words = lane_brief.span_shell_tokens("echo $(a (b) c) d")
+        self.assertEqual(lane_brief.group_spans(words), [(1, 7), (3, 5)])
+        self.assertEqual(lane_brief.group_spans(["echo", "(", "wc"]), [(1, 3)])
+        self.assertEqual(lane_brief.group_spans(["echo", ")", "wc"]), [])
+
+    def test_round13_g3_group_command_position(self) -> None:
+        """Judge each substitution or subshell of a print command by its own command word."""
+        self.round13_rows("g3")
+
+    def test_round13_g4_join_negation_cases(self) -> None:
+        """Keep the join negation results while the search runs on offsets."""
+        self.round13_rows("g4", minimum=4)
+
+    def compare_join_reference(self, content: str) -> int:
+        """Compare segment and exclusion of every join match with the reference; count them."""
+        boundaries = lane_brief.scan_join_boundaries(content)
+        reference = lane_brief.scan_join_boundaries(content)
+        seen = 0
+        for match in lane_brief.ONE_LINE_JOIN.finditer(content):
+            seen += 1
+            begin, end = lane_brief.earlier_join_segment(content, boundaries, match.start())
+            want = reference_join_segment(content, reference, match.start())
+            self.assertEqual(content[begin:end], want, content[:60])
+            got_excluded = lane_brief.join_is_excluded(content, match, boundaries)
+            want_excluded = reference_join_excluded(content, match, reference)
+            self.assertEqual(got_excluded, want_excluded, content[:60])
+        return seen
+
+    def test_round13_g4_segments_equal_slice_reference(self) -> None:
+        """Match the slice-based reference on every join match, also across a straddling match."""
+        rows = [row[3] for row in ROUND13_CASES if row[1] == "g4"]
+        seen = sum(self.compare_join_reference(content) for content in JOIN_DIFFERENTIAL_BRIEFS)
+        seen += sum(self.compare_join_reference(content) for content in rows)
+        self.assertGreater(seen, 100)
+        pattern = re.compile(r"x\s*join|x ")
+        straddling = (
+            "x join into one line",
+            "x x join onto one line",
+            "a x join into one line. x joins into one line",
+        )
+        with patch.object(lane_brief, "JOIN_BOUNDARY", pattern):
+            inside = sum(self.compare_join_reference(content) for content in straddling)
+        self.assertEqual(inside, 4)
+
+    def test_round13_g4_join_check_copies_little_text(self) -> None:
+        """Copy at most four times the content length through slices on the join cost input."""
+        content = SliceCountingStr(JOIN_COST_HEAD + JOIN_COST_LINE * JOIN_COST_COPIES)
+        self.assertEqual(lane_brief.conflict_join_under_column_limit(content), "")
+        self.assertLessEqual(content.copied, JOIN_COST_LIMIT * len(content))
+
+    def test_round13_g5_allow_list_cases(self) -> None:
+        """Accept only locale assignments and allow-listed git diff options."""
+        self.round13_rows("g5")
+
+    def test_round13_g5_allow_list_boundaries(self) -> None:
+        """Hold the context size, locale name, redirect, and option boundaries of the allow-list."""
+        for tag, span, want in ROUND13_G5_LENGTH_ROWS:
+            with self.subTest(tag=tag):
+                self.assertEqual(lane_brief.span_whole_file_length_refused(span), want)
+
+    def test_round13_g5_option_and_assignment_judges(self) -> None:
+        """Judge single option words and assignment words directly."""
+        for token in ("--cached", "--stat", "-U0", "-U3", "--unified=2"):
+            self.assertTrue(lane_brief.git_diff_option_allowed(token), token)
+        for token in ("-U4", "-U03", "-U", "--unified=4", "-W", "-O", "--ext-diff", "--output=x"):
+            self.assertFalse(lane_brief.git_diff_option_allowed(token), token)
+        stage = ["LANG=C", "LC_ALL=C", "git", "diff"]
+        self.assertTrue(lane_brief.git_prefix_assignments_allowed(stage, 2))
+        stage = ["LANG=C", "GIT_DIR=x", "git", "diff"]
+        self.assertFalse(lane_brief.git_prefix_assignments_allowed(stage, 2))
+
+    def test_round13_g6_printf_first_stage_stays_refused(self) -> None:
+        """Keep a printf first stage that only names git diff refused."""
+        self.round13_rows("g6", minimum=0)
+
+    def test_fix11_g1_scanner_flags(self) -> None:
+        """Pin quoted, operator, and joined flags of scanner tokens."""
+        rows = (
+            ("a 2>f", [("a", 0, 0, 0), ("2", 0, 0, 0), (">", 0, 1, 1), ("f", 0, 0, 1)]),
+            ("a 2 >f", [("a", 0, 0, 0), ("2", 0, 0, 0), (">", 0, 1, 0), ("f", 0, 0, 1)]),
+            ("a '2'>f", [("a", 0, 0, 0), ("2", 1, 0, 0), (">", 0, 1, 1), ("f", 0, 0, 1)]),
+            ("x '|' y", [("x", 0, 0, 0), ("|", 1, 0, 0), ("y", 0, 0, 0)]),
+            ("a;b", [("a", 0, 0, 0), (";", 0, 1, 1), ("b", 0, 0, 1)]),
+            (
+                'echo "$(make x)"',
+                [("echo", 0, 0, 0), ("$(", 0, 1, 0), ("make", 0, 0, 1)]
+                + [("x", 0, 0, 0), (")", 0, 1, 1)],
+            ),
+        )
+        for span, want in rows:
+            with self.subTest(span=span):
+                tokens = lane_brief.span_shell_tokens(span)
+                self.assertIsNotNone(tokens)
+                got = [(str(t), int(t.quoted), int(t.operator), int(t.joined)) for t in tokens]
+                self.assertEqual(got, want)
+
+    def test_fix11_g1_scanner_failures(self) -> None:
+        """Report None for unclosed quotes or substitutions and past the depth limit."""
+        for span in ("echo 'x", 'echo "x', "echo $(x", "echo \\", 'echo "$(x"'):
+            with self.subTest(span=span):
+                self.assertIsNone(lane_brief.span_shell_tokens(span))
+        limit = lane_brief.MAX_SHELL_DEPTH
+        inside = "$(a " * (limit - 1) + ")" * (limit - 1)
+        too_deep = "$(a " * limit + ")" * limit
+        self.assertIsNotNone(lane_brief.span_shell_tokens(inside))
+        self.assertIsNone(lane_brief.span_shell_tokens(too_deep))
+
+    def test_fix11_f1_make_command_position(self) -> None:
+        """Refuse make only in a command position; quoted make text and unparseable spans."""
+        worktree, _commit = self.commit_fixture()
+        rows = (
+            ("quoted argument text", "printf '%s\\n' 'example; make fate-x'", 0),
+            ("quoted pipe and make", "echo 'a | make b'", 0),
+            ("quoted command word runs make", "'make' fate-x", 1),
+            ("verify-all exception", "make verify-all", 0),
+            ("make after and", "cd tests && make fate-x", 1),
+            ("make after or", "true || make fate-x", 1),
+            ("make after semicolon", "echo a; make fate-x", 1),
+            ("make after pipe", "echo a | make fate-x", 1),
+            ("make in substitution in double quotes", 'echo "$(make fate-x)"', 1),
+            ("make in text then substitution", 'echo "a $(make fate-x) b"', 1),
+            ("make in subshell", "(make fate-x)", 1),
+            ("make after dash dash", "cmd -- make fate-x", 1),
+            ("wrapped make", "FOO=1 nice -n10 timeout 5 make fate-x", 1),
+            ("unparseable keeps pipe refusal", "echo 'a | make b", 1),
+            ("unparseable keeps leading refusal", "make 'x", 1),
+        )
+        for tag, span, want in rows:
+            with self.subTest(tag=tag):
+                content = f"Never run make.\n- `{span}`\n"
+                self.assertEqual(self.conflict_rc(content, worktree), want)
+
+    def test_fix11_f2_clause_with_backticked_semicolon(self) -> None:
+        """Keep a Never run clause whole across a semicolon inside backticks."""
+        worktree, _commit = self.commit_fixture()
+        rows = (
+            ("make after backticked semicolon", "Never run `echo a; echo b` or make.\n", 1),
+            (
+                "praetorctl after backticked semicolon",
+                "Never run `echo a; echo b` or praetorctl.\n",
+                1,
+            ),
+            (
+                "semicolon outside backticks ends the clause",
+                "Never run `echo a`; make is fine.\n",
+                0,
+            ),
+        )
+        for tag, head, want in rows:
+            with self.subTest(tag=tag):
+                content = f"{head}- `make fate-x`\n"
+                self.assertEqual(self.conflict_rc(content, worktree), want)
+
+    def boundary_scans(self, repeats: int) -> int:
+        """Count join boundary scans while checking repeated join negations."""
+        content = "limit: at most 80 columns.\n" + "Do not join the call onto one line. " * repeats
+        counter = CountingPattern(lane_brief.JOIN_BOUNDARY)
+        with patch.object(lane_brief, "JOIN_BOUNDARY", counter):
+            self.assertEqual(lane_brief.conflict_join_under_column_limit(content), "")
+        return counter.calls
+
+    def test_fix11_f3_boundaries_scanned_once(self) -> None:
+        """Scan join boundaries a constant number of times however many joins repeat."""
+        small = self.boundary_scans(50)
+        large = self.boundary_scans(200)
+        self.assertEqual(small, large)
+        self.assertLessEqual(large, 2)
+
+    def test_fix11_f3_segments_match_split(self) -> None:
+        """Match today's split segment on every join match of the join briefs."""
+        seen = 0
+        for content in JOIN_DIFFERENTIAL_BRIEFS:
+            boundaries = lane_brief.scan_join_boundaries(content)
+            for match in lane_brief.ONE_LINE_JOIN.finditer(content):
+                seen += 1
+                want = lane_brief.JOIN_BOUNDARY.split(content[: match.start()])[-1]
+                got_begin, got_end = lane_brief.earlier_join_segment(
+                    content, boundaries, match.start()
+                )
+                self.assertEqual(content[got_begin:got_end], want, content[:60])
+        self.assertGreater(seen, 100)
+
+    def test_fix11_f3_straddling_boundary_matches_split(self) -> None:
+        """Match today's split when a boundary match runs past the join match start."""
+        pattern = re.compile(r"x\s*join|x ")
+        content = "x join into one line"
+        with patch.object(lane_brief, "JOIN_BOUNDARY", pattern):
+            boundaries = lane_brief.scan_join_boundaries(content)
+            match = lane_brief.ONE_LINE_JOIN.search(content)
+            self.assertIsNotNone(match)
+            self.assertLess(boundaries.starts[0], match.start())
+            self.assertLess(match.start(), boundaries.ends[0])
+            want = pattern.split(content[: match.start()])[-1]
+            begin, end = lane_brief.earlier_join_segment(content, boundaries, match.start())
+        got = content[begin:end]
+        self.assertEqual(got, want)
+        self.assertEqual(got, "")
+
+    def length_rows(self, prefix: str) -> None:
+        """Check the length rows whose tag starts with prefix through the span check."""
+        rows = [row for row in FIX11_LENGTH_ROWS if row[0].startswith(prefix)]
+        self.assertGreater(len(rows), 3)
+        for tag, span, want in rows:
+            with self.subTest(tag=tag):
+                self.assertEqual(lane_brief.span_whole_file_length_refused(span), want)
+
+    def test_fix11_f4_quoted_operators_are_words(self) -> None:
+        """Split stages and commands only on operator tokens, not quoted punctuation."""
+        self.length_rows("f4 ")
+
+    def test_fix11_f5_fixed_string_allow_list(self) -> None:
+        """Skip the counted-dot pattern only for fixed-string searches without other matchers."""
+        self.length_rows("f5 ")
+
+    def test_fix11_f6_descriptor_must_be_joined_and_unquoted(self) -> None:
+        """Treat a digit as a descriptor only when unquoted and joined to the redirect."""
+        self.length_rows("f6 ")
+
+    def test_fix11_f7_git_diff_exemption_closed_list(self) -> None:
+        """Allow the git diff exemption only for the git command word and listed options."""
+        self.length_rows("f7 ")
+
+    def test_fix11_f8_chained_git_c_resolves_in_order(self) -> None:
+        """Resolve successive git -C values in order before the nested repository checks."""
+        worktree, _outer, nested_commit = self.nested_commit_fixture()
+        absolute = worktree.resolve() / "sub" / "nested"
+        rows = (
+            ("chained", "git -C sub -C nested rev-parse HEAD", 0),
+            ("joined path", "git -C sub/nested rev-parse HEAD", 0),
+            ("absolute later", f"git -C other -C {absolute} rev-parse HEAD", 0),
+            ("empty later", "git -C sub/nested -C '' rev-parse HEAD", 0),
+            ("empty first", "git -C '' -C sub/nested rev-parse HEAD", 0),
+            ("chain leaves worktree", "git -C sub -C ../../.. rev-parse HEAD", 1),
+            ("first value only", "git -C sub rev-parse HEAD", 1),
+            ("missing first", f"git -C missing -C {absolute} rev-parse HEAD", 1),
+        )
+        for tag, command, want in rows:
+            with self.subTest(tag=tag):
+                snippet = f"- `{command}`\nHEAD {nested_commit}\n"
+                rc, error = self.check_snippet(snippet, worktree=worktree)
+                self.assertEqual(rc, want, error)
+
+    def test_fix5_probe_cases_table(self) -> None:
+        """Exercise all round-5 probe spans through span_whole_file_length_refused."""
+        for tag, span, want in FIX5_PROBE_CASES:
+            with self.subTest(tag=tag, span=span):
+                self.assertEqual(lane_brief.span_whole_file_length_refused(span), want)
+
+    def test_fix5_g1_parse_table(self) -> None:
+        """Check G1 per-tool option clusters, -- terminators, and fail-closed flags."""
+        for span, want in FIX5_G1_PARSE_CASES:
+            with self.subTest(span=span):
+                self.assertEqual(lane_brief.span_whole_file_length_refused(span), want)
+
+    def test_fix5_g3_chain_table(self) -> None:
+        """Check G3 stdin-only pipeline filter chains and refused intermediate stages."""
+        for span, want in FIX5_G3_CHAIN_CASES:
+            with self.subTest(span=span):
+                self.assertEqual(lane_brief.span_whole_file_length_refused(span), want)
+
+    def test_fix6_probe_cases_table(self) -> None:
+        """Exercise all non-split round-6 probe spans through span_whole_file_length_refused."""
+        for tag, span, want in FIX6_PROBE_CASES:
+            with self.subTest(tag=tag, span=span):
+                self.assertEqual(lane_brief.span_whole_file_length_refused(span), want)
+
+    def test_fix6_awk_scanner_table(self) -> None:
+        """Exercise allow-list awk program scanner cases across refused and safe constructs."""
+        for program, want in FIX6_AWK_SCANNER_CASES:
+            with self.subTest(program=program):
+                self.assertEqual(not lane_brief.awk_program_reads_files(program), want)
+
+    def test_cli_thread_cases_table(self) -> None:
+        """Check whole-file length refusal and exemption cases through the check command."""
+        for row, (span, refused) in enumerate(CLI_THREAD_CASES, start=1):
+            with self.subTest(row=row, span=span):
+                rc, error = self.check_snippet(f"- `{span}`\n")
+                if refused:
+                    self.assertEqual(rc, 1, error)
+                    self.assertIn(span, error)
+                else:
+                    self.assertEqual(rc, 0, error)
+                    self.assertNotIn("conflict:", error)
+
+    def test_make_ban_cases_table(self) -> None:
+        """Check make-ban and praetorctl-ban conflict cases through the check command."""
+        for row, (snippet, refused) in enumerate(MAKE_BAN_CASES, start=1):
+            with self.subTest(row=row, snippet=snippet):
+                rc, error = self.check_snippet(snippet)
+                if refused:
+                    self.assertEqual(rc, 1, error)
+                    self.assertIn("conflict:", error)
+                else:
+                    self.assertEqual(rc, 0, error)
+                    self.assertNotIn("conflict:", error)
+
+    def test_make_and_praetorctl_ban_uses_praetorctl_message(self) -> None:
+        """Refuse row 8 banning make and praetorctl with the praetorctl admit message."""
+        rc, error = self.check_snippet(MAKE_BAN_CASES[7][0])
+        self.assertEqual(rc, 1, error)
+        self.assertIn("allow praetorctl admit", error)
+
+    def test_conflict_alternate_forms_refused(self) -> None:
+        """Refuse alternate column-limit, one-line join, and ERE grep length forms."""
+        for snippet in (
+            "over 100 columns.\nask it to go to one line.\n",
+            "more than 120 columns.\nit must be joined into one line.\n",
+            "<= 80 columns.\ncode becomes a single line.\n",
+            "- `grep -E '.{101}' a.c`\n",
+        ):
+            with self.subTest(snippet=snippet):
+                rc, error = self.check_snippet(snippet)
+                self.assertEqual(rc, 1, error)
+                self.assertIn("conflict:", error)
+
     @unittest.skipUnless(
         hasattr(os, "mkfifo") and hasattr(signal, "SIGALRM"), "FIFO alarm unavailable"
     )
@@ -681,6 +2912,8 @@ class LaneBriefTest(unittest.TestCase):
         self.assertIsNotNone(spec)
         self.assertIsNotNone(spec.loader)
         mutant = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = mutant
+        self.addCleanup(sys.modules.pop, spec.name, None)
         spec.loader.exec_module(mutant)
         content = self.rendered().replace("tests.test_import_style", "tests.test_import_styles")
         required = lane_brief.read_required(CONFIG)

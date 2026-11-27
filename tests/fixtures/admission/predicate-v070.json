@@ -1,0 +1,54 @@
+{
+  "_type": "https://in-toto.io/Statement/v1",
+  "subject": [
+    {
+      "name": "ffmpeg-patches-v0.7.0.tar.gz",
+      "digest": {
+        "sha256": "b880f99128a94bf36a54416a026dcc064e7765d43c9ec96971ddf85580f86d8a"
+      }
+    },
+    {
+      "name": "ffmpeg-patches-v0.7.0.spdx.json",
+      "digest": {
+        "sha256": "74710e3d7db74978b2deb28796048d6fba62af0afd30650f3787c4bbcbf6daf8"
+      }
+    }
+  ],
+  "predicateType": "https://slsa.dev/provenance/v1",
+  "predicate": {
+    "buildDefinition": {
+      "buildType": "https://actions.github.io/buildtypes/workflow/v1",
+      "externalParameters": {
+        "workflow": {
+          "ref": "refs/tags/v0.7.0",
+          "repository": "https://github.com/VMAFx/ffmpeg-patches",
+          "path": ".github/workflows/release.yml"
+        }
+      },
+      "internalParameters": {
+        "github": {
+          "event_name": "push",
+          "repository_id": "1412402229",
+          "repository_owner_id": "288567244",
+          "runner_environment": "github-hosted"
+        }
+      },
+      "resolvedDependencies": [
+        {
+          "uri": "git+https://github.com/VMAFx/ffmpeg-patches@refs/tags/v0.7.0",
+          "digest": {
+            "gitCommit": "c84de852dad9a25d8415939b823c3ebc319b70b1"
+          }
+        }
+      ]
+    },
+    "runDetails": {
+      "builder": {
+        "id": "https://github.com/VMAFx/ffmpeg-patches/.github/workflows/release-build.yml@refs/tags/v0.7.0"
+      },
+      "metadata": {
+        "invocationId": "https://github.com/VMAFx/ffmpeg-patches/actions/runs/42465533917/attempts/5"
+      }
+    }
+  }
+}

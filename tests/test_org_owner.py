@@ -24,6 +24,28 @@ GENERATED = (
     ".windsurfrules",
 )
 RENAME_PHRASE = "moved from the VMAFx GitHub organisation"
+# Pre-move v0.7.0 signer pin: release certificates are immutable.
+_V070_SIGNER_SLUG = f"{OLD_OWNER}/ffmpeg-patches"
+_V070_FIXTURE = "tests/fixtures/admission/predicate-v070.json"
+V070_SIGNER_PIN_ALLOWLIST: tuple[tuple[str, str], ...] = (
+    ("docs/consumer-admission.md", f"| Signer repository | `{_V070_SIGNER_SLUG}` |"),
+    ("docs/consumer-admission.md", f"--signer-repository {_V070_SIGNER_SLUG} \\"),
+    ("tests/test_admit_series.py", f'V070_SIGNER_REPOSITORY = "{_V070_SIGNER_SLUG}"'),
+    (_V070_FIXTURE, f'"repository": "https://github.com/{_V070_SIGNER_SLUG}",'),
+    (
+        _V070_FIXTURE,
+        f'"uri": "git+https://github.com/{_V070_SIGNER_SLUG}@refs/tags/v0.7.0",',
+    ),
+    (
+        _V070_FIXTURE,
+        f'"id": "https://github.com/{_V070_SIGNER_SLUG}/.github/workflows/release-build.yml@refs/tags/v0.7.0"',
+    ),
+    (
+        _V070_FIXTURE,
+        f'"invocationId": "https://github.com/{_V070_SIGNER_SLUG}/actions/runs/42465533917/attempts/5"',
+    ),
+)
+_V070_SIGNER_PIN_ALLOWLIST_SET = frozenset(V070_SIGNER_PIN_ALLOWLIST)
 
 
 def scan_owner_positions(root: Path) -> tuple[list[str], int]:
@@ -47,6 +69,7 @@ def scan_owner_positions(root: Path) -> tuple[list[str], int]:
             f"{name}:{number}: {line}"
             for number, line in enumerate(text.splitlines(), 1)
             if pattern.search(line)
+            if (name, line.strip()) not in _V070_SIGNER_PIN_ALLOWLIST_SET
             if name != "README.md" or RENAME_PHRASE not in line
         ]
     if not findings.get("AGENTS.md"):
@@ -146,4 +169,45 @@ class OrgOwnerTest(unittest.TestCase):
             self.assertEqual(
                 scan_owner_positions(root),
                 ([f"README.md:2: {line}", f"other.md:1: {note}"], 0),
+            )
+
+    def test_planted_v070_pin_allow_listed_line_passes(self) -> None:
+        """P-allow: an allow-listed pin line in its path yields no finding."""
+        path, text = V070_SIGNER_PIN_ALLOWLIST[0]
+        with tempfile.TemporaryDirectory() as scratch:
+            root = Path(scratch)
+            helpers.run_git(root, "init", "-q")
+            target = root / path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(text + "\n", encoding="utf-8")
+            helpers.run_git(root, "add", path)
+            self.assertEqual(scan_owner_positions(root), ([], 0))
+
+    def test_planted_v070_pin_same_line_other_path_reports(self) -> None:
+        """P-other-path: allow-listed line text in another path is reported."""
+        _, text = V070_SIGNER_PIN_ALLOWLIST[0]
+        with tempfile.TemporaryDirectory() as scratch:
+            root = Path(scratch)
+            helpers.run_git(root, "init", "-q")
+            (root / "other.md").write_text(text + "\n", encoding="utf-8")
+            helpers.run_git(root, "add", "other.md")
+            self.assertEqual(
+                scan_owner_positions(root),
+                ([f"other.md:1: {text}"], 0),
+            )
+
+    def test_planted_v070_pin_wrong_line_in_allowed_path_reports(self) -> None:
+        """P-edited-line: a non-allow-listed old-owner line in that path is reported."""
+        path, _ = V070_SIGNER_PIN_ALLOWLIST[1]
+        bad = f"  --repository {_V070_SIGNER_SLUG} \\"
+        with tempfile.TemporaryDirectory() as scratch:
+            root = Path(scratch)
+            helpers.run_git(root, "init", "-q")
+            target = root / path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(bad + "\n", encoding="utf-8")
+            helpers.run_git(root, "add", path)
+            self.assertEqual(
+                scan_owner_positions(root),
+                ([f"{path}:1: {bad}"], 0),
             )

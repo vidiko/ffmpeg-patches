@@ -2325,6 +2325,121 @@ class VulkanSweepTest(unittest.TestCase):
         for label, body, found in cases:
             self._assert_port_parity_shader_mask(label, body, found)
 
+    def test_port_parity_shader_for_literal_conditions(self) -> None:
+        """Check load reachability and loop exits for literal and omitted tests."""
+        load = "x = imageLoad(img, ivec2(0))"
+        # Columns: test, initializer, update, body, expected load site.
+        # A break can reach the clamp; a return cannot. A false test skips
+        # the body and update, but not the initializer.
+        cases = (
+            ("true", "", "", f"{load}; break;", "test.frag:5"),
+            ("", "", "", f"{load}; break;", "test.frag:5"),
+            ("false", "", "", f"{load}; break;", None),
+            ("false", "", load, "++i;", None),
+            ("false", load, "", "return;", "test.frag:4"),
+            ("true", "", load, "if (++i == 2) return;", None),
+            ("", "", load, "if (++i == 2) return;", None),
+            ("i < 1", "", load, "if (++i == 2) return;", "test.frag:4"),
+        )
+        for test, init, update, body, expected in cases:
+            with self.subTest(test=test, init=init, update=update, body=body):
+                source = (
+                    "void main() {\n"
+                    "  vec4 x = vec4(0.0);\n"
+                    "  int i = 0;\n"
+                    f"  for ({init}; {test}; {update}) {{\n"
+                    f"    {body}\n"
+                    "  }\n"
+                    "  color = clamp(x, 0.0, 1.0);\n"
+                    "}\n"
+                )
+                self.assertEqual(
+                    sweep_port_parity.shader_site("test.frag", source, "clamp"), expected
+                )
+
+    def test_port_parity_shader_counted_for(self) -> None:
+        """Match update loads at their source line, including uses on the second iteration."""
+        for bound, after, expected in (
+            ("0", False, None),
+            ("1", False, None),
+            ("2", False, "test.frag:8"),
+            ("1", True, "test.frag:8"),
+            ("limit", False, "test.frag:8"),
+            ("limit", True, "test.frag:8"),
+        ):
+            with self.subTest(bound=bound, after=after):
+                clamp = "color = clamp(x, 0.0, 1.0);\n"
+                source = (
+                    "#version 450\n"
+                    "layout(set = 0, binding = 0, rgba32f) readonly uniform image2D img;\n"
+                    "layout(location = 0) out vec4 color;\n"
+                    "layout(constant_id = 0) const int limit = 2;\n"
+                    "void main() {\n"
+                    "vec4 x = vec4(0.0);\n"
+                    "int i = 0;\n"
+                    f"for (; i < {bound}; x = imageLoad(img, ivec2(0))) {{\n"
+                    f"{'' if after else clamp}++i;\n"
+                    "}\n"
+                    f"{clamp if after else ''}}}\n"
+                )
+                self.assertEqual(
+                    sweep_port_parity.shader_site("test.frag", source, "clamp"), expected
+                )
+
+    def test_port_parity_shader_counted_proof_declines(self) -> None:
+        """Keep conservative loop events when syntax, effects or spans are unproven."""
+        for body in (
+            "int i = 0; ++i;",
+            "i = 0; ++i;",
+            "x = alias(x); ++i;",
+            "continue; ++i;",
+            "return; ++i;",
+            "if (ready) x = y; ++i;",
+            "{ x = y; } ++i;",
+            "++i; x = y;",
+            "#define STEP ++i\nSTEP;",
+        ):
+            with self.subTest(body=body):
+                source = f"void main() {{ for (int i = 0; i < 1;) {{ {body} }} }}"
+                self.assertIn("repeat", [kind for kind, _, _ in self._counted_for_events(source)])
+        incomplete = "void main() { for (int i = 0; i < 1; ++i) { x = y; }"
+        self.assertIn("repeat", [kind for kind, _, _ in self._counted_for_events(incomplete)])
+
+    def test_port_parity_shader_counted_version_directive(self) -> None:
+        """Permit one leading GLSL 450 version line but no other preprocessing."""
+        shader = "void main() { for (int i = 0; i < 2; ++i) {} }\n"
+        for prefix, suffix, expands in (
+            ("#version 450\n", "", True),
+            ("// comment\n#version 450 core\n", "", True),
+            ("/*\n#define N 2\n*/\n// #version 450 es\n", "", True),
+            ("#version 450\n/*\n#extension GL_EXT_debug_printf : enable\n*/\n", "", True),
+            ("#version 450\n#define N 2\n", "", False),
+            ("#version 450\n#version 450\n", "", False),
+            ("#version 450 es\n", "", False),
+            ("#version 450 extra\n", "", False),
+            ("#version 450\n#extension GL_EXT_debug_printf : enable\n", "", False),
+            ("", "#version 450\n", False),
+        ):
+            with self.subTest(prefix=prefix, suffix=suffix):
+                kinds = [kind for kind, _, _ in self._counted_for_events(prefix + shader + suffix)]
+                self.assertEqual("repeat" not in kinds, expands)
+
+    def test_port_parity_shader_counted_event_budget(self) -> None:
+        """Reuse lexical spans for separate executions and decline over-budget copies."""
+        source = "void main() { for (int i = 0; i < 2; i++) { x = y; } }"
+        events = self._counted_for_events(source)
+        writes = [event for event in events if source[event[1] : event[2]] == "x = y;"]
+        self.assertEqual(len(writes), 2)
+        self.assertEqual(writes[0], writes[1])
+        self.assertNotIn("repeat", [kind for kind, _, _ in events])
+        with unittest.mock.patch.object(sweep_port_parity, "_MAX_COUNTED_EVENTS", 0):
+            self.assertIn("repeat", [kind for kind, _, _ in self._counted_for_events(source)])
+
+    @staticmethod
+    def _counted_for_events(source: str) -> list[tuple[str, int, int]]:
+        """Inspect specialization without depending on the normalization recognizer."""
+        return sweep_port_parity._ShaderFlow.from_source(source).events
+
     def test_port_parity_shader_for_update_clamp(self) -> None:
         """Report the clamp site only when the loop can reach its image-load update."""
         for tail, expected in (("break;", None), ("", "test.comp:1"), ("continue;", "test.comp:1")):

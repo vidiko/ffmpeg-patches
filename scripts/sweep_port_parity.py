@@ -21,6 +21,7 @@ from scripts.sweep_vulkan_features import (  # noqa: E402
     owners_for_shaders,
 )
 from scripts.variant_sweep import (  # noqa: E402
+    LITERALS,
     MAX_REPORT_BYTES,
     REPORT_TABLES,
     check_deadline,
@@ -50,6 +51,7 @@ _SUBSCRIPT_DEPTH = 32
 _WHITESPACE = " \t\n\r"
 _MAX_LOADS = 64
 _MAX_STATEMENTS = 4096
+_MAX_COUNTED_EVENTS = 256
 _USE_WINDOW = 32
 _SUFFIX_STEPS = 8
 _HELPER_DEFINITIONS = 8
@@ -1051,7 +1053,13 @@ def _shader_schedule_loop(
         first = init_end + 1
         update = ("update", test_end + 1, close)
     events.extend((("loop", 0, 0), ("enter", 0, 0), ("expr", first, test_end)))
-    test = "test" if _skip_space(masked, first, test_end) < test_end else "always"
+    condition = masked[first:test_end].strip()
+    if condition in {"", "true"}:
+        test = "always"
+    elif condition == "false":
+        test = "never"
+    else:
+        test = "test"
     events.append((test, 0, 0))
     pending.extend((("join", 0, 0), ("repeat", 0, 0), ("exit", 0, 0), update))
     _shader_schedule_body(events, pending, depth)
@@ -1068,7 +1076,7 @@ def _shader_schedule_statement(
     """Consume a statement prefix and schedule any nested statements."""
     start, boundary = span
     if masked[start] == "{":
-        events.append(("enter", 0, 0))
+        events.append(("enter", start, start + 1))
         pending.append(("block", depth + 1, 0))
         return start + 1
     control = _shader_control(masked, start, boundary)
@@ -1084,9 +1092,11 @@ def _shader_schedule_statement(
     return boundary
 
 
-def _shader_events(masked: str) -> list[_ShaderEvent]:
+def _shader_events(masked: str, *, expand_counted: bool = False) -> list[_ShaderEvent]:
     """Split shader statements into expression, lexical-scope and control events."""
-    spans = statement_spans(masked)[:_MAX_STATEMENTS]
+    spans = statement_spans(masked)
+    complete = len(spans) <= _MAX_STATEMENTS
+    spans = spans[:_MAX_STATEMENTS]
     if not spans:
         return []
     limit = spans[-1][1]
@@ -1106,20 +1116,23 @@ def _shader_events(masked: str) -> list[_ShaderEvent]:
             cursor = _shader_schedule_else(masked, (cursor, limit), first, events, pending)
             continue
         if kind == "block" and (cursor == limit or masked[cursor] == "}"):
-            cursor = min(cursor + 1, limit)
-            events.append(("exit", 0, 0))
+            end = min(cursor + 1, limit)
+            events.append(("exit", cursor, end))
+            complete = complete and cursor < end
+            cursor = end
             continue
         if cursor == limit:
             continue
         if first >= _SUBSCRIPT_DEPTH:
             events.append(("stop", 0, 0))
+            complete = False
             break
         if kind != "statement":
             pending.append((kind, first, end))
         while boundary <= cursor:
             boundary = next(boundaries)
         cursor = _shader_schedule_statement(masked, (cursor, boundary), first, events, pending)
-    return events
+    return _counted_events(masked, events) if complete and expand_counted else events
 
 
 def _shader_schedule_else(
@@ -1138,6 +1151,166 @@ def _shader_schedule_else(
     return cursor + len("else")
 
 
+_COUNTED_DECIMAL = r"(?:0|[1-9][0-9]{0,9})"
+_COUNTED_INIT = re.compile(rf"int\s+([A-Za-z_]\w*)\s*=\s*({_COUNTED_DECIMAL})", re.ASCII)
+_COUNTED_TEST = re.compile(rf"([A-Za-z_]\w*)\s*<\s*({_COUNTED_DECIMAL})", re.ASCII)
+_COUNTED_NAME = r"[A-Za-z_]\w*"
+_COUNTED_FLOAT = r"(?:[0-9]+\.[0-9]*|\.[0-9]+)"
+_COUNTED_TYPE = r"(?:int|float|[iu]?vec[234])"
+_COUNTED_ATOM = rf"(?:{_COUNTED_NAME}|{_COUNTED_DECIMAL}|{_COUNTED_FLOAT})"
+_COUNTED_VALUE = re.compile(
+    rf"(?:{_COUNTED_ATOM}|{_COUNTED_TYPE}\s*\(\s*{_COUNTED_ATOM}\s*\)"
+    rf"|clamp\s*\(\s*{_COUNTED_NAME}\s*,\s*{_COUNTED_FLOAT}\s*,\s*{_COUNTED_FLOAT}\s*\)"
+    rf"|imageLoad\s*\(\s*{_COUNTED_NAME}\s*,\s*ivec2\s*\(\s*{_COUNTED_DECIMAL}\s*\)\s*\))",
+    re.ASCII,
+)
+_COUNTED_ASSIGN = re.compile(
+    rf"(?:(?:{_COUNTED_TYPE})\s+)?{_COUNTED_NAME}\s*=\s*(.+)", re.ASCII | re.DOTALL
+)
+_COUNTED_OVERLOAD = re.compile(r"\b[A-Za-z_]\w*\s+(?:clamp|imageLoad)\s*\(", re.ASCII)
+
+
+def _counted_assignment(text: str, counter: str) -> bool:
+    """Accept only simple writes with RHS forms that cannot write through an argument."""
+    if counter in _IDENTIFIER.findall(text):
+        return False
+    match = _COUNTED_ASSIGN.fullmatch(text)
+    return match is not None and _COUNTED_VALUE.fullmatch(match[1]) is not None
+
+
+def _counted_initializer(masked: str, events: list[_ShaderEvent], opening: int) -> str:
+    """Read a header declaration or a physically adjacent standalone declaration."""
+    _, start, end = events[opening - 1]
+    init = masked[start:end].strip()
+    if init or opening < 3:
+        return init
+    kind, start, previous_end = events[opening - 3]
+    if kind != "expr" or not re.fullmatch(r"\s*for\s*\(\s*", masked[previous_end:end]):
+        return ""
+    return masked[start:previous_end].strip().removesuffix(";").rstrip()
+
+
+def _counted_distance(init: str, test: str) -> tuple[str, int] | None:
+    """Prove the arithmetic for the exact signed-int declaration and comparison."""
+    declaration = _COUNTED_INIT.fullmatch(init)
+    comparison = _COUNTED_TEST.fullmatch(test)
+    if declaration is None or comparison is None or declaration[1] != comparison[1]:
+        return None
+    initial, bound = int(declaration[2]), int(comparison[2])
+    count = max(0, bound - initial)
+    if max(initial, bound) > 2**31 - 1 or count > 2:
+        return None
+    return declaration[1], count
+
+
+def _counted_body(events: list[_ShaderEvent], opening: int) -> int | None:
+    """Find the physical body close only for a complete straight-line braced loop."""
+    prefix = [kind for kind, _, _ in events[opening - 2 : opening + 6]]
+    if prefix != ["enter", "expr", "loop", "enter", "expr", "test", "enter", "enter"]:
+        return None
+    if events[opening + 5][1] == events[opening + 5][2]:
+        return None
+    close = opening + 6
+    while close < len(events) and events[close][0] == "expr":
+        close += 1
+    suffix = [kind for kind, _, _ in events[close : close + 7]]
+    if suffix != ["exit", "exit", "update", "exit", "repeat", "join", "exit"]:
+        return None
+    return close if events[close][1] < events[close][2] else None
+
+
+def _counted_steps(body: list[str], update: str, counter: str) -> bool:
+    """Require one unconditional standalone increment and whitelist all other writes."""
+    if any(not statement.endswith(";") for statement in body):
+        return False
+    statements = [statement[:-1].rstrip() for statement in body]
+    name = re.escape(counter)
+    increment = re.compile(rf"(?:\+\+\s*{name}|{name}\s*\+\+)")
+    if increment.fullmatch(update):
+        return all(_counted_assignment(text, counter) for text in statements)
+    if not statements or not increment.fullmatch(statements[-1]):
+        return False
+    if update and not _counted_assignment(update, counter):
+        return False
+    return all(_counted_assignment(text, counter) for text in statements[:-1])
+
+
+def _counted_proof(masked: str, events: list[_ShaderEvent], opening: int, close: int) -> int | None:
+    """Return the exact small count, or decline without inspecting body values."""
+    _, start, end = events[opening + 2]
+    init = _counted_initializer(masked, events, opening)
+    proof = _counted_distance(init, masked[start:end].strip())
+    if proof is None:
+        return None
+    counter, count = proof
+    body = [masked[start:end].strip() for _, start, end in events[opening + 6 : close]]
+    _, start, end = events[close + 2]
+    return count if _counted_steps(body, masked[start:end].strip(), counter) else None
+
+
+_COUNTED_VERSION = re.compile(
+    r"[ \t]*#[ \t]*version[ \t]+450(?:[ \t]+(?:core|compatibility))?[ \t]*\r?"
+)
+
+
+def _counted_directives_ok(source: str) -> bool:
+    """Allow no directives or one leading directive in the supported version subset."""
+    # Support desktop GLSL 450, optionally with core or compatibility, on a
+    # single line without inline comments. Whitespace and comments may precede it.
+    leading = True
+    cursor = 0
+    for match in LITERALS.finditer(source):
+        if source[cursor : match.start()].strip():
+            leading = False
+        text = match[0]
+        if text.lstrip(" \t").startswith("#"):
+            if not leading or _COUNTED_VERSION.fullmatch(text) is None:
+                return False
+            leading = False
+        elif not text.startswith(("//", "/*")):
+            leading = False
+        cursor = match.end()
+    return True
+
+
+def _counted_events(masked: str, events: list[_ShaderEvent]) -> list[_ShaderEvent]:
+    """Expand proven loops within the event budget, retaining spans for load matching."""
+    if _COUNTED_OVERLOAD.search(masked):
+        return events
+    expanded: list[_ShaderEvent] = []
+    cursor = growth = 0
+    for opening, (kind, _, _) in enumerate(events):
+        if opening < cursor or kind != "loop":
+            continue
+        close = _counted_body(events, opening)
+        if close is None:
+            continue
+        count = _counted_proof(masked, events, opening, close)
+        if count is None:
+            continue
+        # Charge every copied event beyond the first iteration, without credit
+        # for removed events. The final scoped test is also charged.
+        cost = max(0, count - 1) * (close + 4 - opening - 2) + 3
+        if growth + cost > _MAX_COUNTED_EVENTS:
+            continue
+        growth += cost
+        test = events[opening + 1 : opening + 3]
+        # The copied update executes as an expression, not as a loop-frame edge.
+        _, start, end = events[close + 2]
+        iteration = (
+            test
+            + events[opening + 4 : close + 2]
+            + [("expr", start, end)]
+            + events[close + 3 : close + 4]
+        )
+        expanded.extend(events[cursor:opening])
+        expanded.extend(iteration * count)
+        expanded.extend((*test, ("exit", 0, 0)))
+        cursor = close + 6
+    expanded.extend(events[cursor:])
+    return expanded
+
+
 class _ShaderFrame:
     """Collect edges whose destination is not known until a control construct ends."""
 
@@ -1145,6 +1318,7 @@ class _ShaderFrame:
         self.kind = kind
         self.opening = opening
         self.branch = opening
+        self.exit_only = False
         self.alternate: int | None = None
         self.breaks: list[int] = []
         self.continues: list[int] = []
@@ -1152,7 +1326,10 @@ class _ShaderFrame:
     def finish(self, edges: list[tuple[int, ...]], end: int) -> None:
         """Connect the optional arm and all breaks to their destinations."""
         alternate = self.alternate
-        edges[self.branch] = (self.branch + 1, end if alternate is None else alternate + 1)
+        if self.exit_only:
+            edges[self.branch] = (end,)
+        else:
+            edges[self.branch] = (self.branch + 1, end if alternate is None else alternate + 1)
         if alternate is not None:
             edges[alternate] = (end,)
         for origin in self.breaks:
@@ -1179,7 +1356,7 @@ def _shader_jump(
 
 
 def _shader_finish_frame(frame: _ShaderFrame, edges: list[tuple[int, ...]], index: int) -> None:
-    """Resolve a join, with only break edges exiting a loop without a test."""
+    """Resolve a join, with only break edges exiting an always-true loop."""
     if frame.kind == "loop" and frame.branch == frame.opening:
         for origin in frame.breaks:
             edges[origin] = (index,)
@@ -1193,10 +1370,10 @@ def _shader_control_edge(
     """Resolve branches, loop back edges and pending abrupt transfers."""
     if kind in {"if", "switch", "loop"}:
         frames.append(_ShaderFrame(kind, index))
-    elif kind in {"test", "always"}:
-        # An omitted condition has no false edge; retain the ordinary back edge.
-        if kind == "test":
-            frames[-1].branch = index
+    elif kind in {"test", "never"}:
+        frames[-1].branch = index
+        frames[-1].exit_only = kind == "never"
+    # An "always" event keeps its fallthrough and leaves branch at opening.
     elif kind == "alternate":
         frames[-1].alternate = index
     elif kind == "update":
@@ -1211,8 +1388,14 @@ def _shader_control_edge(
 class _ShaderFlow:
     """Store shader events, successor edges and lexical depths before each event."""
 
-    def __init__(self, masked: str) -> None:
-        self.events = _shader_events(masked)
+    @classmethod
+    def from_source(cls, source: str) -> _ShaderFlow:
+        expand_counted = _counted_directives_ok(source)
+        return cls(mask_literals(source), expand_counted=expand_counted)
+
+    def __init__(self, masked: str, *, expand_counted: bool = False) -> None:
+        self.masked = masked
+        self.events = _shader_events(masked, expand_counted=expand_counted)
         self.edges: list[tuple[int, ...]] = [(i + 1,) for i in range(len(self.events))]
         self.depths: list[int] = []
         frames: list[_ShaderFrame] = []
@@ -1394,8 +1577,8 @@ def shader_site(shader_path: str, source: str, kind: str) -> str | None:
     pattern = checks.get(kind)
     if pattern is None:
         return None
-    masked = mask_literals(source)
-    flow = _ShaderFlow(masked)
+    flow = _ShaderFlow.from_source(source)
+    masked = flow.masked
     reachable = flow.reachable()
     helpers: dict[tuple[str, int, int], bool] = {}
     first_offset: int | None = None

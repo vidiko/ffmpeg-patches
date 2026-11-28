@@ -86,6 +86,14 @@
           "reason": "same-files",
           "state": "merged",
           "seen": "2026-11-25"
+        },
+        {
+          "number": 26390,
+          "kind": "pull",
+          "author": "michaelni",
+          "reason": "same-files",
+          "state": "merged",
+          "seen": "2026-11-28"
         }
       ]
     },
@@ -118,6 +126,14 @@
           "reason": "same-files",
           "state": "merged",
           "seen": "2026-11-25"
+        },
+        {
+          "number": 26390,
+          "kind": "pull",
+          "author": "michaelni",
+          "reason": "same-files",
+          "state": "merged",
+          "seen": "2026-11-28"
         }
       ]
     },
@@ -206,6 +222,14 @@
           "reason": "same-files",
           "state": "merged",
           "seen": "2026-11-25"
+        },
+        {
+          "number": 26390,
+          "kind": "pull",
+          "author": "michaelni",
+          "reason": "same-files",
+          "state": "merged",
+          "seen": "2026-11-28"
         }
       ]
     },
@@ -286,6 +310,14 @@
           "reason": "same-files",
           "state": "merged",
           "seen": "2026-11-25"
+        },
+        {
+          "number": 26390,
+          "kind": "pull",
+          "author": "michaelni",
+          "reason": "same-files",
+          "state": "merged",
+          "seen": "2026-11-28"
         }
       ]
     },
@@ -358,6 +390,14 @@
           "reason": "same-files",
           "state": "merged",
           "seen": "2026-11-25"
+        },
+        {
+          "number": 26390,
+          "kind": "pull",
+          "author": "michaelni",
+          "reason": "same-files",
+          "state": "merged",
+          "seen": "2026-11-28"
         }
       ]
     },
@@ -541,6 +581,14 @@
           "reason": "same-files",
           "state": "open",
           "seen": "2026-11-19"
+        },
+        {
+          "number": 25423,
+          "kind": "pull",
+          "author": "kasper93",
+          "reason": "same-files",
+          "state": "open",
+          "seen": "2026-11-28"
         },
         {
           "number": 25448,
@@ -735,11 +783,27 @@
           "seen": "2026-11-19"
         },
         {
+          "number": 26083,
+          "kind": "pull",
+          "author": "06needhamt",
+          "reason": "same-files",
+          "state": "merged",
+          "seen": "2026-11-28"
+        },
+        {
+          "number": 26231,
+          "kind": "pull",
+          "author": "rnissl",
+          "reason": "same-files",
+          "state": "open",
+          "seen": "2026-11-28"
+        },
+        {
           "number": 26233,
           "kind": "pull",
           "author": "antonkesy",
           "reason": "same-files",
-          "state": "open",
+          "state": "merged",
           "seen": "2026-11-25"
         },
         {
@@ -773,6 +837,22 @@
           "reason": "same-files",
           "state": "open",
           "seen": "2026-11-25"
+        },
+        {
+          "number": 26390,
+          "kind": "pull",
+          "author": "michaelni",
+          "reason": "same-files",
+          "state": "merged",
+          "seen": "2026-11-28"
+        },
+        {
+          "number": 26410,
+          "kind": "pull",
+          "author": "Forgejo_Fairy",
+          "reason": "same-files",
+          "state": "open",
+          "seen": "2026-11-28"
         }
       ]
     },
@@ -900,6 +980,14 @@
           "reason": "same-files",
           "state": "merged",
           "seen": "2026-11-25"
+        },
+        {
+          "number": 26390,
+          "kind": "pull",
+          "author": "michaelni",
+          "reason": "same-files",
+          "state": "merged",
+          "seen": "2026-11-28"
         }
       ]
     },
@@ -1376,6 +1464,14 @@
           "reason": "same-files",
           "state": "merged",
           "seen": "2026-11-25"
+        },
+        {
+          "number": 26390,
+          "kind": "pull",
+          "author": "michaelni",
+          "reason": "same-files",
+          "state": "merged",
+          "seen": "2026-11-28"
         }
       ]
     },
@@ -1514,12 +1610,28 @@
           "seen": "2026-11-25"
         },
         {
+          "number": 26258,
+          "kind": "pull",
+          "author": "bcoudurier",
+          "reason": "same-files",
+          "state": "open",
+          "seen": "2026-11-28"
+        },
+        {
           "number": 26261,
           "kind": "pull",
           "author": "bcoudurier",
           "reason": "same-files",
           "state": "open",
           "seen": "2026-11-25"
+        },
+        {
+          "number": 26287,
+          "kind": "pull",
+          "author": "bcoudurier",
+          "reason": "same-files",
+          "state": "open",
+          "seen": "2026-11-28"
         },
         {
           "number": 26310,
@@ -1536,6 +1648,14 @@
           "reason": "same-files",
           "state": "open",
           "seen": "2026-11-25"
+        },
+        {
+          "number": 26390,
+          "kind": "pull",
+          "author": "michaelni",
+          "reason": "same-files",
+          "state": "merged",
+          "seen": "2026-11-28"
         }
       ]
     },
@@ -1646,8 +1766,16 @@
           "kind": "pull",
           "author": "michaelni",
           "reason": "same-files",
-          "state": "open",
+          "state": "merged",
           "seen": "2026-11-25"
+        },
+        {
+          "number": 26390,
+          "kind": "pull",
+          "author": "michaelni",
+          "reason": "same-files",
+          "state": "merged",
+          "seen": "2026-11-28"
         }
       ]
     },
@@ -1725,6 +1853,14 @@
           "reason": "same-files",
           "state": "merged",
           "seen": "2026-11-25"
+        },
+        {
+          "number": 26390,
+          "kind": "pull",
+          "author": "michaelni",
+          "reason": "same-files",
+          "state": "merged",
+          "seen": "2026-11-28"
         }
       ]
     },
@@ -1805,6 +1941,14 @@
           "reason": "same-files",
           "state": "open",
           "seen": "2026-11-25"
+        },
+        {
+          "number": 26390,
+          "kind": "pull",
+          "author": "michaelni",
+          "reason": "same-files",
+          "state": "merged",
+          "seen": "2026-11-28"
         }
       ]
     },
@@ -1822,6 +1966,14 @@
       "note": "Part of 0002, split from 25111.",
       "fixes_issues": [],
       "related": [
+        {
+          "number": 23633,
+          "kind": "pull",
+          "author": "damitha",
+          "reason": "same-files",
+          "state": "open",
+          "seen": "2026-11-28"
+        },
         {
           "number": 25609,
           "kind": "pull",
@@ -1903,6 +2055,14 @@
       "fixes_issues": [],
       "related": [
         {
+          "number": 25423,
+          "kind": "pull",
+          "author": "kasper93",
+          "reason": "same-files",
+          "state": "open",
+          "seen": "2026-11-28"
+        },
+        {
           "number": 25530,
           "kind": "pull",
           "author": "gnattu",
@@ -1951,12 +2111,28 @@
           "seen": "2026-11-19"
         },
         {
+          "number": 26083,
+          "kind": "pull",
+          "author": "06needhamt",
+          "reason": "same-files",
+          "state": "merged",
+          "seen": "2026-11-28"
+        },
+        {
           "number": 26117,
           "kind": "pull",
           "author": "mkver",
           "reason": "same-files",
           "state": "merged",
           "seen": "2026-11-19"
+        },
+        {
+          "number": 26371,
+          "kind": "pull",
+          "author": "mypopydev",
+          "reason": "same-files",
+          "state": "merged",
+          "seen": "2026-11-28"
         }
       ]
     },
@@ -1974,6 +2150,14 @@
       "note": "Part of 0002, split from 25111.",
       "fixes_issues": [],
       "related": [
+        {
+          "number": 26083,
+          "kind": "pull",
+          "author": "06needhamt",
+          "reason": "same-files",
+          "state": "merged",
+          "seen": "2026-11-28"
+        },
         {
           "number": 26341,
           "kind": "pull",
@@ -2084,6 +2268,14 @@
           "reason": "same-files",
           "state": "open",
           "seen": "2026-11-25"
+        },
+        {
+          "number": 26390,
+          "kind": "pull",
+          "author": "michaelni",
+          "reason": "same-files",
+          "state": "merged",
+          "seen": "2026-11-28"
         }
       ]
     },
@@ -2162,6 +2354,14 @@
           "reason": "same-files",
           "state": "merged",
           "seen": "2026-11-25"
+        },
+        {
+          "number": 26390,
+          "kind": "pull",
+          "author": "michaelni",
+          "reason": "same-files",
+          "state": "merged",
+          "seen": "2026-11-28"
         }
       ]
     },
@@ -2332,6 +2532,14 @@
           "seen": "2026-11-19"
         },
         {
+          "number": 25423,
+          "kind": "pull",
+          "author": "kasper93",
+          "reason": "same-files",
+          "state": "open",
+          "seen": "2026-11-28"
+        },
+        {
           "number": 25448,
           "kind": "pull",
           "author": "jackboykin",
@@ -2370,6 +2578,14 @@
           "reason": "same-files",
           "state": "merged",
           "seen": "2026-11-25"
+        },
+        {
+          "number": 25647,
+          "kind": "pull",
+          "author": "Forgejo_Fairy",
+          "reason": "same-files",
+          "state": "open",
+          "seen": "2026-11-28"
         },
         {
           "number": 25772,
@@ -2556,6 +2772,14 @@
           "seen": "2026-11-19"
         },
         {
+          "number": 26083,
+          "kind": "pull",
+          "author": "06needhamt",
+          "reason": "same-files",
+          "state": "merged",
+          "seen": "2026-11-28"
+        },
+        {
           "number": 26173,
           "kind": "pull",
           "author": "Forgejo_Fairy",
@@ -2596,11 +2820,19 @@
           "seen": "2026-11-19"
         },
         {
+          "number": 26231,
+          "kind": "pull",
+          "author": "rnissl",
+          "reason": "same-files",
+          "state": "open",
+          "seen": "2026-11-28"
+        },
+        {
           "number": 26233,
           "kind": "pull",
           "author": "antonkesy",
           "reason": "same-files",
-          "state": "open",
+          "state": "merged",
           "seen": "2026-11-25"
         },
         {
@@ -2634,6 +2866,22 @@
           "reason": "same-files",
           "state": "open",
           "seen": "2026-11-25"
+        },
+        {
+          "number": 26390,
+          "kind": "pull",
+          "author": "michaelni",
+          "reason": "same-files",
+          "state": "merged",
+          "seen": "2026-11-28"
+        },
+        {
+          "number": 26410,
+          "kind": "pull",
+          "author": "Forgejo_Fairy",
+          "reason": "same-files",
+          "state": "open",
+          "seen": "2026-11-28"
         }
       ]
     },
@@ -2812,6 +3060,14 @@
           "seen": "2026-11-25"
         },
         {
+          "number": 25146,
+          "kind": "pull",
+          "author": "JuliusBairaktaris",
+          "reason": "same-files",
+          "state": "open",
+          "seen": "2026-11-28"
+        },
+        {
           "number": 25174,
           "kind": "pull",
           "author": "Lynne",
@@ -2850,6 +3106,14 @@
           "reason": "same-files",
           "state": "open",
           "seen": "2026-11-25"
+        },
+        {
+          "number": 25560,
+          "kind": "pull",
+          "author": "JuliusBairaktaris",
+          "reason": "same-files",
+          "state": "open",
+          "seen": "2026-11-28"
         },
         {
           "number": 25646,
@@ -3092,6 +3356,14 @@
           "seen": "2026-11-25"
         },
         {
+          "number": 26074,
+          "kind": "pull",
+          "author": "luoye-cpu",
+          "reason": "same-files",
+          "state": "open",
+          "seen": "2026-11-28"
+        },
+        {
           "number": 26083,
           "kind": "pull",
           "author": "06needhamt",
@@ -3144,7 +3416,7 @@
           "kind": "pull",
           "author": "bcoudurier",
           "reason": "same-files",
-          "state": "open",
+          "state": "merged",
           "seen": "2026-11-25"
         },
         {
@@ -3154,6 +3426,14 @@
           "reason": "same-files",
           "state": "open",
           "seen": "2026-11-25"
+        },
+        {
+          "number": 26202,
+          "kind": "pull",
+          "author": "toots",
+          "reason": "same-files",
+          "state": "open",
+          "seen": "2026-11-28"
         },
         {
           "number": 26207,
@@ -3264,7 +3544,7 @@
           "kind": "pull",
           "author": "quink",
           "reason": "same-files",
-          "state": "open",
+          "state": "merged",
           "seen": "2026-11-25"
         },
         {
@@ -3280,7 +3560,7 @@
           "kind": "pull",
           "author": "michaelni",
           "reason": "same-files",
-          "state": "open",
+          "state": "merged",
           "seen": "2026-11-25"
         },
         {
@@ -3298,6 +3578,70 @@
           "reason": "same-files",
           "state": "open",
           "seen": "2026-11-25"
+        },
+        {
+          "number": 26359,
+          "kind": "pull",
+          "author": "06needhamt",
+          "reason": "same-files",
+          "state": "open",
+          "seen": "2026-11-28"
+        },
+        {
+          "number": 26384,
+          "kind": "pull",
+          "author": "yuygfgg",
+          "reason": "same-files",
+          "state": "open",
+          "seen": "2026-11-28"
+        },
+        {
+          "number": 26390,
+          "kind": "pull",
+          "author": "michaelni",
+          "reason": "same-files",
+          "state": "merged",
+          "seen": "2026-11-28"
+        },
+        {
+          "number": 26394,
+          "kind": "pull",
+          "author": "Forgejo_Fairy",
+          "reason": "same-files",
+          "state": "open",
+          "seen": "2026-11-28"
+        },
+        {
+          "number": 26396,
+          "kind": "pull",
+          "author": "justsrc",
+          "reason": "same-files",
+          "state": "open",
+          "seen": "2026-11-28"
+        },
+        {
+          "number": 26398,
+          "kind": "pull",
+          "author": "ksu-gitreaper807",
+          "reason": "same-files",
+          "state": "open",
+          "seen": "2026-11-28"
+        },
+        {
+          "number": 26413,
+          "kind": "pull",
+          "author": "justsrc",
+          "reason": "same-files",
+          "state": "open",
+          "seen": "2026-11-28"
+        },
+        {
+          "number": 26427,
+          "kind": "pull",
+          "author": "Nariman-Sayed",
+          "reason": "same-files",
+          "state": "open",
+          "seen": "2026-11-28"
         }
       ]
     },
@@ -3532,6 +3876,14 @@
           "seen": "2026-11-19"
         },
         {
+          "number": 25146,
+          "kind": "pull",
+          "author": "JuliusBairaktaris",
+          "reason": "same-files",
+          "state": "open",
+          "seen": "2026-11-28"
+        },
+        {
           "number": 25174,
           "kind": "pull",
           "author": "Lynne",
@@ -3562,6 +3914,14 @@
           "reason": "same-files",
           "state": "open",
           "seen": "2026-11-19"
+        },
+        {
+          "number": 25423,
+          "kind": "pull",
+          "author": "kasper93",
+          "reason": "same-files",
+          "state": "open",
+          "seen": "2026-11-28"
         },
         {
           "number": 25427,
@@ -3610,6 +3970,14 @@
           "reason": "same-files",
           "state": "open",
           "seen": "2026-11-19"
+        },
+        {
+          "number": 25560,
+          "kind": "pull",
+          "author": "JuliusBairaktaris",
+          "reason": "same-files",
+          "state": "open",
+          "seen": "2026-11-28"
         },
         {
           "number": 25628,
@@ -3836,6 +4204,14 @@
           "seen": "2026-11-19"
         },
         {
+          "number": 26010,
+          "kind": "pull",
+          "author": "bcoudurier",
+          "reason": "same-files",
+          "state": "open",
+          "seen": "2026-11-28"
+        },
+        {
           "number": 26017,
           "kind": "pull",
           "author": "ambitiuswisdom",
@@ -3944,7 +4320,7 @@
           "kind": "pull",
           "author": "06needhamt",
           "reason": "same-files",
-          "state": "open",
+          "state": "merged",
           "seen": "2026-11-19"
         },
         {
@@ -3992,8 +4368,16 @@
           "kind": "pull",
           "author": "bcoudurier",
           "reason": "same-files",
-          "state": "open",
+          "state": "merged",
           "seen": "2026-11-25"
+        },
+        {
+          "number": 26148,
+          "kind": "pull",
+          "author": "bcoudurier",
+          "reason": "same-files",
+          "state": "open",
+          "seen": "2026-11-28"
         },
         {
           "number": 26173,
@@ -4012,6 +4396,14 @@
           "seen": "2026-11-19"
         },
         {
+          "number": 26198,
+          "kind": "pull",
+          "author": "bcoudurier",
+          "reason": "same-files",
+          "state": "open",
+          "seen": "2026-11-28"
+        },
+        {
           "number": 26207,
           "kind": "pull",
           "author": "olivierayache",
@@ -4028,11 +4420,19 @@
           "seen": "2026-11-25"
         },
         {
+          "number": 26231,
+          "kind": "pull",
+          "author": "rnissl",
+          "reason": "same-files",
+          "state": "open",
+          "seen": "2026-11-28"
+        },
+        {
           "number": 26233,
           "kind": "pull",
           "author": "antonkesy",
           "reason": "same-files",
-          "state": "open",
+          "state": "merged",
           "seen": "2026-11-25"
         },
         {
@@ -4108,6 +4508,14 @@
           "seen": "2026-11-25"
         },
         {
+          "number": 26311,
+          "kind": "pull",
+          "author": "bcoudurier",
+          "reason": "same-files",
+          "state": "open",
+          "seen": "2026-11-28"
+        },
+        {
           "number": 26314,
           "kind": "pull",
           "author": "mengbinghan",
@@ -4136,7 +4544,7 @@
           "kind": "pull",
           "author": "michaelni",
           "reason": "same-files",
-          "state": "open",
+          "state": "merged",
           "seen": "2026-11-25"
         },
         {
@@ -4162,6 +4570,70 @@
           "reason": "same-files",
           "state": "open",
           "seen": "2026-11-25"
+        },
+        {
+          "number": 26359,
+          "kind": "pull",
+          "author": "06needhamt",
+          "reason": "same-files",
+          "state": "open",
+          "seen": "2026-11-28"
+        },
+        {
+          "number": 26384,
+          "kind": "pull",
+          "author": "yuygfgg",
+          "reason": "same-files",
+          "state": "open",
+          "seen": "2026-11-28"
+        },
+        {
+          "number": 26387,
+          "kind": "pull",
+          "author": "michaelni",
+          "reason": "same-files",
+          "state": "merged",
+          "seen": "2026-11-28"
+        },
+        {
+          "number": 26390,
+          "kind": "pull",
+          "author": "michaelni",
+          "reason": "same-files",
+          "state": "merged",
+          "seen": "2026-11-28"
+        },
+        {
+          "number": 26394,
+          "kind": "pull",
+          "author": "Forgejo_Fairy",
+          "reason": "same-files",
+          "state": "open",
+          "seen": "2026-11-28"
+        },
+        {
+          "number": 26398,
+          "kind": "pull",
+          "author": "ksu-gitreaper807",
+          "reason": "same-files",
+          "state": "open",
+          "seen": "2026-11-28"
+        },
+        {
+          "number": 26410,
+          "kind": "pull",
+          "author": "Forgejo_Fairy",
+          "reason": "same-files",
+          "state": "open",
+          "seen": "2026-11-28"
+        },
+        {
+          "number": 26427,
+          "kind": "pull",
+          "author": "Nariman-Sayed",
+          "reason": "same-files",
+          "state": "open",
+          "seen": "2026-11-28"
         }
       ]
     },
@@ -4308,6 +4780,14 @@
           "seen": "2026-11-19"
         },
         {
+          "number": 25423,
+          "kind": "pull",
+          "author": "kasper93",
+          "reason": "same-files",
+          "state": "open",
+          "seen": "2026-11-28"
+        },
+        {
           "number": 25448,
           "kind": "pull",
           "author": "jackboykin",
@@ -4354,6 +4834,14 @@
           "reason": "same-files",
           "state": "open",
           "seen": "2026-11-19"
+        },
+        {
+          "number": 25647,
+          "kind": "pull",
+          "author": "Forgejo_Fairy",
+          "reason": "same-files",
+          "state": "open",
+          "seen": "2026-11-28"
         },
         {
           "number": 25813,
@@ -4444,6 +4932,14 @@
           "seen": "2026-11-19"
         },
         {
+          "number": 25931,
+          "kind": "pull",
+          "author": "bcoudurier",
+          "reason": "same-files",
+          "state": "open",
+          "seen": "2026-11-28"
+        },
+        {
           "number": 25935,
           "kind": "pull",
           "author": "kierank",
@@ -4508,6 +5004,14 @@
           "seen": "2026-11-19"
         },
         {
+          "number": 26018,
+          "kind": "pull",
+          "author": "luoye-cpu",
+          "reason": "same-files",
+          "state": "open",
+          "seen": "2026-11-28"
+        },
+        {
           "number": 26037,
           "kind": "pull",
           "author": "bcoudurier",
@@ -4556,6 +5060,14 @@
           "seen": "2026-11-19"
         },
         {
+          "number": 26075,
+          "kind": "pull",
+          "author": "bcoudurier",
+          "reason": "same-files",
+          "state": "open",
+          "seen": "2026-11-28"
+        },
+        {
           "number": 26077,
           "kind": "pull",
           "author": "Forgejo_Fairy",
@@ -4570,6 +5082,14 @@
           "reason": "same-files",
           "state": "merged",
           "seen": "2026-11-19"
+        },
+        {
+          "number": 26083,
+          "kind": "pull",
+          "author": "06needhamt",
+          "reason": "same-files",
+          "state": "merged",
+          "seen": "2026-11-28"
         },
         {
           "number": 26145,
@@ -4628,11 +5148,19 @@
           "seen": "2026-11-19"
         },
         {
+          "number": 26231,
+          "kind": "pull",
+          "author": "rnissl",
+          "reason": "same-files",
+          "state": "open",
+          "seen": "2026-11-28"
+        },
+        {
           "number": 26233,
           "kind": "pull",
           "author": "antonkesy",
           "reason": "same-files",
-          "state": "open",
+          "state": "merged",
           "seen": "2026-11-25"
         },
         {
@@ -4676,6 +5204,14 @@
           "seen": "2026-11-25"
         },
         {
+          "number": 26287,
+          "kind": "pull",
+          "author": "bcoudurier",
+          "reason": "same-files",
+          "state": "open",
+          "seen": "2026-11-28"
+        },
+        {
           "number": 26310,
           "kind": "pull",
           "author": "michaelni",
@@ -4706,6 +5242,22 @@
           "reason": "same-files",
           "state": "open",
           "seen": "2026-11-25"
+        },
+        {
+          "number": 26390,
+          "kind": "pull",
+          "author": "michaelni",
+          "reason": "same-files",
+          "state": "merged",
+          "seen": "2026-11-28"
+        },
+        {
+          "number": 26410,
+          "kind": "pull",
+          "author": "Forgejo_Fairy",
+          "reason": "same-files",
+          "state": "open",
+          "seen": "2026-11-28"
         }
       ]
     }

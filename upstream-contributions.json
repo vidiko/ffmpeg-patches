@@ -791,6 +791,14 @@
           "seen": "2026-11-28"
         },
         {
+          "number": 26231,
+          "kind": "pull",
+          "author": "rnissl",
+          "reason": "same-files",
+          "state": "open",
+          "seen": "2026-11-28"
+        },
+        {
           "number": 26233,
           "kind": "pull",
           "author": "antonkesy",
@@ -2572,6 +2580,14 @@
           "seen": "2026-11-25"
         },
         {
+          "number": 25647,
+          "kind": "pull",
+          "author": "Forgejo_Fairy",
+          "reason": "same-files",
+          "state": "open",
+          "seen": "2026-11-28"
+        },
+        {
           "number": 25772,
           "kind": "pull",
           "author": "Forgejo_Fairy",
@@ -2802,6 +2818,14 @@
           "reason": "same-files",
           "state": "open",
           "seen": "2026-11-19"
+        },
+        {
+          "number": 26231,
+          "kind": "pull",
+          "author": "rnissl",
+          "reason": "same-files",
+          "state": "open",
+          "seen": "2026-11-28"
         },
         {
           "number": 26233,
@@ -4396,6 +4420,14 @@
           "seen": "2026-11-25"
         },
         {
+          "number": 26231,
+          "kind": "pull",
+          "author": "rnissl",
+          "reason": "same-files",
+          "state": "open",
+          "seen": "2026-11-28"
+        },
+        {
           "number": 26233,
           "kind": "pull",
           "author": "antonkesy",
@@ -4804,6 +4836,14 @@
           "seen": "2026-11-19"
         },
         {
+          "number": 25647,
+          "kind": "pull",
+          "author": "Forgejo_Fairy",
+          "reason": "same-files",
+          "state": "open",
+          "seen": "2026-11-28"
+        },
+        {
           "number": 25813,
           "kind": "pull",
           "author": "ashveikin",
@@ -5106,6 +5146,14 @@
           "reason": "same-files",
           "state": "open",
           "seen": "2026-11-19"
+        },
+        {
+          "number": 26231,
+          "kind": "pull",
+          "author": "rnissl",
+          "reason": "same-files",
+          "state": "open",
+          "seen": "2026-11-28"
         },
         {
           "number": 26233,
